@@ -60,6 +60,10 @@ describe('path expressions', () => {
     expect(evaluatePath(parsePath('input.data.hasOwnProperty'), context)).toBeUndefined();
     expect(evaluatePath(parsePath('input.date.getTime'), { input: { date: new Date(0) } })).toBeUndefined();
     expect(evaluatePath(parsePath('input.map.size'), { input: { map: new Map() } })).toBeUndefined();
+    class Holder {
+      token = 'secret';
+    }
+    expect(evaluatePath(parsePath('input.token'), { input: new Holder() })).toBeUndefined();
     const inherited = Object.create({ secret: 1 }) as Record<string, unknown>;
     expect(evaluatePath(parsePath('input.secret'), { input: inherited })).toBeUndefined();
   });

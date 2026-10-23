@@ -41,7 +41,7 @@ const fail = (code: CommandError['code'], message: string, details?: Record<stri
   error: commandError(code, message, details),
 });
 
-/** Agent and script executions that the engine restarts after it died mid-run, before giving up. */
+/** How often the engine starts an interrupted agent again on its own (engine restart, cancel without a pause). */
 export const MAX_AUTOMATIC_ATTEMPTS = 3;
 
 function ticketStream(ticket: Loaded<TicketState>, events: readonly NewEvent[]): StreamAppend {
@@ -300,16 +300,22 @@ export async function createTicketEvents(
 // ---------------------------------------------------------------------------
 // Node commands
 
+/**
+ * Scope of a command that may name a lane. A node agent's run decides its lane, so naming another lane
+ * of the same node (or a lane its run no longer drives) is out of its scope: the named lane's current run
+ * becomes the scope's run, which authorization compares with the token's run.
+ */
+export function laneScope(payload: { ticketId: string; nodeId: string; lane?: string }, target: Loaded<TicketState> | undefined): CommandTarget {
+  const scope: CommandTarget = nodeScope(payload);
+  if (payload.lane === undefined || target === undefined) return scope;
+  const runId = currentExecution(target.state, payload.nodeId, payload.lane)?.runIds.at(-1);
+  return { ...scope, runId: runId ?? 'none' };
+}
+
 export const nodeDone: CommandHandler<'node.done', TicketState> = {
   target: ticketTarget,
-  // An agent's run decides the lane; naming another lane of the same node is out of its scope.
-  scope: (payload, target) => {
-    const scope: CommandTarget = nodeScope(payload);
-    if (payload.lane === undefined || target === undefined) return scope;
-    const runId = currentExecution(target.state, payload.nodeId, payload.lane)?.runIds.at(-1);
-    return { ...scope, runId: runId ?? 'none' };
-  },
-  scopeNeedsTarget: true,
+  scope: laneScope,
+  scopeNeedsTarget: (payload) => payload.lane !== undefined,
   decide: async (ctx, payload, target) => {
     const ticket = requireTicket(target);
     const workflow = await openWorkflow(ctx, ticket);
@@ -557,14 +563,17 @@ export const nodeFinish: CommandHandler<'node.finish', TicketState> = {
       if (!run.state.exists) return fail('not_found', `run ${result.runId} does not exist`);
       if (run.state.status === 'running') return fail('invariant_violated', `run ${result.runId} has not settled yet`);
       const resumeFrom = run.state.sessionId === undefined ? {} : { resumeFromRunId: result.runId };
-      if (exec.pauseRequested && run.state.status === 'cancelled') {
+      const canRequeue = exec.requeues < MAX_AUTOMATIC_ATTEMPTS;
+      const interrupted = run.state.status === 'abnormal_exit' && run.state.terminalReason === 'engine_restarted';
+      if (run.state.status === 'cancelled' && exec.pauseRequested) {
         draft.emit({ type: 'node.paused', data: { ...fields, resumeTo: 'queued', ...resumeFrom } });
       } else if (exec.submitted !== undefined && run.state.status !== 'cancelled') {
+        // The agent reported before it ended; its result counts even if the process then exited badly.
         finishWithOutput(draft, node, exec, withLateArtifacts(exec.submitted, exec));
-      } else if (run.state.status === 'abnormal_exit' && run.state.terminalReason === 'engine_restarted' && exec.attempts < MAX_AUTOMATIC_ATTEMPTS) {
-        draft.emit({ type: 'node.requeued', data: { ...fields, reason: 'the engine restarted while the agent was running', ...resumeFrom } });
-      } else if (exec.pauseRequested) {
-        draft.emit({ type: 'node.paused', data: { ...fields, resumeTo: 'queued', ...resumeFrom } });
+      } else if ((interrupted || run.state.status === 'cancelled') && canRequeue) {
+        // Cancelled without a pause: the engine stopped it (shutdown, or a pause that was resumed before it took effect).
+        const reason = interrupted ? 'the engine restarted while the agent was running' : 'the run was cancelled and the lane is still wanted';
+        draft.emit({ type: 'node.requeued', data: { ...fields, reason, ...resumeFrom } });
       } else {
         const reason =
           run.state.status === 'succeeded'

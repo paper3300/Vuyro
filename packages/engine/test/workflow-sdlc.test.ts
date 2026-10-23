@@ -171,6 +171,12 @@ describe('AI-Native SDLC template', () => {
     expect(submissions).toHaveLength(9);
     expect(submissions.every((event) => event.actor.kind === 'agent' && event.actor.role === 'node.agent')).toBe(true);
     expect(h.errors).toEqual([]);
+    // The run token reaches the agent only through its environment.
+    for (const request of h.adapter.started) {
+      const token = request.env.VUYRO_RUN_TOKEN ?? '';
+      expect(token).toMatch(/^vrt_/);
+      expect(request.prompt).not.toContain(token);
+    }
 
     // Replaying the log rebuilds the same tables.
     const before = await h.store.query('SELECT * FROM p_node_runs ORDER BY ticket_id, node_id, run');

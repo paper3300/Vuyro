@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CommandFailure, CommandResponse, DefinitionEnvelope, NodeTypeDefinition, TemplateDefinition, TemplateEdge, TemplateNode } from '@vuyro/contracts';
 import type { ScriptedBehavior } from '../src/workflow/scripted-agent.ts';
 import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
@@ -101,6 +101,39 @@ describe('WorkflowEngine', () => {
     expect(state.status).toBe('done');
     const joined = nodeProgress(state, 'join').executions[0]?.output?.items.map((item) => item.data.n);
     expect(joined).toEqual(['1', '2', '3', '4', '5']);
+  });
+
+  it('gathers a fan-out into a whole input without a join node, once every lane finished', async () => {
+    const seen: string[] = [];
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId } = s.request;
+        if (nodeId === 'plan') {
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { n: 1 } }, { data: { n: 2 } }, { data: { n: 3 } }] }));
+        } else if (nodeId === 'work') {
+          const n = Number(/work on (\d)/.exec(s.request.prompt)?.[1]);
+          await s.sleep(n * MINUTE);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { n } }));
+        } else {
+          seen.push(s.request.prompt);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done' }));
+        }
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/gather',
+        [agent('plan'), agent('work', 'work on {{ input.data.n }}', { ports: { in: { mode: 'each' } } }), agent('sum', 'sum {{ inputs.in.length }} results'), { id: 'end', type: 'vuyro.end', version: 1 }],
+        [edge('plan', 'done', 'work'), edge('work', 'done', 'sum'), edge('sum', 'done', 'end')],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/gather');
+    await h.drive();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain('sum 3 results');
+    expect((await h.ticket(ticketId)).status).toBe('done');
   });
 
   it('routes items by edge conditions', async () => {
@@ -212,6 +245,25 @@ describe('WorkflowEngine', () => {
     expect((await h.ticket(ticketId)).status).toBe('done');
   });
 
+  it('a pause resumed before it took effect never fails the lane', async () => {
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        await s.sleep(10 * MINUTE);
+        if (!s.cancelled) expectOk(await s.vuyro('node.done', { ticketId: s.request.ticketId, nodeId: 'write', port: 'done' }));
+        return undefined;
+      },
+    });
+    await save(h, template('myteam/flip', [agent('write'), { id: 'end', type: 'vuyro.end', version: 1 }], [edge('write', 'done', 'end')]));
+    const ticketId = await ticketFor(h, 'myteam/flip');
+    await h.activity.idle();
+    await h.ok('node.pause', { ticketId, nodeId: 'write' });
+    await h.ok('node.resume', { ticketId, nodeId: 'write' });
+    await h.drive();
+    const state = await h.ticket(ticketId);
+    expect(state.status).toBe('done');
+    expect(nodeProgress(state, 'write').executions.map((exec) => exec.status)).toEqual(['done']);
+  });
+
   it('after an engine restart, re-runs interrupted agents (resuming the session) and fails interrupted scripts', async () => {
     const script: NodeTypeDefinition = {
       vuyro: 'export',
@@ -317,13 +369,44 @@ describe('WorkflowEngine', () => {
     await h.drive();
     const state = await h.ticket(ticketId);
     const spawned = h.processes.spawned.map((entry) => entry.spec);
-    expect(spawned[0]).toMatchObject({ command: 'check', args: ['--target', 'Ticket'], env: { PATH: '/bin', CHECK_MODE: 'strict' } });
+    expect(spawned[0]).toMatchObject({ command: 'check', args: ['--target', 'Ticket'] });
+    // Nothing from the engine's environment beyond the base set, and never the run-token variables.
+    expect(spawned[0]?.env).toEqual({ PATH: '/bin', CHECK_MODE: 'strict' });
     for (const spec of spawned) expect(Object.keys(spec.env ?? {}).some((name) => name.startsWith('VUYRO_'))).toBe(false);
     expect(currentExecution(state, 'json', 'main')?.output).toMatchObject({ port: 'done', items: [{ data: { passed: 3 }, summary: '3 passed' }] });
     expect(currentExecution(state, 'codes', 'main')?.output).toMatchObject({ port: 'warn', items: [{ data: { exitCode: 3, stdout: 'careful\n' } }] });
     const slow = currentExecution(state, 'slow', 'main');
     expect(slow?.status).toBe('failed');
     expect(String(slow?.output?.items[0]?.data.error)).toMatch(/timed out/);
+  });
+
+  it('fails a script whose JSON result has malformed items instead of trusting them', async () => {
+    h = await openWorkflowHarness();
+    await save(h, {
+      vuyro: 'export',
+      formatVersion: 1,
+      kind: 'nodeType',
+      id: 'myteam.emit',
+      version: 1,
+      name: 'Emit',
+      content: {
+        type: 'myteam.emit',
+        version: 1,
+        label: 'Emit',
+        completion: 'script',
+        inputs: [{ name: 'in', label: 'In' }],
+        outputs: [{ name: 'done', label: 'Done' }, { name: 'error', label: 'Error' }],
+        params: [],
+        script: { program: 'emit', output: 'json' },
+      },
+    });
+    await save(h, template('myteam/emit', [{ id: 'emit', type: 'myteam.emit', version: 1 }, { id: 'end', type: 'vuyro.end', version: 1 }], [edge('emit', 'done', 'end')]));
+    h.processes.enqueue({ steps: [{ stdout: '{"items":[{"data":"not an object","lineage":[{"nodeId":"x"}]}]}' }, { exit: 0 }] });
+    const ticketId = await ticketFor(h, 'myteam/emit');
+    await h.drive();
+    const exec = currentExecution(await h.ticket(ticketId), 'emit', 'main');
+    expect(exec?.status).toBe('failed');
+    expect(String(exec?.output?.items[0]?.data.error)).toMatch(/item 0 is not valid/);
   });
 
   it('supersedes a running execution when new input arrives, and ignores the old run', async () => {
@@ -413,7 +496,8 @@ describe('node command boundary', () => {
           expectOk(await s.vuyro('node.done', { ticketId: s.request.ticketId, nodeId: 'plan', port: 'done', items: [{ data: { n: 1 } }, { data: { n: 2 } }] }));
           return undefined;
         }
-        tokens.set(s.request.lane, s.request.env.VUYRO_RUN_TOKEN ?? '');
+        // Tokens of the first ticket only (a later ticket's lanes reuse the lane names).
+        if (!tokens.has(s.request.lane)) tokens.set(s.request.lane, s.request.env.VUYRO_RUN_TOKEN ?? '');
         await s.sleep(60 * MINUTE);
         return undefined;
       },
@@ -433,6 +517,7 @@ describe('node command boundary', () => {
     const { ticketId, tokens } = await twoLanes();
     const lane1 = tokens.get('1') ?? '';
     expectFailure(await asAgent(lane1, 'node.done', { ticketId, nodeId: 'work', lane: '2', port: 'done' }), 'out_of_scope');
+    expectFailure(await asAgent(lane1, 'artifact.add', { ticketId, nodeId: 'work', lane: '2', slot: 'change', ref: { kind: 'git', uri: 'x' } }), 'out_of_scope');
     expectFailure(await asAgent(lane1, 'node.done', { ticketId, nodeId: 'plan', port: 'done' }), 'out_of_scope');
     expectFailure(await asAgent(lane1, 'node.done', { ticketId, nodeId: 'work', port: 'done' }, { nodeId: 'plan' }), 'out_of_scope');
     expectFailure(await asAgent(lane1, 'node.approve', { ticketId, nodeId: 'work' }), 'forbidden');
@@ -442,6 +527,7 @@ describe('node command boundary', () => {
     const denials = await h.store.query<{ command_type: string; code: string }>('SELECT command_type, code FROM p_command_denials ORDER BY sequence');
     expect(denials).toEqual([
       { command_type: 'node.done', code: 'out_of_scope' },
+      { command_type: 'artifact.add', code: 'out_of_scope' },
       { command_type: 'node.done', code: 'out_of_scope' },
       { command_type: 'node.done', code: 'out_of_scope' },
       { command_type: 'node.approve', code: 'forbidden' },
@@ -452,6 +538,21 @@ describe('node command boundary', () => {
     // Its own lane works, named or not.
     expectOk(await asAgent(lane1, 'node.done', { ticketId, nodeId: 'work', lane: '1', port: 'done', data: { n: 1 } }));
     expectOk(await asAgent(tokens.get('2') ?? '', 'node.done', { ticketId, nodeId: 'work', port: 'done', data: { n: 2 } }));
+  });
+
+  it('refuses an agent naming a lane of another ticket before reading that ticket', async () => {
+    const { ticketId, tokens } = await twoLanes();
+    const project = await h.ok('project.create', { name: 'other' });
+    const { projectId } = project.result as { projectId: string };
+    const other = await h.ok('ticket.create', { projectId, title: 'other', template: { id: 'myteam/fanout' } });
+    const otherId = (other.result as { ticketId: string }).ticketId;
+    await h.activity.idle();
+    const read = vi.spyOn(h.store, 'readAggregate');
+    expectFailure(await asAgent(tokens.get('1') ?? '', 'node.done', { ticketId: otherId, nodeId: 'work', lane: '1', port: 'done' }), 'out_of_scope');
+    expectFailure(await asAgent(tokens.get('1') ?? '', 'artifact.add', { ticketId: otherId, nodeId: 'work', lane: '1', slot: 'x', ref: { kind: 'git', uri: 'x' } }), 'out_of_scope');
+    expect(read).not.toHaveBeenCalled();
+    read.mockRestore();
+    void ticketId;
   });
 
   it('keeps engine steps and agent results away from people and unverified clients', async () => {

@@ -27,6 +27,7 @@ import {
   createTicketEvents,
   definitionAbandon,
   definitionActivate,
+  laneScope,
   nodeApprove,
   nodeDone,
   nodeFinish,
@@ -72,10 +73,11 @@ export interface CommandHandler<T extends CommandType, S> {
   /** Ticket, node and run the command acts on, for the scope check. */
   readonly scope: (payload: CommandPayload<T>, target: Loaded<S> | undefined) => CommandTarget;
   /**
-   * True when `scope` needs the loaded target (e.g. a run's ticket and node). Otherwise the bus
-   * authorizes from the payload alone, before reading any aggregate.
+   * True (or true for this payload) when `scope` needs the loaded target (e.g. a run's ticket and node,
+   * or the run that drives a named lane). The bus first authorizes from the payload alone, before reading
+   * anything, and only then loads the target and authorizes again with the full scope.
    */
-  readonly scopeNeedsTarget?: boolean;
+  readonly scopeNeedsTarget?: boolean | ((payload: CommandPayload<T>) => boolean);
   readonly decide: (ctx: HandlerContext, payload: CommandPayload<T>, target: Loaded<S> | undefined) => Promise<Decision<T>>;
 }
 
@@ -128,7 +130,7 @@ type HandlerMap = { readonly [T in CommandType]: CommandHandler<T, never> };
 export interface ErasedHandler {
   readonly target?: (payload: unknown) => { readonly definition: AggregateDefinition<unknown>; readonly aggregateId: string };
   readonly scope: (payload: unknown, target: Loaded<unknown> | undefined) => CommandTarget;
-  readonly scopeNeedsTarget?: boolean;
+  readonly scopeNeedsTarget?: boolean | ((payload: unknown) => boolean);
   readonly decide: (ctx: HandlerContext, payload: unknown, target: Loaded<unknown> | undefined) => Promise<Decision<CommandType>>;
 }
 
@@ -187,18 +189,14 @@ export const HANDLERS: HandlerMap = {
 
   'artifact.add': handler<'artifact.add', TicketState>({
     target: ticketTarget,
-    scope: (payload) => ({ ticketId: payload.ticketId, nodeId: payload.nodeId }),
+    // Naming a lane its run does not drive is out of a node agent's scope (see laneScope).
+    scope: laneScope,
+    scopeNeedsTarget: (payload) => payload.lane !== undefined,
     decide: (ctx, payload, target) => {
       const ticket = requireTarget(target);
       if (!ticket.state.exists) return Promise.resolve(fail('not_found', `ticket ${payload.ticketId} does not exist`));
       const runId = ctx.caller.binding?.runId;
       const data = { ...payload, ...(runId === undefined ? {} : { runId }) };
-      if (runId !== undefined && payload.lane !== undefined) {
-        // An agent's artifacts belong to its own run's lane.
-        const owner = Object.hasOwn(ticket.state.runIndex, runId) ? ticket.state.runIndex[runId] : undefined;
-        const lane = owner === undefined ? undefined : ticket.state.nodes[owner.nodeId]?.executions[owner.run - 1]?.lane;
-        if (lane !== payload.lane) return Promise.resolve(fail('invariant_violated', `run ${runId} works on lane '${lane ?? '?'}', not '${payload.lane}'`));
-      }
       return Promise.resolve({
         ok: true,
         appends: [stream('ticket', ticket.aggregateId, ticket.revision, [{ type: 'artifact.added', data }])],

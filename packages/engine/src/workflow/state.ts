@@ -25,6 +25,8 @@ export interface Execution {
   readonly inputs: Readonly<Record<string, readonly HandoffItem[]>>;
   readonly feedback?: { readonly run: number; readonly comment?: string };
   readonly attempts: number;
+  /** Automatic restarts so far (engine restart, cancelled without a pause). Bounded by MAX_AUTOMATIC_ATTEMPTS. */
+  readonly requeues: number;
   readonly executor?: 'agent' | 'script';
   /** Agent runs of this execution, oldest first. The last one is current. */
   readonly runIds: readonly string[];
@@ -195,6 +197,7 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
         inputs: data.inputs,
         feedback: data.feedback,
         attempts: 0,
+        requeues: 0,
         runIds: [],
         routes: {},
         artifacts: {},
@@ -255,7 +258,13 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
     }
     case 'node.requeued':
       return setExecution(state, event.data.nodeId, event.data.run, (current) =>
-        withoutUndefined<Execution>({ ...current, status: 'queued', submitted: undefined, resumeFromRunId: event.data.resumeFromRunId }),
+        withoutUndefined<Execution>({
+          ...current,
+          status: 'queued',
+          requeues: current.requeues + 1,
+          submitted: undefined,
+          resumeFromRunId: event.data.resumeFromRunId,
+        }),
       );
     case 'node.pauseRequested':
       return setExecution(state, event.data.nodeId, event.data.run, (current) => ({ ...current, pauseRequested: true }));

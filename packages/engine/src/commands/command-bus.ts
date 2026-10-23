@@ -158,17 +158,23 @@ export class CommandBus {
     const targetRef = handler.target?.(payload);
     const loadTarget = () => (targetRef === undefined ? Promise.resolve(undefined) : this.load(targetRef.definition, targetRef.aggregateId));
 
-    // Authorize from the payload before reading anything, unless the scope depends on the target.
+    // Authorize from the payload before reading anything. When the scope depends on the target, a caller
+    // that passes this first check is authorized again once the target is loaded.
+    const needsTarget = typeof handler.scopeNeedsTarget === 'function' ? handler.scopeNeedsTarget(payload) : handler.scopeNeedsTarget === true;
     let target: Loaded<unknown> | undefined;
-    if (handler.scopeNeedsTarget === true) target = await loadTarget();
-    const scope = handler.scope(payload, target);
-    const decision = authorize(type, definition, caller, scope);
+    let scope = handler.scope(payload, undefined);
+    let decision = authorize(type, definition, caller, scope);
+    if (decision.ok && needsTarget) {
+      target = await loadTarget();
+      scope = handler.scope(payload, target);
+      decision = authorize(type, definition, caller, scope);
+    }
     if (!decision.ok) {
       const auditError = await this.recordDenial(caller, request, decision.code, decision.reason, scope);
       const details = auditError === undefined ? undefined : { audit: 'failed', auditError: auditError.message };
       return failure(commandError(decision.code, decision.reason, details), requestId);
     }
-    if (handler.scopeNeedsTarget !== true) target = await loadTarget();
+    if (!needsTarget) target = await loadTarget();
 
     if (request.expectedRevision !== undefined) {
       const actual = target?.revision ?? 0;

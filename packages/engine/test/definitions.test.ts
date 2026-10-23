@@ -123,6 +123,25 @@ describe('definition files', () => {
     expect(await h.store.query("SELECT * FROM p_definitions WHERE id = 'myteam/tiny'")).toEqual([]);
   });
 
+  it('does not let a template use a node type that is only staged', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    h.writer.stop();
+    const nodeType: DefinitionEnvelope = {
+      vuyro: 'export',
+      formatVersion: 1,
+      kind: 'nodeType',
+      id: 'myteam.task',
+      version: 1,
+      name: 'Task',
+      content: { type: 'myteam.task', version: 1, label: 'Task', completion: 'human', inputs: [{ name: 'in', label: 'In' }], outputs: [{ name: 'done', label: 'Done' }], params: [] },
+    };
+    await h.ok('nodeType.save', { definition: nodeType }, HUMAN);
+    const template = structuredClone(tinyTemplate());
+    template.content.nodes[0] = { id: 'task', type: 'myteam.task', version: 1 };
+    const failure = expectFailure(await h.exec('template.save', { definition: template }, HUMAN), 'validation_failed');
+    expect(JSON.stringify(failure.error.details)).toMatch(/myteam.task@1 is not available/);
+  });
+
   it("rejects node types this engine cannot run (fail closed on 'shared')", async () => {
     h = await openWorkflowHarness({ noEngine: true });
     const definition: DefinitionEnvelope = {
@@ -158,6 +177,11 @@ describe('definition files', () => {
     expect(staged).toMatchObject({ ok: true, result: { status: 'staged' } });
     const path = definitionPath(h.registry.root, 'template', 'myteam/tiny', 1);
     expect(await h.registry.fileHash('template', 'myteam/tiny', 1)).toBeUndefined();
+    // Staged is not usable yet, by latest or by exact version.
+    const project = await h.ok('project.create', { name: 'sample' });
+    const { projectId } = project.result as { projectId: string };
+    expectFailure(await h.exec('ticket.create', { projectId, title: 'x', template: { id: 'myteam/tiny' } }), 'not_found');
+    expectFailure(await h.exec('ticket.create', { projectId, title: 'x', template: { id: 'myteam/tiny', version: 1 } }), 'not_found');
     await h.restart({ noEngine: true });
     expect(await h.store.queryOne("SELECT status FROM p_definitions WHERE id = 'myteam/tiny'")).toEqual({ status: 'active' });
     expect(definitionHash(JSON.parse(readFileSync(path, 'utf8')) as DefinitionEnvelope)).toBe(definitionHash(tinyTemplate()));
