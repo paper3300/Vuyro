@@ -541,7 +541,7 @@ describe('node command boundary', () => {
   });
 
   it('refuses an agent naming a lane of another ticket before reading that ticket', async () => {
-    const { ticketId, tokens } = await twoLanes();
+    const { tokens } = await twoLanes();
     const project = await h.ok('project.create', { name: 'other' });
     const { projectId } = project.result as { projectId: string };
     const other = await h.ok('ticket.create', { projectId, title: 'other', template: { id: 'myteam/fanout' } });
@@ -552,7 +552,6 @@ describe('node command boundary', () => {
     expectFailure(await asAgent(tokens.get('1') ?? '', 'artifact.add', { ticketId: otherId, nodeId: 'work', lane: '1', slot: 'x', ref: { kind: 'git', uri: 'x' } }), 'out_of_scope');
     expect(read).not.toHaveBeenCalled();
     read.mockRestore();
-    void ticketId;
   });
 
   it('keeps engine steps and agent results away from people and unverified clients', async () => {
