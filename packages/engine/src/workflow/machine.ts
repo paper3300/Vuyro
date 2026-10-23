@@ -35,8 +35,9 @@ import {
  * - Each input port: every item gets a lane. An item whose lineage leads back to one of the node's own
  *   lanes re-runs that lane (rework, e.g. QA rejected item 3); other items open new lanes in one group.
  * - Input over a back edge (one that closes a loop, like approval reject → spec) is rework of the target.
- * - Join nodes wait until every source node (not every edge: a source's done and error edges are
- *   alternatives) has delivered, and at least one delivered something new.
+ * - Join nodes fire when one source delivered something new and every other source is settled: finished,
+ *   with nothing active that could still reach it (dead path elimination). Every completion re-checks
+ *   every join, because the path a join waited for can die anywhere upstream.
  * - An agent or script output that would deliver nothing (no items, or no item passes any edge condition)
  *   on a port that leads somewhere waits in Review (reason 'empty'), on every port, error included.
  *   Rejecting runs the node again; approving (or a person finishing a human node with no items) sends an
@@ -44,7 +45,8 @@ import {
  *   runs with no items, a join fires with what it has.
  * - Items whose lineage leads only to lanes of an older group of a fan-out target are stale (the work they
  *   answer was replaced, e.g. by a new plan): they are recorded as `stale` and delivered nowhere.
- * - The ticket is done when an end node (no output ports) finished, nothing else is active, and no lane's
+ * - The ticket is done when a path ended (an end node finished, or an execution finished successfully on a
+ *   port that leads nowhere: implicit end), nothing else is active, and no lane's
  *   latest run failed without an error edge taking the failure somewhere.
  */
 
@@ -232,7 +234,11 @@ function deliverEach(draft: WorkflowDraft, edgeIndex: number, source: Execution,
   });
 }
 
-/** Items a source node delivered over some edges: per lane of its current group, else from its latest run that used them. */
+/**
+ * What a source contributes to a join over some edges: per lane of its current group the lane's current
+ * run, else its latest finished run. A run that left through another port contributes nothing (that path
+ * was not taken this time), even if an older run once took this one.
+ */
 function gatherFrom(draft: WorkflowDraft, source: string, edges: readonly number[]): HandoffItem[] {
   const progress = nodeProgress(draft.state, source);
   const pick = (exec: Execution): HandoffItem[] => edges.flatMap((index) => routedItems(draft, index, exec));
@@ -244,11 +250,45 @@ function gatherFrom(draft: WorkflowDraft, source: string, edges: readonly number
     });
   }
   const latest = progress.executions
-    .filter((exec) => exec.completedOrder !== undefined && edges.some((index) => Object.hasOwn(exec.routes, index)))
+    .filter((exec) => exec.completedOrder !== undefined)
     .sort((a, b) => (b.completedOrder ?? 0) - (a.completedOrder ?? 0))[0];
   return latest === undefined ? [] : pick(latest);
 }
 
+/**
+ * Whether anything still in progress could make `source` deliver to `join`: an active execution at the
+ * source itself or at any node from which the source can be reached without passing through the join.
+ * Back edges count, so a review that may still send work back keeps the paths it can revive alive.
+ */
+function mayStillDeliver(draft: WorkflowDraft, source: string, join: string): boolean {
+  const group = nodeProgress(draft.state, source).group;
+  if (group !== undefined && !groupSettled(draft, group)) return true;
+  const active = [...draft.workflow.nodes.keys()].filter(
+    (nodeId) => nodeId !== join && nodeProgress(draft.state, nodeId).executions.some((exec) => ACTIVE_STATUSES.has(exec.status)),
+  );
+  const seen = new Set<string>(active);
+  const queue = [...active];
+  while (queue.length > 0) {
+    const nodeId = queue.shift() ?? '';
+    if (nodeId === source) return true;
+    for (const indexes of draft.node(nodeId).outgoing.values()) {
+      for (const index of indexes) {
+        const next = draft.workflow.edges[index]?.edge.to.node;
+        if (next === undefined || next === join || seen.has(next)) continue;
+        seen.add(next);
+        queue.push(next);
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Fires a join (dead path elimination, as in BPMN): it needs something new from at least one source, and
+ * every other source must be settled: its runs are over and nothing still active can reach it. A source
+ * whose latest run took another port, or that can no longer run at all, is a dead path and contributes
+ * nothing. A later loop can revive it; freshness is counted from the join's last activation.
+ */
 function tryJoin(draft: WorkflowDraft, target: CompiledNode): void {
   const progress = nodeProgress(draft.state, target.id);
   const bySource = new Map<string, number[]>();
@@ -259,11 +299,14 @@ function tryJoin(draft: WorkflowDraft, target: CompiledNode): void {
   const seqOf = (index: number): number | undefined => (Object.hasOwn(progress.deliveries, index) ? progress.deliveries[index] : undefined);
   let fresh = false;
   for (const [source, edges] of bySource) {
-    const seqs = edges.map(seqOf).filter((seq): seq is number => seq !== undefined);
-    if (seqs.length === 0) return;
-    if (seqs.some((seq) => seq > progress.consumed)) fresh = true;
+    const isFresh = edges.some((index) => (seqOf(index) ?? 0) > progress.consumed);
     const group = nodeProgress(draft.state, source).group;
-    if (group !== undefined && !groupSettled(draft, group)) return;
+    if (isFresh) {
+      if (group !== undefined && !groupSettled(draft, group)) return;
+      fresh = true;
+    } else if (mayStillDeliver(draft, source, target.id)) {
+      return;
+    }
   }
   if (!fresh) return;
   const inputs: Record<string, HandoffItem[]> = {};
@@ -273,6 +316,11 @@ function tryJoin(draft: WorkflowDraft, target: CompiledNode): void {
     );
   }
   activate(draft, target.id, MAIN, 'input', inputs);
+}
+
+/** Re-checks every join: a completion anywhere can kill the last path a join was waiting for. */
+function sweepJoins(draft: WorkflowDraft): void {
+  for (const node of draft.workflow.nodes.values()) if (node.completion === 'join') tryJoin(draft, node);
 }
 
 /** What one finished execution means for the node at the other end of one of its outgoing edges. */
@@ -386,6 +434,7 @@ export function complete(
     if (emptied.has(edgeIndex)) propagateEmpty(draft, edgeIndex, new Set());
     else propagate(draft, edgeIndex, finished, routed.has(edgeIndex));
   }
+  sweepJoins(draft);
   completeTicketIfDone(draft);
 }
 
@@ -462,8 +511,21 @@ export function ticketWaitReasons(state: TicketWorkflow, workflow: CompiledWorkf
   return reasons;
 }
 
+/**
+ * A path ended: an end node finished, or (implicit end, as in BPMN) an execution finished successfully
+ * through a port that leads nowhere (no edges took anything, not even an empty delivery).
+ */
 export function endReached(state: TicketWorkflow, workflow: CompiledWorkflow): boolean {
-  return workflow.ends.some((id) => nodeProgress(state, id).executions.some((exec) => exec.status === 'done'));
+  // An empty delivery that passed over a fan-out node with no further edges ended its path there too.
+  if (state.pathEnds > 0) return true;
+  const ends = new Set(workflow.ends);
+  for (const nodeId of workflow.nodes.keys()) {
+    for (const exec of nodeProgress(state, nodeId).executions) {
+      if (exec.status !== 'done') continue;
+      if (ends.has(nodeId) || Object.keys(exec.routes).length === 0) return true;
+    }
+  }
+  return false;
 }
 
 export function completeTicketIfDone(draft: WorkflowDraft): void {

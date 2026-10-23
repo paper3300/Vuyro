@@ -76,6 +76,8 @@ export interface TicketWorkflow {
   readonly groups: Readonly<Record<string, { readonly node: string; readonly parent?: string }>>;
   readonly deliverySeq: number;
   readonly completions: number;
+  /** Empty deliveries that ended at a passed-over fan-out node with nowhere further to go (implicit ends). */
+  readonly pathEnds: number;
   /** Agent run id → execution. */
   readonly runIndex: Readonly<Record<string, { readonly nodeId: string; readonly run: number }>>;
 }
@@ -89,6 +91,7 @@ export const EMPTY_TICKET: TicketWorkflow = {
   groups: {},
   deliverySeq: 0,
   completions: 0,
+  pathEnds: 0,
   runIndex: {},
 };
 
@@ -257,7 +260,11 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
     }
     case 'node.passedOver': {
       const { data } = event;
-      let next: TicketWorkflow = { ...state, groups: { ...state.groups, [data.group]: { node: data.nodeId } } };
+      let next: TicketWorkflow = {
+        ...state,
+        groups: { ...state.groups, [data.group]: { node: data.nodeId } },
+        pathEnds: state.pathEnds + (data.edges.length === 0 ? 1 : 0),
+      };
       next = setNode(next, data.nodeId, (node) => ({ ...node, group: data.group }));
       return deliver(next, data.edges);
     }

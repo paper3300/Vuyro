@@ -164,8 +164,11 @@ export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}):
           continue; // Tests that tamper with definition files check that on their own.
         }
         if (ticketWaitReasons(state, workflow).length === 0) {
-          const where = endReached(state, workflow) ? 'an end node finished' : 'no end node finished';
-          throw new Error(`ticket ${ticketId}: ${where} and nothing is waiting, but the ticket is still open (stuck)`);
+          const where = endReached(state, workflow) ? 'a path ended' : 'no path ended';
+          const runs = Object.entries(state.nodes).flatMap(([nodeId, progress]) =>
+            progress.executions.map((exec) => `${nodeId}/${exec.lane}#${exec.run}:${exec.status}:${exec.output?.port ?? '-'}:${JSON.stringify(exec.routes)}`),
+          );
+          throw new Error(`ticket ${ticketId}: ${where} and nothing is waiting, but the ticket is still open (stuck) [${runs.join(' ')}]`);
         }
       }
     },

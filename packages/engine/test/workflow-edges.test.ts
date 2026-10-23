@@ -152,6 +152,67 @@ describe('routing edge cases', () => {
     expect((await h.ticket(ticketId)).status).toBe('done');
   });
 
+  it('joins a branch whose taken path goes through a middle node, ignoring the path not taken', async () => {
+    // A: done -> C -> join, error -> join. Whichever way A goes, the join must fire once.
+    for (const outcome of ['done', 'error'] as const) {
+      const ran: string[] = [];
+      h = await openWorkflowHarness({
+        behavior: async (s) => {
+          const { ticketId, nodeId } = s.request;
+          ran.push(nodeId);
+          const port = nodeId === 'a' ? outcome : 'done';
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port, data: { from: nodeId } }));
+          return undefined;
+        },
+      });
+      await save(
+        h,
+        template(
+          'myteam/branch',
+          [agent('a'), agent('c'), { id: 'join', type: 'vuyro.join', version: 1 }, { id: 'end', type: 'vuyro.end', version: 1 }],
+          [edge('a', 'done', 'c'), edge('a', 'error', 'join'), edge('c', 'done', 'join'), edge('join', 'done', 'end')],
+        ),
+      );
+      const ticketId = await ticketFor(h, 'myteam/branch');
+      await h.drive();
+      const state = await h.ticket(ticketId);
+      expect(state.status, outcome).toBe('done');
+      const joins = nodeProgress(state, 'join').executions;
+      expect(joins, outcome).toHaveLength(1);
+      expect(joins[0]?.output?.items.map((item) => item.data.from), outcome).toEqual(outcome === 'done' ? ['c'] : ['a']);
+      expect(ran, outcome).toEqual(outcome === 'done' ? ['a', 'c'] : ['a']);
+      await h.close();
+    }
+    h = await openWorkflowHarness();
+  });
+
+  it('revives a dead join path when a rejection loop runs the branch again', async () => {
+    // First pass A fails (error -> join, C is dead). QA rejects; A runs again and this time goes through C.
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId, run } = s.request;
+        if (nodeId === 'a') expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: run === 1 ? 'error' : 'done', data: { from: `a${run}` } }));
+        else if (nodeId === 'c') expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { from: `c${run}` } }));
+        else expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: run === 1 ? 'reject' : 'approve', ...(run === 1 ? { data: { feedback: 'again' } } : {}) }));
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/revive',
+        [{ id: 'start', type: 'vuyro.human-task', version: 1 }, agent('a'), agent('c'), { id: 'join', type: 'vuyro.join', version: 1 }, { id: 'qa', type: 'vuyro.review-agent', version: 1, params: { instructions: 'check' } }, { id: 'end', type: 'vuyro.end', version: 1 }],
+        [edge('start', 'done', 'a'), edge('a', 'done', 'c'), edge('a', 'error', 'join'), edge('c', 'done', 'join'), edge('join', 'done', 'qa'), edge('qa', 'approve', 'end'), edge('qa', 'reject', 'a')],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/revive');
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.drive();
+    const state = await h.ticket(ticketId);
+    expect(state.status).toBe('done');
+    expect(nodeProgress(state, 'join').executions.map((exec) => exec.output?.items.map((item) => item.data.from))).toEqual([['a1'], ['c1']]);
+  });
+
   it('does not let a failed lane of a replaced plan keep the ticket open', async () => {
     let planRun = 0;
     h = await openWorkflowHarness({
