@@ -1,7 +1,12 @@
 import {
   DACL_SECURITY_INFORMATION,
   ERROR_INSUFFICIENT_BUFFER,
-  GENERIC_WRITE,
+  FILE_NAME_INFO_CLASS,
+  FILE_PIPE_CONNECTED_STATE,
+  FILE_PIPE_LOCAL_INFORMATION_CLASS,
+  FILE_PIPE_REJECT_REMOTE_CLIENTS,
+  FILE_READ_ATTRIBUTES,
+  FILE_SHARE_ALL,
   GROUP_SECURITY_INFORMATION,
   type Handle,
   INVALID_HANDLE_VALUE,
@@ -9,11 +14,14 @@ import {
   OPEN_EXISTING,
   type OutSlot,
   OWNER_SECURITY_INFORMATION,
+  PIPE_SERVER_END,
+  PROCESS_HANDLE_INFORMATION_CLASS,
   PROCESS_QUERY_LIMITED_INFORMATION,
   PROTECTED_DACL_SECURITY_INFORMATION,
   READ_CONTROL,
   SDDL_REVISION_1,
   SE_KERNEL_OBJECT,
+  STATUS_INFO_LENGTH_MISMATCH,
   TOKEN_QUERY,
   TOKEN_USER_CLASS,
   WRITE_DAC,
@@ -24,9 +32,10 @@ import {
  * Named pipe security helpers.
  *
  * A pipe's security descriptor is shared by all of its instances, and any handle
- * opened with WRITE_DAC can replace it. Opening the pipe as a client is the only
- * way to get such a handle from JS (Node keeps the server handles private), so
- * every helper here opens a short-lived client connection.
+ * opened with WRITE_DAC can replace it. Node keeps its server handles private, so:
+ * - the server side finds its own instance handles in this process's handle table
+ *   (`findOwnPipeServerInstances`); libuv opens them with WRITE_DAC;
+ * - the other helpers open a short-lived client connection.
  */
 
 export class Win32Error extends Error {
@@ -49,6 +58,11 @@ export interface CurrentUserOnlyOptions {
   /**
    * Deny network logons (SMB `\\host\pipe\...`), even for the same account.
    * Default true. Note that OpenSSH sessions are network logons too.
+   *
+   * This ACE is the only remote-access control available: libuv creates the
+   * instances without PIPE_REJECT_REMOTE_CLIENTS (checked through
+   * `PipeServerInstance.rejectsRemoteClients`), and that flag cannot be added
+   * afterwards. Its effect from another PC is still to be measured before release.
    */
   readonly rejectRemote?: boolean;
 }
@@ -79,32 +93,38 @@ export function readPipeSecurity(pipePath: string): PipeSecurity {
 }
 
 /**
- * Replaces the DACL of an existing pipe and returns the descriptor read back
- * through the same handle. Applies to every instance of the pipe.
+ * Replaces the DACL of an existing pipe through a client connection and returns
+ * the descriptor read back through the same handle. Applies to every instance.
  */
 export function setPipeDacl(pipePath: string, sddl: string): PipeSecurity {
-  return withPipeHandle(pipePath, (READ_CONTROL | WRITE_DAC) >>> 0, (handle) => {
-    const w = win32();
-    const out: OutSlot<NativePointer> = [null];
-    if (!w.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, out, null)) {
-      throw new Win32Error('ConvertStringSecurityDescriptorToSecurityDescriptorW', w.GetLastError());
+  return withPipeHandle(pipePath, (READ_CONTROL | WRITE_DAC) >>> 0, (handle) => setPipeDaclOnHandle(handle, sddl));
+}
+
+/**
+ * Replaces the DACL through any handle of the pipe that has WRITE_DAC
+ * (a server instance or a client end) and reads it back through the same handle.
+ */
+export function setPipeDaclOnHandle(handle: Handle, sddl: string): PipeSecurity {
+  const w = win32();
+  const out: OutSlot<NativePointer> = [null];
+  if (!w.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, out, null)) {
+    throw new Win32Error('ConvertStringSecurityDescriptorToSecurityDescriptorW', w.GetLastError());
+  }
+  const sd = required(out, 'ConvertStringSecurityDescriptorToSecurityDescriptorW');
+  try {
+    const present: OutSlot<number> = [0];
+    const dacl: OutSlot<NativePointer> = [null];
+    if (!w.GetSecurityDescriptorDacl(sd, present, dacl, [0])) {
+      throw new Win32Error('GetSecurityDescriptorDacl', w.GetLastError());
     }
-    const sd = required(out, 'ConvertStringSecurityDescriptorToSecurityDescriptorW');
-    try {
-      const present: OutSlot<number> = [0];
-      const dacl: OutSlot<NativePointer> = [null];
-      if (!w.GetSecurityDescriptorDacl(sd, present, dacl, [0])) {
-        throw new Win32Error('GetSecurityDescriptorDacl', w.GetLastError());
-      }
-      if (!present[0]) throw new Error(`SDDL has no DACL: ${sddl}`);
-      const info = (DACL_SECURITY_INFORMATION | (sddl.includes('D:P') ? PROTECTED_DACL_SECURITY_INFORMATION : 0)) >>> 0;
-      const rc = w.SetSecurityInfo(handle, SE_KERNEL_OBJECT, info, null, null, required(dacl, 'GetSecurityDescriptorDacl'), null);
-      if (rc !== 0) throw new Win32Error('SetSecurityInfo', rc);
-    } finally {
-      w.LocalFree(sd);
-    }
-    return readSecurity(handle);
-  });
+    if (!present[0]) throw new Error(`SDDL has no DACL: ${sddl}`);
+    const info = (DACL_SECURITY_INFORMATION | (sddl.includes('D:P') ? PROTECTED_DACL_SECURITY_INFORMATION : 0)) >>> 0;
+    const rc = w.SetSecurityInfo(handle, SE_KERNEL_OBJECT, info, null, null, required(dacl, 'GetSecurityDescriptorDacl'), null);
+    if (rc !== 0) throw new Win32Error('SetSecurityInfo', rc);
+  } finally {
+    w.LocalFree(sd);
+  }
+  return readSecurity(handle);
 }
 
 /**
@@ -129,26 +149,140 @@ export function getPipeServerUserSid(pipePath: string): string {
     if (!w.GetNamedPipeServerProcessId(handle, pid)) {
       throw new Win32Error('GetNamedPipeServerProcessId', w.GetLastError());
     }
-    const process = w.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid[0] ?? 0);
-    if (process === 0) throw new Win32Error('OpenProcess', w.GetLastError());
-    try {
-      return processUserSid(process);
-    } finally {
-      w.CloseHandle(process);
-    }
+    return getProcessUserSid(pid[0] ?? 0);
   });
 }
 
-/** Connects as a client, writes `data` and disconnects. */
-export function writeToPipe(pipePath: string, data: Buffer): void {
-  withPipeHandle(pipePath, GENERIC_WRITE, (handle) => {
-    const w = win32();
-    const written: OutSlot<number> = [0];
-    if (!w.WriteFile(handle, data, data.length, written, null)) {
-      throw new Win32Error('WriteFile', w.GetLastError());
+/** User SID of a running process. Throws if the process cannot be opened. */
+export function getProcessUserSid(pid: number): string {
+  const w = win32();
+  const process = w.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+  if (process === 0) throw new Win32Error(`OpenProcess(${pid})`, w.GetLastError());
+  try {
+    return processUserSid(process);
+  } finally {
+    w.CloseHandle(process);
+  }
+}
+
+export interface PipeServerInstance {
+  readonly handle: Handle;
+  /** Process id of the connected client, if a client is connected to this instance. */
+  readonly clientPid: number | undefined;
+  /** Whether the instance was created with PIPE_REJECT_REMOTE_CLIENTS. */
+  readonly rejectsRemoteClients: boolean;
+}
+
+const LOCAL_PIPE_PREFIX = String.raw`\\.\pipe` + '\\';
+
+/**
+ * Server-end instances of `pipePath` held by this process: the listening
+ * instances and the accepted connections that libuv created.
+ *
+ * Only handles of type File that were granted WRITE_DAC are queried (libuv
+ * requests it for every server instance). Those are overlapped handles, so the
+ * pipe queries below cannot block on a pending synchronous read.
+ */
+export function findOwnPipeServerInstances(pipePath: string): PipeServerInstance[] {
+  if (!pipePath.toLowerCase().startsWith(LOCAL_PIPE_PREFIX)) throw new Error(`Not a local pipe path: ${pipePath}`);
+  const expectedName = `\\${pipePath.slice(LOCAL_PIPE_PREFIX.length)}`.toLowerCase();
+  const w = win32();
+  const fileType = fileObjectTypeIndex();
+  const instances: PipeServerInstance[] = [];
+  for (const entry of ownHandles()) {
+    if (entry.objectType !== fileType || (entry.grantedAccess & WRITE_DAC) === 0) continue;
+    const flags: OutSlot<number> = [0];
+    if (!w.GetNamedPipeInfo(entry.handle, flags, null, null, null) || ((flags[0] ?? 0) & PIPE_SERVER_END) === 0) continue;
+    if (fileName(entry.handle)?.toLowerCase() !== expectedName) continue;
+    const local = pipeLocalInformation(entry.handle);
+    let clientPid: number | undefined;
+    if (local.state === FILE_PIPE_CONNECTED_STATE) {
+      const pid: OutSlot<number> = [0];
+      if (w.GetNamedPipeClientProcessId(entry.handle, pid)) clientPid = pid[0] ?? undefined;
     }
-    if (written[0] !== data.length) throw new Error(`Short pipe write: ${written[0] ?? 0}/${data.length}`);
-  });
+    instances.push({
+      handle: entry.handle,
+      clientPid,
+      rejectsRemoteClients: (local.type & FILE_PIPE_REJECT_REMOTE_CLIENTS) !== 0,
+    });
+  }
+  return instances;
+}
+
+/** Forcibly disconnects the client of a server instance; unread data is discarded. */
+export function disconnectPipeInstance(handle: Handle): void {
+  const w = win32();
+  if (!w.DisconnectNamedPipe(handle)) throw new Win32Error('DisconnectNamedPipe', w.GetLastError());
+}
+
+interface HandleEntry {
+  readonly handle: Handle;
+  readonly grantedAccess: number;
+  readonly objectType: number;
+}
+
+/** PROCESS_HANDLE_SNAPSHOT_INFORMATION of the current process (Windows 8+). */
+function ownHandles(): HandleEntry[] {
+  const w = win32();
+  let size = 64 * 1024;
+  for (;;) {
+    const buffer = Buffer.alloc(size);
+    const returned: OutSlot<number> = [0];
+    const status = w.NtQueryInformationProcess(w.GetCurrentProcess(), PROCESS_HANDLE_INFORMATION_CLASS, buffer, size, returned);
+    if (status >>> 0 === STATUS_INFO_LENGTH_MISMATCH) {
+      size = Math.max(size * 2, (returned[0] ?? 0) + 4096);
+      continue;
+    }
+    if (status !== 0) throw new Error(`NtQueryInformationProcess failed with NTSTATUS 0x${(status >>> 0).toString(16)}`);
+    // { ULONG_PTR NumberOfHandles; ULONG_PTR Reserved; PROCESS_HANDLE_TABLE_ENTRY_INFO Handles[]; }
+    // entry (40 bytes): HANDLE HandleValue; ULONG_PTR HandleCount, PointerCount;
+    //                   ULONG GrantedAccess, ObjectTypeIndex, HandleAttributes, Reserved
+    const count = Number(buffer.readBigUInt64LE(0));
+    const entries: HandleEntry[] = [];
+    for (let i = 0; i < count; i++) {
+      const offset = 16 + i * 40;
+      entries.push({
+        handle: Number(buffer.readBigUInt64LE(offset)),
+        grantedAccess: buffer.readUInt32LE(offset + 24),
+        objectType: buffer.readUInt32LE(offset + 28),
+      });
+    }
+    return entries;
+  }
+}
+
+let fileTypeIndex: number | undefined;
+
+/** Object type index of "File", taken from a handle we open to our own executable. */
+function fileObjectTypeIndex(): number {
+  if (fileTypeIndex !== undefined) return fileTypeIndex;
+  const w = win32();
+  const handle = w.CreateFileW(process.execPath, FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, null, OPEN_EXISTING, 0, null);
+  if (handle === INVALID_HANDLE_VALUE) throw new Win32Error('CreateFileW(execPath)', w.GetLastError());
+  try {
+    const entry = ownHandles().find((candidate) => candidate.handle === handle);
+    if (entry === undefined) throw new Error('Reference file handle not found in the handle snapshot');
+    fileTypeIndex = entry.objectType;
+    return fileTypeIndex;
+  } finally {
+    w.CloseHandle(handle);
+  }
+}
+
+/** FILE_NAME_INFO { DWORD FileNameLength; WCHAR FileName[]; }; for a pipe this is `\<name>`. */
+function fileName(handle: Handle): string | undefined {
+  const buffer = Buffer.alloc(1024);
+  if (!win32().GetFileInformationByHandleEx(handle, FILE_NAME_INFO_CLASS, buffer, buffer.length)) return undefined;
+  return buffer.toString('utf16le', 4, 4 + buffer.readUInt32LE(0));
+}
+
+/** FILE_PIPE_LOCAL_INFORMATION: ten ULONGs; NamedPipeType at 0, NamedPipeState at 32. */
+function pipeLocalInformation(handle: Handle): { type: number; state: number } {
+  const ioStatus = Buffer.alloc(16);
+  const info = Buffer.alloc(40);
+  const status = win32().NtQueryInformationFile(handle, ioStatus, info, info.length, FILE_PIPE_LOCAL_INFORMATION_CLASS);
+  if (status !== 0) throw new Error(`NtQueryInformationFile failed with NTSTATUS 0x${(status >>> 0).toString(16)}`);
+  return { type: info.readUInt32LE(0), state: info.readUInt32LE(32) };
 }
 
 /** Opens a client handle to a pipe, runs `fn` and closes the handle. */

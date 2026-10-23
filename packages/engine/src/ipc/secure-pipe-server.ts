@@ -1,39 +1,47 @@
-import { randomBytes } from 'node:crypto';
 import net from 'node:net';
 import {
   allowedTrustees,
   currentUserOnlySddl,
+  disconnectPipeInstance,
+  findOwnPipeServerInstances,
   getCurrentUserSid,
+  getProcessUserSid,
   type PipeSecurity,
-  setPipeDacl,
-  writeToPipe,
+  setPipeDaclOnHandle,
 } from '../platform/win32/pipe-security.ts';
 
 /**
- * Named pipe server that only accepts connections from the current Windows user.
+ * Named pipe server that only serves the current Windows user.
  *
  * Node creates the pipe with the default descriptor, which also grants read
- * access to Everyone and Anonymous. We replace the DACL right after `listen`,
- * which leaves a short window in which someone else could already connect.
- * To close it, every connection accepted before the DACL was in place is dropped:
+ * access to Everyone and Anonymous, and offers no way to pass another one.
+ * Two independent measures close that gap without relying on accept order:
  *
- * 1. listen (libuv uses FILE_FLAG_FIRST_PIPE_INSTANCE, so a squatted name fails here)
- * 2. replace the DACL and verify it through the same client handle
- * 3. connect once more and send a random nonce (this connection is subject to the new DACL)
- * 4. connections accepted up to and including the nonce connection are destroyed;
- *    only later ones reach `onConnection`
+ * 1. Right after `listen`, the DACL is replaced through one of our own server
+ *    instance handles (found in this process's handle table). The descriptor is
+ *    shared by all instances, so from then on the OS refuses other users at open time.
+ * 2. Client check: after the DACL is applied and again whenever a connection
+ *    arrives, every connected instance's client process is looked up
+ *    (GetNamedPipeClientProcessId → process token user SID). Instances whose client
+ *    is not accepted are disconnected at the OS level, which discards unread data.
+ *    Sockets start paused, so nothing is read before the check has run.
  *
- * Accept order equals connect order because libuv takes pipe connections off a
- * single I/O completion port in FIFO order.
+ * Connections that Node dispatches before the server is secured are destroyed.
  */
+
+export interface PipeClient {
+  readonly pid: number;
+  /** undefined when the client process could not be opened. */
+  readonly userSid: string | undefined;
+}
 
 export interface SecurePipeServerOptions {
   /** DACL to apply. Defaults to the current user only, remote logons denied. */
   readonly sddl?: string;
-  /** How long to wait for our own gate connection. Default 5000 ms. */
-  readonly gateTimeoutMs?: number;
-  /** Test seam: runs after `listen` and before the DACL is replaced. */
-  readonly afterListen?: () => void;
+  /** Which clients to serve. Defaults to processes running as the current user. */
+  readonly acceptClient?: (client: PipeClient) => boolean;
+  /** Test seam: runs after `listen` and before the pipe is secured. */
+  readonly afterListen?: () => Promise<void> | void;
 }
 
 export interface SecurePipeServer {
@@ -41,24 +49,21 @@ export interface SecurePipeServer {
   readonly server: net.Server;
   /** Descriptor read back after the DACL was applied. */
   readonly security: PipeSecurity;
-  /** Connections dropped because they were accepted before the gate (includes our own DACL connection). */
-  readonly droppedBeforeGate: number;
+  /** Connections destroyed because Node dispatched them before the pipe was secured. */
+  readonly droppedBeforeSecure: number;
+  /** Client connections disconnected by the client check. */
+  readonly rejectedClients: number;
   close(): Promise<void>;
 }
 
-interface EarlyConnection {
-  readonly socket: net.Socket;
-  readonly chunks: Buffer[];
-  length: number;
-  stopInspecting: () => void;
-  release: () => void;
-}
-
-const NONCE_BYTES = 32;
-
+/**
+ * `onConnection` receives a paused socket. The socket is resumed once the
+ * handler returns, or once its returned promise settles, so a handler may set
+ * up its listeners asynchronously without losing the first request.
+ */
 export async function listenSecurePipe(
   pipePath: string,
-  onConnection: (socket: net.Socket) => void,
+  onConnection: (socket: net.Socket) => Promise<void> | void,
   options: SecurePipeServerOptions = {},
 ): Promise<SecurePipeServer> {
   if (process.platform !== 'win32') {
@@ -66,74 +71,38 @@ export async function listenSecurePipe(
   }
   const userSid = getCurrentUserSid();
   const sddl = options.sddl ?? currentUserOnlySddl(userSid);
-  const nonce = randomBytes(NONCE_BYTES);
+  const acceptClient = options.acceptClient ?? ((client: PipeClient) => client.userSid === userSid);
   const server = net.createServer({ pauseOnConnect: true });
 
-  const early: EarlyConnection[] = [];
-  let gateOpen = false;
-  let droppedBeforeGate = 0;
-  let gateResolved: () => void = () => undefined;
-  const gate = new Promise<void>((resolve) => {
-    gateResolved = resolve;
-  });
+  let secured = false;
+  let droppedBeforeSecure = 0;
+  let rejectedClients = 0;
 
-  const handOff = (socket: net.Socket): void => {
-    onConnection(socket);
-    if (socket.listenerCount('readable') === 0) socket.resume();
-  };
-
-  const openGate = (nonceIndex: number): void => {
-    gateOpen = true;
-    early.forEach((connection, index) => {
-      connection.stopInspecting();
-      if (index <= nonceIndex) {
-        connection.socket.destroy();
-        if (index < nonceIndex) droppedBeforeGate += 1;
-        return;
-      }
-      connection.release();
-      if (connection.length > 0) connection.socket.unshift(Buffer.concat(connection.chunks));
-      handOff(connection.socket);
-    });
-    early.length = 0;
-    gateResolved();
-  };
-
-  const inspect = (socket: net.Socket): void => {
-    const connection: EarlyConnection = {
-      socket,
-      chunks: [],
-      length: 0,
-      stopInspecting: () => undefined,
-      release: () => undefined,
-    };
-    const index = early.push(connection) - 1;
-    const onReadable = (): void => {
-      let chunk: unknown;
-      while (connection.length < NONCE_BYTES && (chunk = socket.read()) !== null) {
-        const buffer = chunk as Buffer;
-        connection.chunks.push(buffer);
-        connection.length += buffer.length;
-      }
-      if (connection.length < NONCE_BYTES) return;
-      connection.stopInspecting();
-      if (Buffer.concat(connection.chunks).subarray(0, NONCE_BYTES).equals(nonce)) openGate(index);
-    };
-    const onError = (): void => undefined;
-    socket.on('readable', onReadable);
-    socket.on('error', onError);
-    connection.stopInspecting = () => {
-      socket.off('readable', onReadable);
-    };
-    // Untrusted sockets keep a no-op error handler until they are destroyed.
-    connection.release = () => {
-      socket.off('error', onError);
-    };
+  const checkClients = (): void => {
+    for (const instance of findOwnPipeServerInstances(pipePath)) {
+      if (instance.clientPid === undefined) continue;
+      if (acceptClient({ pid: instance.clientPid, userSid: tryProcessUserSid(instance.clientPid) })) continue;
+      disconnectPipeInstance(instance.handle);
+      rejectedClients += 1;
+    }
   };
 
   server.on('connection', (socket) => {
-    if (gateOpen) handOff(socket);
-    else inspect(socket);
+    socket.on('error', () => undefined);
+    if (!secured) {
+      droppedBeforeSecure += 1;
+      socket.destroy();
+      return;
+    }
+    try {
+      // This socket's own instance is among those checked; a rejected one ends right after resume.
+      checkClients();
+    } catch {
+      // Fail closed: without a completed check the connection is not served.
+      socket.destroy();
+      return;
+    }
+    void handOff(socket, onConnection);
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -144,26 +113,20 @@ export async function listenSecurePipe(
     });
   });
 
-  const close = (): Promise<void> =>
-    new Promise((resolve) => {
-      for (const connection of early) connection.socket.destroy();
-      server.close(() => {
-        resolve();
-      });
-    });
-
   let security: PipeSecurity;
   try {
-    options.afterListen?.();
-    security = setPipeDacl(pipePath, sddl);
+    await options.afterListen?.();
+    const instance = findOwnPipeServerInstances(pipePath)[0];
+    if (instance === undefined) throw new Error(`No server instance handle found for ${pipePath}`);
+    security = setPipeDaclOnHandle(instance.handle, sddl);
     const trustees = allowedTrustees(security.sddl);
     if (options.sddl === undefined && (trustees.length !== 1 || trustees[0] !== userSid)) {
       throw new Error(`Pipe DACL was not restricted to the current user: ${security.sddl}`);
     }
-    writeToPipe(pipePath, nonce);
-    await withTimeout(gate, options.gateTimeoutMs ?? 5000, 'Timed out waiting for the pipe gate connection');
+    checkClients();
+    secured = true;
   } catch (error) {
-    await close();
+    await new Promise<void>((resolve) => server.close(() => { resolve(); }));
     throw error;
   }
 
@@ -171,23 +134,36 @@ export async function listenSecurePipe(
     path: pipePath,
     server,
     security,
-    get droppedBeforeGate() {
-      return droppedBeforeGate;
+    get droppedBeforeSecure() {
+      return droppedBeforeSecure;
     },
-    close,
+    get rejectedClients() {
+      return rejectedClients;
+    },
+    close: () =>
+      new Promise((resolve) => {
+        server.close(() => {
+          resolve();
+        });
+      }),
   };
 }
 
-async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(message));
-    }, ms);
-  });
+async function handOff(socket: net.Socket, onConnection: (socket: net.Socket) => Promise<void> | void): Promise<void> {
   try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(timer);
+    await onConnection(socket);
+  } catch {
+    socket.destroy();
+    return;
+  }
+  // Respect handlers that consume the stream themselves ('readable', pipe(), resume()).
+  if (!socket.destroyed && socket.readableFlowing !== true && socket.listenerCount('readable') === 0) socket.resume();
+}
+
+function tryProcessUserSid(pid: number): string | undefined {
+  try {
+    return getProcessUserSid(pid);
+  } catch {
+    return undefined;
   }
 }

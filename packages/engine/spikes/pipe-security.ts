@@ -10,6 +10,7 @@ import { listenSecurePipe } from '../src/ipc/secure-pipe-server.ts';
 import {
   allowedTrustees,
   currentUserOnlySddl,
+  findOwnPipeServerInstances,
   getCurrentUserSid,
   readPipeSecurity,
   setPipeDacl,
@@ -74,8 +75,10 @@ console.log(`Node ${process.version} (${process.platform} ${process.arch})\n`);
   console.log('## listenSecurePipe()\n');
   console.log(`SDDL: ${redact(last.security.sddl)}`);
   console.log(`allowed: ${redact(allowedTrustees(last.security.sddl).join(', '))}`);
-  console.log(`dropped before gate: ${last.droppedBeforeGate}`);
-  console.log(`time to listen + secure + gate: median ${sorted[runs >> 1]?.toFixed(2)} ms, max ${sorted.at(-1)?.toFixed(2)} ms (${runs} runs)`);
+  console.log(`dropped before secure: ${last.droppedBeforeSecure}, rejected clients: ${last.rejectedClients}`);
+  const instances = findOwnPipeServerInstances(last.path);
+  console.log(`server instances: ${instances.length}, PIPE_REJECT_REMOTE_CLIENTS set: ${instances.some((i) => i.rejectsRemoteClients)}`);
+  console.log(`time to listen + secure: median ${sorted[runs >> 1]?.toFixed(2)} ms, max ${sorted.at(-1)?.toFixed(2)} ms (${runs} runs)`);
   const pipeName = last.path.slice(local('').length);
   console.log(`connect locally: ${await tryConnect(last.path)}`);
   console.log(`connect via \\\\localhost: ${await tryConnect(viaSmb('localhost', pipeName))}`);

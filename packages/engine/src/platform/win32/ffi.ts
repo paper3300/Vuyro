@@ -23,6 +23,8 @@ export const GENERIC_WRITE = 0x40000000;
 export const READ_CONTROL = 0x00020000;
 export const WRITE_DAC = 0x00040000;
 export const OPEN_EXISTING = 3;
+export const FILE_READ_ATTRIBUTES = 0x0080;
+export const FILE_SHARE_ALL = 0x7;
 
 export const OWNER_SECURITY_INFORMATION = 0x1;
 export const GROUP_SECURITY_INFORMATION = 0x2;
@@ -34,6 +36,15 @@ export const SDDL_REVISION_1 = 1;
 export const TOKEN_QUERY = 0x0008;
 export const TOKEN_USER_CLASS = 1;
 export const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+export const PIPE_SERVER_END = 0x1;
+/** FILE_PIPE_LOCAL_INFORMATION.NamedPipeType bit set by PIPE_REJECT_REMOTE_CLIENTS. */
+export const FILE_PIPE_REJECT_REMOTE_CLIENTS = 0x2;
+export const FILE_PIPE_CONNECTED_STATE = 3;
+export const FILE_NAME_INFO_CLASS = 2;
+export const FILE_PIPE_LOCAL_INFORMATION_CLASS = 24;
+export const PROCESS_HANDLE_INFORMATION_CLASS = 51;
+export const STATUS_INFO_LENGTH_MISMATCH = 0xc0000004;
 
 export const ERROR_FILE_NOT_FOUND = 2;
 export const ERROR_ACCESS_DENIED = 5;
@@ -59,6 +70,14 @@ export interface Win32 {
   GetCurrentProcess(): Handle;
   OpenProcess(access: number, inherit: number, pid: number): Handle;
   GetNamedPipeServerProcessId(pipe: Handle, pid: OutSlot<number>): number;
+  GetNamedPipeClientProcessId(pipe: Handle, pid: OutSlot<number>): number;
+  GetNamedPipeInfo(pipe: Handle, flags: OutSlot<number>, outSize: null, inSize: null, maxInstances: null): number;
+  DisconnectNamedPipe(pipe: Handle): number;
+  GetFileInformationByHandleEx(handle: Handle, cls: number, buffer: Buffer, length: number): number;
+  /** Returns an NTSTATUS. */
+  NtQueryInformationProcess(process: Handle, cls: number, buffer: Buffer, length: number, returned: OutSlot<number>): number;
+  /** Returns an NTSTATUS. `ioStatus` is a 16-byte IO_STATUS_BLOCK. */
+  NtQueryInformationFile(handle: Handle, ioStatus: Buffer, buffer: Buffer, length: number, cls: number): number;
   OpenProcessToken(process: Handle, access: number, token: OutSlot<Handle>): number;
   GetTokenInformation(token: Handle, cls: number, buffer: Buffer | null, length: number, returned: OutSlot<number>): number;
   ConvertSidToStringSidW(sid: NativePointer, out: OutSlot<NativePointer>): number;
@@ -134,6 +153,8 @@ function bind(): Win32 {
   const advapi32 = koffi.load('advapi32.dll');
   const k = (definition: string) => kernel32.func(definition);
   const a = (definition: string) => advapi32.func(definition);
+  const ntdll = koffi.load('ntdll.dll');
+  const n = (definition: string) => ntdll.func(definition);
 
   // BOOL is declared as int, HANDLE as intptr_t, out pointers as `_Out_ void **`.
   const fns = {
@@ -147,6 +168,16 @@ function bind(): Win32 {
     GetCurrentProcess: k('intptr_t GetCurrentProcess()'),
     OpenProcess: k('intptr_t OpenProcess(uint32_t access, int inherit, uint32_t pid)'),
     GetNamedPipeServerProcessId: k('int GetNamedPipeServerProcessId(intptr_t pipe, _Out_ uint32_t *pid)'),
+    GetNamedPipeClientProcessId: k('int GetNamedPipeClientProcessId(intptr_t pipe, _Out_ uint32_t *pid)'),
+    GetNamedPipeInfo: k('int GetNamedPipeInfo(intptr_t pipe, _Out_ uint32_t *flags, void *outSize, void *inSize, void *maxInstances)'),
+    DisconnectNamedPipe: k('int DisconnectNamedPipe(intptr_t pipe)'),
+    GetFileInformationByHandleEx: k('int GetFileInformationByHandleEx(intptr_t handle, int cls, void *buffer, uint32_t length)'),
+    NtQueryInformationProcess: n(
+      'int32_t NtQueryInformationProcess(intptr_t process, int cls, void *buffer, uint32_t length, _Out_ uint32_t *returned)',
+    ),
+    NtQueryInformationFile: n(
+      'int32_t NtQueryInformationFile(intptr_t handle, void *ioStatus, void *buffer, uint32_t length, int cls)',
+    ),
     OpenProcessToken: a('int OpenProcessToken(intptr_t process, uint32_t access, _Out_ intptr_t *token)'),
     GetTokenInformation: a(
       'int GetTokenInformation(intptr_t token, int cls, void *buffer, uint32_t length, _Out_ uint32_t *returned)',

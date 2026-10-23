@@ -1,11 +1,13 @@
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { existsSync, mkdtempSync } from 'node:fs';
 import net from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { listenSecurePipe, type SecurePipeServer } from '../src/ipc/secure-pipe-server.ts';
+import { listenSecurePipe } from '../src/ipc/secure-pipe-server.ts';
 import {
   ERROR_ACCESS_DENIED,
-  ERROR_NO_DATA,
-  ERROR_PIPE_NOT_CONNECTED,
   GENERIC_READ,
   GENERIC_WRITE,
   INVALID_HANDLE_VALUE,
@@ -15,6 +17,7 @@ import {
 import {
   allowedTrustees,
   currentUserOnlySddl,
+  findOwnPipeServerInstances,
   getCurrentUserSid,
   getPipeServerUserSid,
   readPipeSecurity,
@@ -64,6 +67,89 @@ async function roundTrip(path: string, text: string): Promise<string> {
     socket.once('error', reject);
     socket.write(text);
   });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Echo handler that also records everything it receives. */
+function recordInto(received: string[]) {
+  return (socket: net.Socket): void => {
+    socket.on('data', (chunk) => {
+      received.push(chunk.toString());
+      socket.write(chunk);
+    });
+    socket.on('error', () => undefined);
+  };
+}
+
+/** Blocks this thread (no event loop turns) until `path` exists. */
+function waitForFileSync(path: string, timeoutMs: number): void {
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${path}`);
+    Atomics.wait(cell, 0, 0, 10);
+  }
+}
+
+// A client in another process: connects, keeps writing "evil", reports what it received when closed.
+const CLIENT_SCRIPT = `
+const net = require('node:net');
+const fs = require('node:fs');
+const [path, marker] = process.argv.slice(1);
+let received = '';
+function attempt() {
+  let connected = false;
+  const socket = net.connect(path);
+  socket.on('connect', () => {
+    connected = true;
+    socket.write('evil');
+    fs.writeFileSync(marker, '');
+    // A Windows pipe client only notices a server-side disconnect on its next write.
+    setInterval(() => socket.write('evil'), 50);
+  });
+  socket.on('data', (chunk) => { received += chunk; });
+  socket.on('error', () => undefined);
+  socket.on('close', () => {
+    if (!connected) { setTimeout(attempt, 10); return; } // the server is not listening yet
+    process.stdout.write('closed:' + received);
+    process.exit(0);
+  });
+}
+attempt();
+setTimeout(() => { process.stdout.write('timeout'); process.exit(1); }, 10000);
+`;
+
+interface ClientProcess {
+  pid: number;
+  output: Promise<string>;
+  start(): void;
+}
+
+/**
+ * Starts CLIENT_SCRIPT. With `spawnOnly` the process waits on stdin until `start()`,
+ * so its pid is known before it connects.
+ */
+function startClientProcess(path: string, marker: string, options: { spawnOnly?: boolean } = {}): ClientProcess {
+  const script = options.spawnOnly === true ? `process.stdin.once('data', () => { ${CLIENT_SCRIPT} });` : CLIENT_SCRIPT;
+  const child = spawn(process.execPath, ['-e', script, path, marker], { stdio: ['pipe', 'pipe', 'inherit'] });
+  const output = new Promise<string>((resolve) => {
+    let text = '';
+    child.stdout.on('data', (chunk: Buffer) => (text += chunk.toString()));
+    child.on('exit', () => {
+      resolve(text);
+    });
+  });
+  if (child.pid === undefined) throw new Error('client process did not start');
+  return {
+    pid: child.pid,
+    output,
+    start: () => {
+      child.stdin.write('go\n');
+    },
+  };
 }
 
 function listenPlain(path: string): Promise<net.Server> {
@@ -121,8 +207,23 @@ describe.runIf(isWindows)('named pipe security (Windows)', () => {
     expect(secure.security.ownerSid).toBe(sid);
     expect(allowedTrustees(secure.security.sddl)).toEqual([sid]);
     expect(secure.security.sddl).toContain('D:P(D;;FA;;;NU)');
-    expect(secure.droppedBeforeGate).toBe(1); // our own DACL connection
+    expect(secure.droppedBeforeSecure).toBe(0);
+    expect(secure.rejectedClients).toBe(0);
     expect(await roundTrip(path, 'hello')).toBe('hello');
+  });
+
+  it('applies the DACL without opening a connection of its own', async () => {
+    const path = pipePath();
+    let connections = 0;
+    const secure = await listenSecurePipe(path, () => {
+      connections += 1;
+    });
+    cleanup.push(() => secure.close());
+
+    await sleep(100);
+    expect(connections).toBe(0);
+    expect(findOwnPipeServerInstances(path).length).toBeGreaterThan(0);
+    expect(findOwnPipeServerInstances(path).every((instance) => !instance.rejectsRemoteClients)).toBe(true);
   });
 
   it('keeps the DACL on pipe instances created after securing', async () => {
@@ -155,27 +256,79 @@ describe.runIf(isWindows)('named pipe security (Windows)', () => {
     expect(() => readPipeSecurity(path)).toThrow(Win32Error);
   });
 
-  it('drops connections accepted before the DACL was applied', async () => {
+  it('disconnects a client of another process that connected before the DACL, without relying on accept order', async () => {
     const path = pipePath();
-    const w = win32();
-    let early = INVALID_HANDLE_VALUE;
-    const secure: SecurePipeServer = await listenSecurePipe(path, echo, {
+    const marker = join(mkdtempSync(join(tmpdir(), 'vuyro-pipe-')), 'connected');
+    const child = startClientProcess(path, marker);
+    const received: string[] = [];
+    const secure = await listenSecurePipe(path, recordInto(received), {
+      // Keeps this thread blocked, so Node dispatches nothing before the pipe is secured.
       afterListen: () => {
-        // Connects while the pipe still has Node's default DACL.
-        early = w.CreateFileW(path, (GENERIC_READ | GENERIC_WRITE) >>> 0, 0, null, OPEN_EXISTING, 0, null);
+        waitForFileSync(marker, 10_000);
       },
+      acceptClient: (client) => client.pid !== child.pid,
     });
     cleanup.push(() => secure.close());
-    cleanup.push(() => {
-      w.CloseHandle(early);
-    });
 
-    expect(early).not.toBe(INVALID_HANDLE_VALUE);
-    expect(secure.droppedBeforeGate).toBe(2); // the early client + our own DACL connection
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const written: [number | null] = [0];
-    expect(w.WriteFile(early, Buffer.from('late'), 4, written, null)).toBe(0);
-    expect([ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED]).toContain(w.GetLastError());
+    expect(secure.rejectedClients).toBe(1);
+    expect(secure.droppedBeforeSecure).toBe(0);
+    expect(await child.output).toBe('closed:'); // never got a reply
+    await sleep(50);
+    expect(received).toEqual([]); // and its early write was discarded
+    expect(await roundTrip(path, 'still serving')).toBe('still serving');
+    expect(received).toEqual(['still serving']);
+  }, 20_000);
+
+  it('checks the client on every connection after securing', async () => {
+    const path = pipePath();
+    const received: string[] = [];
+    let rejectedPid = -1;
+    const secure = await listenSecurePipe(path, recordInto(received), {
+      acceptClient: (client) => client.pid !== rejectedPid,
+    });
+    cleanup.push(() => secure.close());
+
+    const marker = join(mkdtempSync(join(tmpdir(), 'vuyro-pipe-')), 'connected');
+    const child = startClientProcess(path, marker, { spawnOnly: true });
+    rejectedPid = child.pid;
+    child.start();
+    expect(await child.output).toBe('closed:');
+    expect(secure.rejectedClients).toBe(1);
+    await sleep(50);
+    expect(received).toEqual([]);
+  }, 20_000);
+
+  it('destroys connections that Node dispatches before the pipe is secured', async () => {
+    const path = pipePath();
+    let early: net.Socket | undefined;
+    const earlyClosed = new Promise<void>((resolve) => {
+      void listenSecurePipe(path, echo, {
+        afterListen: async () => {
+          early = net.connect(path);
+          early.on('error', () => undefined);
+          early.on('close', () => {
+            resolve();
+          });
+          await sleep(100); // lets Node dispatch the connection
+        },
+      }).then((secure) => {
+        cleanup.push(() => secure.close());
+        expect(secure.droppedBeforeSecure).toBe(1);
+      });
+    });
+    await earlyClosed;
+    expect(early).toBeDefined();
+  });
+
+  it('does not lose the first request when the handler attaches its listeners late', async () => {
+    const path = pipePath();
+    const secure = await listenSecurePipe(path, async (socket) => {
+      await sleep(50);
+      echo(socket);
+    });
+    cleanup.push(() => secure.close());
+
+    expect(await roundTrip(path, 'first')).toBe('first');
   });
 
   it('refuses to listen on a name that already exists (squatting, second instance)', async () => {

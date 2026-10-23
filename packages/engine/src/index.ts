@@ -9,14 +9,18 @@ export type {
   SynchronousMode,
 } from './db/sqlite-worker-protocol.ts';
 export { listenSecurePipe } from './ipc/secure-pipe-server.ts';
-export type { SecurePipeServer, SecurePipeServerOptions } from './ipc/secure-pipe-server.ts';
+export type { PipeClient, SecurePipeServer, SecurePipeServerOptions } from './ipc/secure-pipe-server.ts';
 export {
   allowedTrustees,
   currentUserOnlySddl,
+  disconnectPipeInstance,
+  findOwnPipeServerInstances,
   getCurrentUserSid,
   getPipeServerUserSid,
+  getProcessUserSid,
   readPipeSecurity,
   setPipeDacl,
+  setPipeDaclOnHandle,
   Win32Error,
 } from './platform/win32/pipe-security.ts';
-export type { CurrentUserOnlyOptions, PipeSecurity } from './platform/win32/pipe-security.ts';
+export type { CurrentUserOnlyOptions, PipeSecurity, PipeServerInstance } from './platform/win32/pipe-security.ts';
