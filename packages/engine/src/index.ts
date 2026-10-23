@@ -50,3 +50,23 @@ export { hashRunToken } from './commands/run-token.ts';
 export { HumanCredential } from './commands/human-credential.ts';
 export type { HumanCredentialVerifier } from './commands/human-credential.ts';
 export { ORPHANED_RUN_REASON, settleOrphanedRuns } from './commands/recovery.ts';
+
+// M2: workflow engine.
+export { ActivityTracker } from './runtime/activity.ts';
+export { MAX_AUTOMATIC_ATTEMPTS } from './commands/workflow-handlers.ts';
+export type { DefinitionState, RunState, TicketState } from './commands/aggregates.ts';
+export { compileNodeType, compileWorkflow, DefinitionError } from './workflow/compile.ts';
+export type { CompiledEdge, CompiledNode, CompiledNodeType, CompiledPort, CompiledWorkflow, DefinitionIssue } from './workflow/compile.ts';
+export { DefinitionLoadError, DefinitionRegistry, definitionHash, definitionPath } from './workflow/definitions.ts';
+export type { DefinitionResolver, DefinitionRow, LoadedTemplate } from './workflow/definitions.ts';
+export { DefinitionWriter } from './workflow/definition-writer.ts';
+export type { DefinitionWriterOptions, ScanReport } from './workflow/definition-writer.ts';
+export { BUILTIN_DEFINITIONS_DIR, DEFAULT_TEMPLATE_ID, installBuiltins, loadBuiltinDefinitions } from './workflow/builtins.ts';
+export { WorkflowEngine } from './workflow/engine.ts';
+export type { WorkflowEngineOptions } from './workflow/engine.ts';
+export { ScriptedAgentAdapter } from './workflow/scripted-agent.ts';
+export type { ScriptedAgentOptions, ScriptedBehavior, ScriptedSession } from './workflow/scripted-agent.ts';
+export { ancestorsOf, executionContext } from './workflow/context.ts';
+export { currentExecution, EMPTY_TICKET, evolveTicket, laneStatus, nodeProgress } from './workflow/state.ts';
+export type { Execution, Lane, NodeProgress, TicketWorkflow } from './workflow/state.ts';
+export { parseDuration } from './workflow/duration.ts';

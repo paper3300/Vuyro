@@ -61,8 +61,12 @@ export class SchemaValidator {
   private readonly ajv: Ajv2020;
   private readonly cache = new WeakMap<object, ValidateFunction>();
 
-  constructor() {
-    this.ajv = new Ajv2020({ strict: true, allErrors: true, validateFormats: false });
+  /**
+   * `strict: false` is for schemas people and agents write (port data schemas): keywords Ajv does not
+   * know (UI hints, notes) are kept and ignored instead of failing the compile. Contract schemas stay strict.
+   */
+  constructor(options: { strict?: boolean } = {}) {
+    this.ajv = new Ajv2020({ strict: options.strict ?? true, allErrors: true, validateFormats: false });
   }
 
   /** Registers a schema with an `urn:vuyro:` `$id` so other schemas can reference it. */

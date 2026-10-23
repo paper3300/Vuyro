@@ -94,6 +94,11 @@ export class VirtualClock implements Clock {
     return this.timers.length;
   }
 
+  /** When the next timer fires, if any. */
+  nextDueAt(): number | undefined {
+    return this.nextDue()?.dueAt;
+  }
+
   /** Moves time forward by `ms`, firing every timer that comes due on the way. */
   advance(ms: number): Promise<void> {
     if (ms < 0) return Promise.reject(new RangeError('cannot move a clock backwards'));

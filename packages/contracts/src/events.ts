@@ -1,10 +1,18 @@
 import { type Static, type TSchema, Type } from '@sinclair/typebox';
-import { ArtifactRefSchema, SLOT_PATTERN } from './handoff.ts';
+import { ArtifactRefSchema, HandoffItemSchema, NodeRunOutputSchema, PORT_PATTERN, SLOT_PATTERN } from './handoff.ts';
 import { AggregateIdSchema, IdSchema, NodeIdSchema, RequestIdSchema } from './ids.ts';
 import { PermissionRuleSchema } from './permission.ts';
 import { AuthorizationSchema, PrincipalSchema } from './principal.ts';
 import { AGENT_PROVIDERS } from './providers.ts';
 import { CostSchema, TokenUsageSchema } from './usage.ts';
+import {
+  ACTIVATION_CAUSES,
+  DEFINITION_ID_PATTERN,
+  DEFINITION_KINDS,
+  DefinitionEnvelopeSchema,
+  HashSchema,
+  PinnedTemplateSchema,
+} from './workflow.ts';
 
 /**
  * Event envelope. Every state change is one of these, appended to the log and never changed.
@@ -110,6 +118,33 @@ export const RUN_SETTLE_FIELDS = {
 
 const strict = { additionalProperties: false } as const;
 
+/**
+ * A lane is one parallel copy of a node. Whole-input nodes have the single lane 'main'; fan-out
+ * (`mode: 'each'`) nodes get lanes '1', '2', … in creation order, never reused across groups.
+ */
+export const LANE_PATTERN = '^(main|[1-9][0-9]{0,6})$';
+export const LaneSchema = Type.String({ pattern: LANE_PATTERN });
+/** Execution number of a node within a ticket (1-based, over all lanes). The `run` of an ItemRef. */
+const RunNumber = Type.Integer({ minimum: 1 });
+
+/** Fields that identify one node execution, shared by the node events and the system commands. */
+export const EXECUTION_FIELDS = {
+  ticketId: TicketId,
+  nodeId: NodeIdSchema,
+  lane: LaneSchema,
+  run: RunNumber,
+};
+
+/** Fan-out group id: lanes created together. Inherited along chained fan-out nodes. */
+const GroupId = Type.String({ minLength: 1, maxLength: 160 });
+
+const DefinitionKey = {
+  kind: Type.Union(DEFINITION_KINDS.map((kind) => Type.Literal(kind))),
+  id: Type.String({ pattern: DEFINITION_ID_PATTERN }),
+  version: Type.Integer({ minimum: 1 }),
+  hash: HashSchema,
+};
+
 interface EventDefinition {
   readonly aggregateType: string;
   /** Current version of `data`. Bump only for breaking changes and add an upcaster. */
@@ -132,9 +167,17 @@ export const EVENT_CATALOG = {
         projectId: IdSchema,
         title: Type.String({ minLength: 1, maxLength: 300 }),
         description: Type.Optional(Type.String({ maxLength: 65536 })),
+        /** The workflow this ticket runs, pinned with the hashes of every definition it uses. */
+        template: Type.Optional(PinnedTemplateSchema),
       },
       strict,
     ),
+  },
+  /** An end node finished and nothing else in the ticket is active. */
+  'ticket.completed': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object({ ticketId: TicketId }, strict),
   },
   'ticket.updated': {
     aggregateType: 'ticket',
@@ -159,9 +202,167 @@ export const EVENT_CATALOG = {
         ref: ArtifactRefSchema,
         /** The run that registered it, when an agent did. */
         runId: Type.Optional(RunId),
+        /** The lane it was registered for, when the caller named one. */
+        lane: Type.Optional(LaneSchema),
       },
       strict,
     ),
+  },
+
+  // -------------------------------------------------------------------------
+  // Workflow (ticket aggregate). The engine decides every routing step and records it explicitly,
+  // so the ticket state folds from these events without reading the template.
+
+  /** A node execution got its inputs. `status` is where it starts: queued (executor), review (human) or rejected. */
+  'node.activated': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...EXECUTION_FIELDS,
+        cause: Type.Union(ACTIVATION_CAUSES.map((cause) => Type.Literal(cause))),
+        status: Type.Union([Type.Literal('queued'), Type.Literal('review'), Type.Literal('rejected')]),
+        /** Input items by input port. Each item's lineage points at the upstream output it was copied from. */
+        inputs: Type.Record(Type.String({ pattern: PORT_PATTERN }), Type.Array(HandoffItemSchema), strict),
+        /** Fan-out group of the lane (each-mode nodes). */
+        group: Type.Optional(GroupId),
+        /** Set when the group is new and was inherited from an upstream fan-out group. */
+        groupParent: Type.Optional(GroupId),
+        /** The lane's previous execution this one replaces while it was still active. */
+        supersedes: Type.Optional(RunNumber),
+        /** Reviewer feedback for a `review` re-activation. */
+        feedback: Type.Optional(Type.Object({ run: RunNumber, comment: Type.Optional(Type.String({ maxLength: 65536 })) }, strict)),
+      },
+      strict,
+    ),
+  },
+  'node.started': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...EXECUTION_FIELDS,
+        /** 1, 2, … per execution (a restart after an engine crash is a new attempt). */
+        attempt: Type.Integer({ minimum: 1 }),
+        executor: Type.Union([Type.Literal('agent'), Type.Literal('script')]),
+        runId: Type.Optional(RunId),
+      },
+      strict,
+    ),
+  },
+  /** The agent reported its result (`node.done`) while its run is still going. Applied when the run settles. */
+  'node.outputSubmitted': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object({ ...EXECUTION_FIELDS, runId: RunId, output: NodeRunOutputSchema }, strict),
+  },
+  /** Review gate: the output waits for a person before it is routed. */
+  'node.reviewRequested': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object({ ...EXECUTION_FIELDS, output: NodeRunOutputSchema }, strict),
+  },
+  /** A reviewer sent the held output back. The execution is discarded; a `review` activation follows. */
+  'node.returned': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object({ ...EXECUTION_FIELDS, comment: Type.Optional(Type.String({ maxLength: 65536 })) }, strict),
+  },
+  /**
+   * An execution finished. `routes` lists, per template edge index, which output items travel it
+   * (the engine evaluated the edge conditions). The activations they cause are separate events.
+   */
+  'node.completed': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...EXECUTION_FIELDS,
+        status: Type.Union([Type.Literal('done'), Type.Literal('failed')]),
+        output: NodeRunOutputSchema,
+        routes: Type.Array(
+          Type.Object(
+            { edge: Type.Integer({ minimum: 0 }), to: NodeIdSchema, items: Type.Array(Type.Integer({ minimum: 0 }), { minItems: 1 }) },
+            strict,
+          ),
+        ),
+        /** Why it failed (executor failure without an output). */
+        error: Type.Optional(Type.String({ maxLength: 65536 })),
+        /** Top-level data fields the port schema does not declare (kept, shown as undeclared). */
+        undeclared: Type.Optional(Type.Array(Type.String({ maxLength: 256 }), { maxItems: 256 })),
+      },
+      strict,
+    ),
+  },
+  /** The executor stopped without a result for a reason worth another attempt (engine restart). */
+  'node.requeued': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object(
+      { ...EXECUTION_FIELDS, reason: Type.String({ maxLength: 1024 }), resumeFromRunId: Type.Optional(RunId) },
+      strict,
+    ),
+  },
+  /** A person asked to pause a running lane; the engine cancels the run and then records `node.paused`. */
+  'node.pauseRequested': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object(EXECUTION_FIELDS, strict),
+  },
+  'node.paused': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...EXECUTION_FIELDS,
+        resumeTo: Type.Union([Type.Literal('queued'), Type.Literal('review'), Type.Literal('rejected')]),
+        resumeFromRunId: Type.Optional(RunId),
+      },
+      strict,
+    ),
+  },
+  'node.resumed': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...EXECUTION_FIELDS,
+        /** Where the lane is now: back where it was paused, or still running when the pause had not happened yet. */
+        status: Type.Union([Type.Literal('queued'), Type.Literal('review'), Type.Literal('rejected'), Type.Literal('running')]),
+      },
+      strict,
+    ),
+  },
+
+  // -------------------------------------------------------------------------
+  // Definitions (aggregate 'definition', one per kind + id). Files are the source of truth;
+  // these events record which versions were asked for and which are usable.
+
+  /** An authorized caller asked to save this version. The file is written next. */
+  'definition.staged': {
+    aggregateType: 'definition',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...DefinitionKey,
+        name: Type.String({ minLength: 1, maxLength: 200 }),
+        /** The content, so recovery can write the file if the engine died before it did. */
+        definition: DefinitionEnvelopeSchema,
+      },
+      strict,
+    ),
+  },
+  /** The file is in place and its hash matches. Usable from now on. */
+  'definition.activated': {
+    aggregateType: 'definition',
+    version: 1,
+    schema: Type.Object(DefinitionKey, strict),
+  },
+  /** The file never made it (write failed, or the engine died first and the file is missing or different). */
+  'definition.abandoned': {
+    aggregateType: 'definition',
+    version: 1,
+    schema: Type.Object({ ...DefinitionKey, reason: Type.String({ maxLength: 1024 }) }, strict),
   },
   'run.started': {
     aggregateType: 'run',

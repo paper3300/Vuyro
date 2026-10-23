@@ -9,6 +9,7 @@ import {
 import type { RandomSource } from '../runtime/ids.ts';
 import type { IdGenerator } from '../runtime/ids.ts';
 import type { NewEvent, StreamAppend } from '../store/event-store.ts';
+import type { DefinitionResolver } from '../workflow/definitions.ts';
 import {
   type AggregateDefinition,
   permissionsAggregate,
@@ -22,6 +23,21 @@ import {
 import type { CommandTarget } from './authorize.ts';
 import type { CallerContext } from './caller.ts';
 import { issueRunToken } from './run-token.ts';
+import {
+  createTicketEvents,
+  definitionAbandon,
+  definitionActivate,
+  nodeApprove,
+  nodeDone,
+  nodeFinish,
+  nodePause,
+  nodeReject,
+  nodeResume,
+  nodeRetry,
+  nodeStart,
+  nodeTypeSave,
+  templateSave,
+} from './workflow-handlers.ts';
 
 export interface Loaded<S> {
   readonly aggregateId: string;
@@ -33,6 +49,8 @@ export interface HandlerContext {
   readonly caller: CallerContext;
   readonly ids: IdGenerator;
   readonly random: RandomSource;
+  /** Definition files (templates, node types). Absent in engines without a definition store. */
+  readonly definitions?: DefinitionResolver;
   load<S>(definition: AggregateDefinition<S>, aggregateId: string): Promise<Loaded<S>>;
 }
 
@@ -142,15 +160,11 @@ export const HANDLERS: HandlerMap = {
       const project = await ctx.load(projectAggregate, payload.projectId);
       if (!project.state.exists) return fail('not_found', `project ${payload.projectId} does not exist`);
       const ticketId = ctx.ids.next();
-      const data = {
-        ticketId,
-        projectId: payload.projectId,
-        title: payload.title,
-        ...(payload.description === undefined ? {} : { description: payload.description }),
-      };
+      const events = await createTicketEvents(ctx, ticketId, payload);
+      if (!Array.isArray(events)) return events;
       return {
         ok: true,
-        appends: [stream('ticket', ticketId, 0, [{ type: 'ticket.created', data }])],
+        appends: [stream('ticket', ticketId, 0, events)],
         result: { ticketId },
         created: ticketId,
       };
@@ -179,6 +193,12 @@ export const HANDLERS: HandlerMap = {
       if (!ticket.state.exists) return Promise.resolve(fail('not_found', `ticket ${payload.ticketId} does not exist`));
       const runId = ctx.caller.binding?.runId;
       const data = { ...payload, ...(runId === undefined ? {} : { runId }) };
+      if (runId !== undefined && payload.lane !== undefined) {
+        // An agent's artifacts belong to its own run's lane.
+        const owner = Object.hasOwn(ticket.state.runIndex, runId) ? ticket.state.runIndex[runId] : undefined;
+        const lane = owner === undefined ? undefined : ticket.state.nodes[owner.nodeId]?.executions[owner.run - 1]?.lane;
+        if (lane !== payload.lane) return Promise.resolve(fail('invariant_violated', `run ${runId} works on lane '${lane ?? '?'}', not '${payload.lane}'`));
+      }
       return Promise.resolve({
         ok: true,
         appends: [stream('ticket', ticket.aggregateId, ticket.revision, [{ type: 'artifact.added', data }])],
@@ -267,4 +287,17 @@ export const HANDLERS: HandlerMap = {
       };
     },
   }),
+
+  'nodeType.save': handler(nodeTypeSave),
+  'template.save': handler(templateSave),
+  'definition.activate': handler(definitionActivate),
+  'definition.abandon': handler(definitionAbandon),
+  'node.done': handler(nodeDone),
+  'node.approve': handler(nodeApprove),
+  'node.reject': handler(nodeReject),
+  'node.retry': handler(nodeRetry),
+  'node.pause': handler(nodePause),
+  'node.resume': handler(nodeResume),
+  'node.start': handler(nodeStart),
+  'node.finish': handler(nodeFinish),
 };

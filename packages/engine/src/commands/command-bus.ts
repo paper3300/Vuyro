@@ -21,6 +21,7 @@ import { type CallerContext, resolveCaller, type RunTokenRecord, type TransportI
 import { canonicalJson, sha256Hex } from './fingerprint.ts';
 import { type HandlerContext, handlerFor, type Loaded } from './handlers.ts';
 import type { HumanCredentialVerifier } from './human-credential.ts';
+import type { DefinitionResolver } from '../workflow/definitions.ts';
 
 export interface CommandBusOptions {
   readonly store: EventStore;
@@ -37,6 +38,8 @@ export interface CommandBusOptions {
   readonly humanCredential?: HumanCredentialVerifier;
   /** Called for failures the bus survives but must not hide (e.g. a denial that could not be audited). */
   readonly reportError?: (error: Error, context: string) => void;
+  /** Definition files for workflow commands (templates, node types). */
+  readonly definitions?: DefinitionResolver;
 }
 
 interface CachedAggregate {
@@ -65,6 +68,7 @@ export class CommandBus {
   private readonly cacheSize: number;
   private readonly humanCredential: HumanCredentialVerifier | undefined;
   private readonly reportError: (error: Error, context: string) => void;
+  private readonly definitions: DefinitionResolver | undefined;
   private readonly cache = new Map<string, CachedAggregate>();
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -75,6 +79,7 @@ export class CommandBus {
     this.validator = options.validator ?? new SchemaValidator();
     this.cacheSize = options.aggregateCacheSize ?? 1000;
     this.humanCredential = options.humanCredential;
+    this.definitions = options.definitions;
     this.reportError =
       options.reportError ??
       ((error, context) => {
@@ -183,6 +188,7 @@ export class CommandBus {
       caller,
       ids: this.ids,
       random: this.random,
+      ...(this.definitions === undefined ? {} : { definitions: this.definitions }),
       load: (aggregate, aggregateId) => this.load(aggregate, aggregateId),
     };
     const outcome = await handler.decide(context, payload, target);

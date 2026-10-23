@@ -1,10 +1,11 @@
 import { type Static, type TSchema, Type } from '@sinclair/typebox';
 import { CommandErrorSchema } from './errors.ts';
-import { OBSERVATION_FIELDS, RUN_SETTLE_FIELDS } from './events.ts';
-import { ArtifactRefSchema, SLOT_PATTERN } from './handoff.ts';
+import { EXECUTION_FIELDS, LaneSchema, OBSERVATION_FIELDS, RUN_SETTLE_FIELDS } from './events.ts';
+import { ArtifactRefSchema, ItemRefSchema, PORT_PATTERN, SLOT_PATTERN } from './handoff.ts';
 import { IdSchema, NodeIdSchema, RequestIdSchema } from './ids.ts';
 import { PermissionRuleSchema } from './permission.ts';
 import { AGENT_PROVIDERS } from './providers.ts';
+import { DEFINITION_ID_PATTERN, DEFINITION_KINDS, HashSchema, NodeTypeDefinitionSchema, TEMPLATE_ID_PATTERN, TemplateDefinitionSchema } from './workflow.ts';
 
 /**
  * Command envelope. UI buttons, the `vuyro` CLI, the agent panel and MCP all send this
@@ -64,7 +65,7 @@ export interface CommandDefinition {
   readonly version: number;
   readonly scope: CommandScope;
   /** 'permission' commands are always refused for AI principals (fixed rule). */
-  readonly category: 'project' | 'ticket' | 'artifact' | 'run' | 'permission';
+  readonly category: 'project' | 'ticket' | 'artifact' | 'run' | 'node' | 'definition' | 'permission';
   readonly access: CommandAccess;
   readonly summary: string;
   readonly payload: TSchema;
@@ -85,6 +86,47 @@ const Observation = Type.Union([
 ]);
 export type RunObservation = Static<typeof Observation>;
 export const RunObservationSchema = Observation;
+
+/**
+ * An output item as a node submits it. The engine turns it into a HandoffItem: it fills `lineage`
+ * (from `pairedInput`, or by pairing with the inputs) and adds the artifacts registered during the run.
+ */
+export const DraftItemSchema = Type.Object(
+  {
+    data: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+    summary: Type.Optional(Type.String({ maxLength: 65536 })),
+    artifacts: Type.Optional(Type.Record(Type.String({ pattern: SLOT_PATTERN }), ArtifactRefSchema, strict)),
+    /** Index (or indexes) of the input items on the first input port this item answers. */
+    pairedInput: Type.Optional(
+      Type.Union([Type.Integer({ minimum: 0 }), Type.Array(Type.Integer({ minimum: 0 }), { minItems: 1, maxItems: 1000 })]),
+    ),
+    /** Explicit lineage. Every reference must point at an existing output of this ticket. */
+    lineage: Type.Optional(Type.Array(ItemRefSchema, { maxItems: 1000 })),
+  },
+  strict,
+);
+export type DraftItem = Static<typeof DraftItemSchema>;
+
+const NodeTarget = { ticketId: IdSchema, nodeId: NodeIdSchema, lane: Type.Optional(LaneSchema) };
+const Comment = Type.Optional(Type.String({ maxLength: 65536 }));
+
+const DefinitionSaveResult = Type.Object(
+  {
+    kind: Type.Union(DEFINITION_KINDS.map((kind) => Type.Literal(kind))),
+    id: Type.String({ pattern: DEFINITION_ID_PATTERN }),
+    version: Type.Integer({ minimum: 1 }),
+    hash: HashSchema,
+    /** 'active' when this exact version was already active (nothing to write). */
+    status: Type.Union([Type.Literal('staged'), Type.Literal('active')]),
+  },
+  strict,
+);
+const DefinitionKeyPayload = {
+  kind: Type.Union(DEFINITION_KINDS.map((kind) => Type.Literal(kind))),
+  id: Type.String({ pattern: DEFINITION_ID_PATTERN }),
+  version: Type.Integer({ minimum: 1 }),
+  hash: HashSchema,
+};
 
 export const COMMAND_CATALOG = {
   'project.create': {
@@ -107,6 +149,10 @@ export const COMMAND_CATALOG = {
         projectId: IdSchema,
         title: Type.String({ minLength: 1, maxLength: 300 }),
         description: Type.Optional(Type.String({ maxLength: 65536 })),
+        /** Workflow to run. Version omitted = the latest active version. Pinned with its hashes. */
+        template: Type.Optional(
+          Type.Object({ id: Type.String({ pattern: TEMPLATE_ID_PATTERN }), version: Type.Optional(Type.Integer({ minimum: 1 })) }, strict),
+        ),
       },
       strict,
     ),
@@ -140,6 +186,149 @@ export const COMMAND_CATALOG = {
         nodeId: NodeIdSchema,
         slot: Type.String({ pattern: SLOT_PATTERN }),
         ref: ArtifactRefSchema,
+        /** Lane the artifact belongs to. Agents need not say: their run identifies the lane. */
+        lane: Type.Optional(LaneSchema),
+      },
+      strict,
+    ),
+    result: Empty,
+  },
+  'nodeType.save': {
+    version: 1,
+    scope: 'app',
+    category: 'definition',
+    access: { nodeAgent: 'deny' },
+    summary: 'Save a node type version (stages it; the engine writes the file and activates it).',
+    payload: Type.Object({ definition: NodeTypeDefinitionSchema }, strict),
+    result: DefinitionSaveResult,
+  },
+  'template.save': {
+    version: 1,
+    scope: 'app',
+    category: 'definition',
+    access: { nodeAgent: 'deny' },
+    summary: 'Save a workflow template version (stages it; the engine writes the file and activates it).',
+    payload: Type.Object({ definition: TemplateDefinitionSchema }, strict),
+    result: DefinitionSaveResult,
+  },
+  'definition.activate': {
+    version: 1,
+    scope: 'app',
+    category: 'definition',
+    access: { nodeAgent: 'deny', systemOnly: true },
+    summary: 'Mark a staged definition usable once its file is in place with the staged hash.',
+    payload: Type.Object(DefinitionKeyPayload, strict),
+    result: Empty,
+  },
+  'definition.abandon': {
+    version: 1,
+    scope: 'app',
+    category: 'definition',
+    access: { nodeAgent: 'deny', systemOnly: true },
+    summary: 'Drop a staged definition whose file could not be written.',
+    payload: Type.Object({ ...DefinitionKeyPayload, reason: Type.String({ maxLength: 1024 }) }, strict),
+    result: Empty,
+  },
+  'node.done': {
+    version: 1,
+    scope: 'node',
+    category: 'node',
+    access: { nodeAgent: 'own-node' },
+    summary: 'Report the result of a node: the output port and its items (or one item as data/summary/artifacts).',
+    payload: Type.Object(
+      {
+        ...NodeTarget,
+        port: Type.String({ pattern: PORT_PATTERN }),
+        data: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+        summary: Type.Optional(Type.String({ maxLength: 65536 })),
+        artifacts: Type.Optional(Type.Record(Type.String({ pattern: SLOT_PATTERN }), ArtifactRefSchema, strict)),
+        /** Several items (fan-out). Not together with data/summary/artifacts. */
+        items: Type.Optional(Type.Array(DraftItemSchema, { maxItems: 1000 })),
+      },
+      strict,
+    ),
+    result: Empty,
+  },
+  'node.approve': {
+    version: 1,
+    scope: 'node',
+    category: 'node',
+    access: { nodeAgent: 'deny' },
+    summary: "Approve a node waiting in Review: an approval node's 'approve' port, or a held output behind a review gate.",
+    payload: Type.Object({ ...NodeTarget, comment: Comment }, strict),
+    result: Empty,
+  },
+  'node.reject': {
+    version: 1,
+    scope: 'node',
+    category: 'node',
+    access: { nodeAgent: 'deny' },
+    summary: "Reject a node waiting in Review: an approval node's 'reject' port (items pick what to send back), or a held output (runs it again).",
+    payload: Type.Object({ ...NodeTarget, comment: Comment, items: Type.Optional(Type.Array(DraftItemSchema, { minItems: 1, maxItems: 1000 })) }, strict),
+    result: Empty,
+  },
+  'node.retry': {
+    version: 1,
+    scope: 'node',
+    category: 'node',
+    access: { nodeAgent: 'deny' },
+    summary: 'Run a failed lane again with the same inputs.',
+    payload: Type.Object(NodeTarget, strict),
+    result: Empty,
+  },
+  'node.pause': {
+    version: 1,
+    scope: 'node',
+    category: 'node',
+    access: { nodeAgent: 'deny' },
+    summary: 'Pause a lane. A running agent is cancelled and resumes its session later.',
+    payload: Type.Object(NodeTarget, strict),
+    result: Empty,
+  },
+  'node.resume': {
+    version: 1,
+    scope: 'node',
+    category: 'node',
+    access: { nodeAgent: 'deny' },
+    summary: 'Resume a paused lane.',
+    payload: Type.Object(NodeTarget, strict),
+    result: Empty,
+  },
+  'node.start': {
+    version: 1,
+    scope: 'node',
+    category: 'node',
+    access: { nodeAgent: 'deny', systemOnly: true },
+    summary: "Start a queued execution. For agent nodes this also starts the run and returns its token (once).",
+    payload: Type.Object({ ...EXECUTION_FIELDS, attempt: Type.Integer({ minimum: 1 }) }, strict),
+    result: Type.Object({ runId: Type.Optional(IdSchema), runToken: Type.Optional(Type.String()) }, strict),
+  },
+  'node.finish': {
+    version: 1,
+    scope: 'node',
+    category: 'node',
+    access: { nodeAgent: 'deny', systemOnly: true },
+    summary: 'Apply the end of an execution: the settled agent run, or the exit of a script.',
+    payload: Type.Object(
+      {
+        ...EXECUTION_FIELDS,
+        attempt: Type.Integer({ minimum: 1 }),
+        result: Type.Union([
+          Type.Object({ kind: Type.Literal('agent'), runId: IdSchema }, strict),
+          Type.Object(
+            {
+              kind: Type.Literal('script'),
+              exitCode: Type.Union([Type.Integer(), Type.Null()]),
+              signal: Type.Optional(Type.Union([Type.String({ maxLength: 32 }), Type.Null()])),
+              timedOut: Type.Optional(Type.Boolean()),
+              /** Could not start or was interrupted (e.g. the engine restarted while it ran). */
+              error: Type.Optional(Type.String({ maxLength: 65536 })),
+              stdout: Type.Optional(Type.String({ maxLength: 1_048_576 })),
+              stderr: Type.Optional(Type.String({ maxLength: 65536 })),
+            },
+            strict,
+          ),
+        ]),
       },
       strict,
     ),

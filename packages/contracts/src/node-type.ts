@@ -94,6 +94,36 @@ export const ClaimSpecSchema = Type.Object(
   { additionalProperties: false },
 );
 
+/** Environment variable names a script may set. `VUYRO_*` is reserved for the engine. */
+export const ENV_NAME_PATTERN = '^(?!VUYRO_)[A-Za-z_][A-Za-z0-9_]{0,127}$';
+export const EXIT_PORT_KEY_PATTERN = '^(default|0|-?[1-9][0-9]{0,9})$';
+
+/**
+ * What a `completion: 'script'` node runs. Every string is a template ([[n8n 노드 데이터 전달 분석]] §6.5):
+ * `args: ['sync', '{{ params.path }}']`. An argument that is exactly one expression resolving to an array
+ * is spread into several arguments. The program runs without a shell, with a minimal environment.
+ */
+export const ScriptSpecSchema = Type.Object(
+  {
+    program: Type.String({ minLength: 1, maxLength: 1024 }),
+    args: Type.Optional(Type.Array(Type.String({ maxLength: 8192 }), { maxItems: 256 })),
+    env: Type.Optional(Type.Record(Type.String({ pattern: ENV_NAME_PATTERN }), Type.String({ maxLength: 8192 }), { additionalProperties: false })),
+    cwd: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
+    /** Killed after this long and finished through the error port. Default 30m. */
+    timeout: Type.Optional(DurationSchema),
+    /** Exit code → output port. Default `{ "0": "done", "default": "error" }`. */
+    exitPorts: Type.Optional(
+      Type.Record(Type.String({ pattern: EXIT_PORT_KEY_PATTERN }), Type.String({ pattern: PORT_PATTERN }), { additionalProperties: false }),
+    ),
+    /**
+     * 'json': the last non-empty stdout line is `{port?, data?, summary?, items?}` and becomes the output.
+     * 'none' (default): the output is one item with the exit code and the tail of stdout.
+     */
+    output: Type.Optional(Type.Union([Type.Literal('none'), Type.Literal('json')])),
+  },
+  { additionalProperties: false },
+);
+
 /** Plugin data keyed by plugin namespace ('p4', 'myteam.build'). Never interpreted by the engine. */
 export const ExtensionsSchema = Type.Record(Type.String({ pattern: '^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$' }), Type.Unknown(), {
   additionalProperties: false,
@@ -124,6 +154,13 @@ export const NodeTypeSpecSchema = Type.Object(
     writes: Type.Optional(Type.Array(BlackboardKeySchema)),
     /** Claims taken together when the node starts (§3.7). */
     claims: Type.Optional(Type.Array(ClaimSpecSchema)),
+    /**
+     * `completion: 'agent'`: the prompt template. The engine appends the reporting instructions
+     * (output ports, their schemas and artifact slots) after it.
+     */
+    prompt: Type.Optional(Type.String({ minLength: 1, maxLength: 262_144 })),
+    /** `completion: 'script'`: the command to run. */
+    script: Type.Optional(ScriptSpecSchema),
     extensions: Type.Optional(ExtensionsSchema),
   },
   { additionalProperties: false },
@@ -192,4 +229,5 @@ export type AttachmentSpec = Static<typeof AttachmentSpecSchema>;
 export type ParamSpec = Static<typeof ParamSpecSchema>;
 export type NodeTypeSpec = Static<typeof NodeTypeSpecSchema>;
 export type ClaimSpec = Static<typeof ClaimSpecSchema>;
+export type ScriptSpec = Static<typeof ScriptSpecSchema>;
 export type SharedNodeSpec = Static<typeof SharedNodeSpecSchema>;
