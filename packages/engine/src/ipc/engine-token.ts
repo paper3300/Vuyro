@@ -9,10 +9,10 @@ import { allowedTrustees, getCurrentUserSid, readFileSecurity, restrictFileToCur
  * file only the current user can read. Clients prove they know it before any
  * command is processed (see pipe-auth.ts).
  *
- * A `VerifiedEngineToken` can only come from `createEngineToken`, which fails
- * unless the file's DACL was applied and read back as current-user-only. The
- * pipe server only accepts such a token and re-verifies the file right before
- * it listens (`reverifyEngineToken`), so it cannot run on an unverified secret.
+ * A `VerifiedEngineToken` can only come from committing a `PendingEngineToken`,
+ * which fails unless the file's DACL was applied and read back as
+ * current-user-only. The engine replaces the token only after it holds the pipe
+ * (see `startEnginePipe`), so a second start cannot cut off a running engine.
  */
 
 export const TOKEN_BYTES = 32;
@@ -43,29 +43,80 @@ export function defaultTokenPath(): string {
 }
 
 /**
- * Writes a fresh token. The file is created empty, restricted to the current
- * user and verified before the secret is written, then moved into place
- * (a rename keeps the file's own DACL) and verified again. Any failure throws
- * and leaves no secret behind, so the engine does not start (fail closed).
+ * A new token whose file is ready but not yet in place: written next to the
+ * final path, restricted to the current user and verified. Nothing at the final
+ * path has changed yet, so a running engine keeps its token until `commit`.
  */
-export function createEngineToken(path: string = defaultTokenPath()): VerifiedEngineToken {
-  if (process.platform !== 'win32') throw new Error('createEngineToken is only implemented for Windows');
+export class PendingEngineToken {
+  readonly path: string;
+  readonly temporaryPath: string;
+  readonly secret: Buffer;
+  #done = false;
+
+  private constructor(path: string, temporaryPath: string, secret: Buffer) {
+    this.path = path;
+    this.temporaryPath = temporaryPath;
+    this.secret = secret;
+  }
+
+  /** Module-private factory: the symbol is not exported. */
+  static [ISSUE](path: string, temporaryPath: string, secret: Buffer): PendingEngineToken {
+    return new PendingEngineToken(path, temporaryPath, secret);
+  }
+
+  /**
+   * Moves the file into place (a rename keeps the file's own DACL) and verifies
+   * it again. On failure nothing with this secret is left behind.
+   */
+  commit(): VerifiedEngineToken {
+    if (this.#done) throw new Error('Engine token was already committed or discarded');
+    this.#done = true;
+    let moved = false;
+    try {
+      renameSync(this.temporaryPath, this.path);
+      moved = true;
+      verifyFile(this.path, this.secret);
+      return VerifiedEngineToken[ISSUE](this.path, this.secret);
+    } catch (error) {
+      rmSync(moved ? this.path : this.temporaryPath, { force: true });
+      throw error;
+    }
+  }
+
+  /** Removes the temporary file; the token at the final path is untouched. */
+  discard(): void {
+    if (this.#done) return;
+    this.#done = true;
+    rmSync(this.temporaryPath, { force: true });
+  }
+}
+
+/**
+ * Prepares a fresh token without touching the final path: the temporary file
+ * is created empty, restricted to the current user and verified before the
+ * secret is written, then verified again with its content. Any failure throws
+ * and leaves no secret behind (fail closed).
+ */
+export function prepareEngineToken(path: string = defaultTokenPath()): PendingEngineToken {
+  if (process.platform !== 'win32') throw new Error('Engine tokens are only implemented for Windows');
   mkdirSync(dirname(path), { recursive: true });
   const temporary = `${path}.${randomUUID()}.tmp`;
   writeFileSync(temporary, '', { flag: 'wx' });
-  let moved = false;
   try {
     restrictFileToCurrentUser(temporary);
     const secret = randomBytes(TOKEN_BYTES);
     writeFileSync(temporary, secret.toString('hex'), { flag: 'r+' });
-    renameSync(temporary, path);
-    moved = true;
-    verifyFile(path, secret);
-    return VerifiedEngineToken[ISSUE](path, secret);
+    verifyFile(temporary, secret);
+    return PendingEngineToken[ISSUE](path, temporary, secret);
   } catch (error) {
-    rmSync(moved ? path : temporary, { force: true });
+    rmSync(temporary, { force: true });
     throw error;
   }
+}
+
+/** Prepares and commits a token at once (no pipe involved). */
+export function createEngineToken(path: string = defaultTokenPath()): VerifiedEngineToken {
+  return prepareEngineToken(path).commit();
 }
 
 /**

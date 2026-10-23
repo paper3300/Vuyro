@@ -1,10 +1,10 @@
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createEngineToken, type VerifiedEngineToken } from '../src/ipc/engine-token.ts';
+import { createEngineToken, readEngineToken, type VerifiedEngineToken } from '../src/ipc/engine-token.ts';
 import {
   AUTH_PROTOCOL,
   type AuthenticatedPipeServerOptions,
@@ -325,11 +325,74 @@ describe.runIf(isWindows)('authenticated engine pipe', () => {
     await expect(connectAuthenticatedPipe(path, randomBytes(32), { timeoutMs: 100 })).rejects.toThrow(/timed out/);
   });
 
-  it('refuses to listen on a name that already exists (squatting, second instance)', async () => {
-    const served = await serve();
-    await expect(startEnginePipe(served.path, () => undefined, { tokenPath: tokenPath() })).rejects.toMatchObject({
+  // --- single instance: a second start must not touch the running engine's token -----
+
+  async function authenticates(path: string, file: string): Promise<boolean> {
+    try {
+      const socket = await connectAuthenticatedPipe(path, readEngineToken(file), { timeoutMs: 1000 });
+      socket.destroy();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function runningEngine() {
+    const file = tokenPath();
+    const server = await start(() => undefined, { tokenPath: file });
+    expect(await authenticates(server.path, file)).toBe(true);
+    return { server, file, secret: readEngineToken(file) };
+  }
+
+  function expectOnlyTokenFile(file: string): void {
+    expect(readdirSync(join(file, '..'))).toEqual(['engine.token']);
+  }
+
+  it('a second start on the same pipe and token path fails and leaves the running token alone', async () => {
+    const { server, file, secret } = await runningEngine();
+    await expect(startEnginePipe(server.path, () => undefined, { tokenPath: file })).rejects.toMatchObject({
       code: 'EADDRINUSE',
     });
+    expect(readEngineToken(file).equals(secret)).toBe(true);
+    expectOnlyTokenFile(file); // the second start's temporary file is gone
+    expect(await authenticates(server.path, file)).toBe(true);
+  });
+
+  it('a second start that fails while preparing its token leaves the running token alone', async () => {
+    const { server, file, secret } = await runningEngine();
+    vi.spyOn(win32(), 'SetSecurityInfo').mockReturnValue(ERROR_ACCESS_DENIED);
+    await expect(startEnginePipe(server.path, () => undefined, { tokenPath: file })).rejects.toThrow(/SetSecurityInfo/);
+    vi.restoreAllMocks();
+    expect(readEngineToken(file).equals(secret)).toBe(true);
+    expectOnlyTokenFile(file);
+    expect(await authenticates(server.path, file)).toBe(true);
+  });
+
+  it('a start whose listen fails for another reason keeps the previous token and leaves no temporary file', async () => {
+    const file = tokenPath();
+    const previous = createEngineToken(file); // e.g. left by an engine that has exited
+    const invalid = String.raw`\\.\pipe\vuyro-` + 'x'.repeat(300); // longer than a pipe name may be
+    await expect(startEnginePipe(invalid, () => undefined, { tokenPath: file })).rejects.toThrow();
+    expect(readEngineToken(file).equals(previous.secret)).toBe(true);
+    expectOnlyTokenFile(file);
+  });
+
+  it('stops listening when the token cannot be moved into place and verified', async () => {
+    const path = pipePath();
+    const file = tokenPath();
+    const w = win32();
+    const real = w.GetSecurityInfo.bind(w);
+    let reads = 0;
+    // Two read-backs while preparing are real; the check after the move (once listening) fails.
+    vi.spyOn(w, 'GetSecurityInfo').mockImplementation((...args) => {
+      reads += 1;
+      return reads <= 2 ? real(...args) : ERROR_ACCESS_DENIED;
+    });
+    await expect(startEnginePipe(path, () => undefined, { tokenPath: file })).rejects.toThrow(/GetSecurityInfo/);
+    vi.restoreAllMocks();
+    await expectNotListening(path);
+    expect(existsSync(file)).toBe(false);
+    expect(readdirSync(join(file, '..'))).toEqual([]);
   });
 
   it('client refuses tokens that are too short', async () => {

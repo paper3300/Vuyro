@@ -101,10 +101,10 @@ describe.runIf(isWindows)('engine token file', () => {
     const w = win32();
     const real = w.GetSecurityInfo.bind(w);
     let reads = 0;
-    // The first read-back (temporary file) is real; the check after the move fails.
+    // The two read-backs of the temporary file are real; the check after the move fails.
     vi.spyOn(w, 'GetSecurityInfo').mockImplementation((...args) => {
       reads += 1;
-      return reads === 1 ? real(...args) : ERROR_ACCESS_DENIED;
+      return reads <= 2 ? real(...args) : ERROR_ACCESS_DENIED;
     });
     expect(() => createEngineToken(path)).toThrow();
     expect(existsSync(path)).toBe(false);

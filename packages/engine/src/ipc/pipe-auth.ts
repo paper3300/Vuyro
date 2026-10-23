@@ -1,6 +1,6 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import net from 'node:net';
-import { createEngineToken, reverifyEngineToken, type VerifiedEngineToken } from './engine-token.ts';
+import { prepareEngineToken, reverifyEngineToken, type VerifiedEngineToken } from './engine-token.ts';
 
 /**
  * Engine pipe authentication (decision C in 기술 스택 결정 §3/§14).
@@ -20,8 +20,9 @@ import { createEngineToken, reverifyEngineToken, type VerifiedEngineToken } from
  * malformed, oversized, late or wrong message closes the connection without a
  * reason; the handler is never called before `auth.ok`.
  *
- * Start the server with `startEnginePipe`, which creates and verifies the token
- * file before listening. `listenAuthenticatedPipe` only takes a
+ * Start the server with `startEnginePipe`: it prepares and verifies the new token
+ * file, listens (which also claims the single instance), and only then moves the
+ * token into place. `listenAuthenticatedPipe` only takes a
  * `VerifiedEngineToken` and re-verifies its file, so there is no way to listen
  * on a secret whose file ACL was not confirmed.
  */
@@ -70,17 +71,36 @@ export interface AuthenticatedPipeServer {
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 
 /**
- * The engine's only start path: validates the options, writes and verifies the
- * token file, then listens. Fails, without listening, if any step fails.
+ * The engine's only start path:
+ * 1. validate the options;
+ * 2. prepare the new token in a temporary file (ACL applied and verified);
+ * 3. listen — `FILE_FLAG_FIRST_PIPE_INSTANCE` makes this the single-instance
+ *    check, so a second start fails here (EADDRINUSE) and only discards its
+ *    temporary file, leaving the running engine's token in place;
+ * 4. move the token into place and verify it; if that fails, stop listening.
  */
 export async function startEnginePipe(
   pipePath: string,
   onConnection: (socket: net.Socket) => Promise<void> | void,
   options: EnginePipeOptions = {},
 ): Promise<AuthenticatedPipeServer> {
-  serverLimits(options); // reject bad options before touching the token file
-  const token = createEngineToken(options.tokenPath);
-  return listenAuthenticatedPipe(pipePath, token, onConnection, options);
+  const limits = serverLimits(options); // reject bad options before touching any token file
+  const pending = prepareEngineToken(options.tokenPath);
+  let listening: Listening;
+  try {
+    listening = await listenWithSecret(pipePath, pending.secret, onConnection, limits);
+  } catch (error) {
+    pending.discard();
+    throw error;
+  }
+  let token: VerifiedEngineToken;
+  try {
+    token = pending.commit();
+  } catch (error) {
+    await listening.close();
+    throw error;
+  }
+  return { path: pipePath, token, ...listening };
 }
 
 /**
@@ -95,9 +115,30 @@ export async function listenAuthenticatedPipe(
   onConnection: (socket: net.Socket) => Promise<void> | void,
   options: AuthenticatedPipeServerOptions = {},
 ): Promise<AuthenticatedPipeServer> {
-  const { maxPending, timeoutMs, maxBytes } = serverLimits(options);
+  const limits = serverLimits(options);
   reverifyEngineToken(token);
-  const secret = token.secret;
+  return { path: pipePath, token, ...(await listenWithSecret(pipePath, token.secret, onConnection, limits)) };
+}
+
+interface Limits {
+  readonly maxPending: number;
+  readonly timeoutMs: number;
+  readonly maxBytes: number;
+}
+
+interface Listening {
+  readonly server: net.Server;
+  readonly stats: Readonly<AuthStats>;
+  close(): Promise<void>;
+}
+
+/** Callers vouch for `secret` (a verified or prepared token). */
+async function listenWithSecret(
+  pipePath: string,
+  secret: Buffer,
+  onConnection: (socket: net.Socket) => Promise<void> | void,
+  { maxPending, timeoutMs, maxBytes }: Limits,
+): Promise<Listening> {
   const stats: AuthStats = { authenticated: 0, rejected: 0, timedOut: 0, overPendingLimit: 0, oversized: 0 };
   let pending = 0;
 
@@ -198,9 +239,7 @@ export async function listenAuthenticatedPipe(
   });
 
   return {
-    path: pipePath,
     server,
-    token,
     stats,
     close: () =>
       new Promise((resolve) => {
@@ -329,7 +368,7 @@ function send(socket: net.Socket, message: Record<string, string>): void {
   socket.write(`${JSON.stringify(message)}\n`);
 }
 
-function serverLimits(options: AuthenticatedPipeServerOptions): { maxPending: number; timeoutMs: number; maxBytes: number } {
+function serverLimits(options: AuthenticatedPipeServerOptions): Limits {
   return {
     maxPending: positiveInteger('maxPendingAuth', options.maxPendingAuth, 16, 65_536),
     timeoutMs: positiveInteger('authTimeoutMs', options.authTimeoutMs, 5000, MAX_TIMEOUT_MS),
