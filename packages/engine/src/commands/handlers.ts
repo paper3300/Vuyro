@@ -53,6 +53,11 @@ export interface CommandHandler<T extends CommandType, S> {
   readonly target?: (payload: CommandPayload<T>) => { readonly definition: AggregateDefinition<S>; readonly aggregateId: string };
   /** Ticket, node and run the command acts on, for the scope check. */
   readonly scope: (payload: CommandPayload<T>, target: Loaded<S> | undefined) => CommandTarget;
+  /**
+   * True when `scope` needs the loaded target (e.g. a run's ticket and node). Otherwise the bus
+   * authorizes from the payload alone, before reading any aggregate.
+   */
+  readonly scopeNeedsTarget?: boolean;
   readonly decide: (ctx: HandlerContext, payload: CommandPayload<T>, target: Loaded<S> | undefined) => Promise<Decision<T>>;
 }
 
@@ -105,6 +110,7 @@ type HandlerMap = { readonly [T in CommandType]: CommandHandler<T, never> };
 export interface ErasedHandler {
   readonly target?: (payload: unknown) => { readonly definition: AggregateDefinition<unknown>; readonly aggregateId: string };
   readonly scope: (payload: unknown, target: Loaded<unknown> | undefined) => CommandTarget;
+  readonly scopeNeedsTarget?: boolean;
   readonly decide: (ctx: HandlerContext, payload: unknown, target: Loaded<unknown> | undefined) => Promise<Decision<CommandType>>;
 }
 
@@ -218,6 +224,7 @@ export const HANDLERS: HandlerMap = {
   'run.observe': handler<'run.observe', RunState>({
     target: runTarget,
     scope: runScope,
+    scopeNeedsTarget: true,
     decide: (_ctx, payload, target) => {
       const run = runningRun(target);
       if ('ok' in run) return Promise.resolve(run);
@@ -229,6 +236,7 @@ export const HANDLERS: HandlerMap = {
   'run.settle': handler<'run.settle', RunState>({
     target: runTarget,
     scope: runScope,
+    scopeNeedsTarget: true,
     decide: (_ctx, payload, target) => {
       const run = runningRun(target);
       if ('ok' in run) return Promise.resolve(run);

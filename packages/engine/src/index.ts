@@ -47,3 +47,6 @@ export type { CommandBusOptions } from './commands/command-bus.ts';
 export { LOCAL_USER_ID } from './commands/caller.ts';
 export type { CallerContext, RunBinding, TransportIdentity } from './commands/caller.ts';
 export { hashRunToken } from './commands/run-token.ts';
+export { HumanCredential } from './commands/human-credential.ts';
+export type { HumanCredentialVerifier } from './commands/human-credential.ts';
+export { ORPHANED_RUN_REASON, settleOrphanedRuns } from './commands/recovery.ts';

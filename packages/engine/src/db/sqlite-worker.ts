@@ -82,10 +82,24 @@ function handle(request: SqliteRequest): unknown {
   }
 }
 
+let crashCountdown = config.testCrash?.occurrence ?? 0;
+
+/** See SqliteWorkerConfig.testCrash. Terminates the process mid-transaction, before COMMIT. */
+function maybeCrash(sql: string): void {
+  const crash = config.testCrash;
+  if (crash === undefined || !sql.trimStart().startsWith(crash.afterStatement)) return;
+  crashCountdown -= 1;
+  if (crashCountdown === 0) process.kill(process.pid, 'SIGKILL');
+}
+
 function transaction(batch: readonly SqliteStatement[]): SqliteRunResult[] {
   db.exec('BEGIN IMMEDIATE');
   try {
-    const results = batch.map((statement) => runResult(bind(prepare(statement.sql), 'run', statement.params)));
+    const results = batch.map((statement) => {
+      const result = runResult(bind(prepare(statement.sql), 'run', statement.params));
+      maybeCrash(statement.sql);
+      return result;
+    });
     db.exec('COMMIT');
     return results;
   } catch (error) {

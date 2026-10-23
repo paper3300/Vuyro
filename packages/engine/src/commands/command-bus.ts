@@ -20,6 +20,7 @@ import { authorize } from './authorize.ts';
 import { type CallerContext, resolveCaller, type RunTokenRecord, type TransportIdentity } from './caller.ts';
 import { canonicalJson, sha256Hex } from './fingerprint.ts';
 import { type HandlerContext, handlerFor, type Loaded } from './handlers.ts';
+import type { HumanCredentialVerifier } from './human-credential.ts';
 
 export interface CommandBusOptions {
   readonly store: EventStore;
@@ -29,6 +30,13 @@ export interface CommandBusOptions {
   readonly validator?: SchemaValidator;
   /** Folded aggregate states kept in memory. Default 1000. */
   readonly aggregateCacheSize?: number;
+  /**
+   * Verifies `humanProof` on engine-token connections. M3 wires the app's credential here;
+   * until then development tools and tests inject one. Absent = no caller can prove to be the human that way.
+   */
+  readonly humanCredential?: HumanCredentialVerifier;
+  /** Called for failures the bus survives but must not hide (e.g. a denial that could not be audited). */
+  readonly reportError?: (error: Error, context: string) => void;
 }
 
 interface CachedAggregate {
@@ -44,8 +52,9 @@ const failure = (error: CommandError, requestId?: string): CommandFailure =>
  * The single entry point for every state change. UI, CLI, agent panel, MCP and engine internals
  * all call `execute`; the transport says who is on the other end.
  *
- * Order of checks: envelope → command type → schema version → caller (run token) →
- * idempotency → payload → target load → authorization → expected revision → decide → append.
+ * Order of checks: envelope → command type → schema version → caller (run token, human proof) →
+ * idempotency → payload → authorization (from the payload; after loading the target only when the
+ * scope needs it) → target load → expected revision → decide → append.
  * Commands run one at a time, so a decision always sees every earlier commit.
  */
 export class CommandBus {
@@ -54,6 +63,8 @@ export class CommandBus {
   private readonly random: RandomSource;
   private readonly validator: SchemaValidator;
   private readonly cacheSize: number;
+  private readonly humanCredential: HumanCredentialVerifier | undefined;
+  private readonly reportError: (error: Error, context: string) => void;
   private readonly cache = new Map<string, CachedAggregate>();
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -63,6 +74,13 @@ export class CommandBus {
     this.random = options.random ?? cryptoRandom;
     this.validator = options.validator ?? new SchemaValidator();
     this.cacheSize = options.aggregateCacheSize ?? 1000;
+    this.humanCredential = options.humanCredential;
+    this.reportError =
+      options.reportError ??
+      ((error, context) => {
+        process.stderr.write(`[vuyro] ${context}: ${error.message}
+`);
+      });
   }
 
   execute(request: unknown, transport: TransportIdentity): Promise<CommandResponse> {
@@ -94,11 +112,6 @@ export class CommandBus {
       );
     }
 
-    const resolved = await resolveCaller(transport, request, (hash) => this.lookupRunToken(hash));
-    if (!resolved.ok) return failure(resolved.error, requestId);
-    const { caller } = resolved;
-
-    const callerKey = principalKey(caller.principal);
     const fingerprint = sha256Hex(
       canonicalJson({
         type,
@@ -108,6 +121,25 @@ export class CommandBus {
         payload: request.payload,
       }),
     );
+
+    const resolved = await resolveCaller(transport, request, {
+      lookupRunToken: (hash) => this.lookupRunToken(hash),
+      ...(this.humanCredential === undefined ? {} : { humanCredential: this.humanCredential }),
+    });
+    if (!resolved.ok) {
+      // A settled run may still get the stored answer to an exact retry of its own earlier request.
+      // Anything else (new request, different payload) gets the authentication error, revealing nothing.
+      if (resolved.settledAs !== undefined) {
+        const previous = await this.store.getCommand(requestId);
+        if (previous?.principalKey === principalKey(resolved.settledAs) && previous.fingerprint === fingerprint) {
+          return { ...previous.response, replayed: true };
+        }
+      }
+      return failure(resolved.error, requestId);
+    }
+    const { caller } = resolved;
+    const callerKey = principalKey(caller.principal);
+
     const stored = await this.store.getCommand(requestId);
     if (stored !== undefined) return this.replay(stored, callerKey, fingerprint, requestId);
 
@@ -119,14 +151,19 @@ export class CommandBus {
     const handler = handlerFor(type);
     const { payload } = request;
     const targetRef = handler.target?.(payload);
-    const target = targetRef === undefined ? undefined : await this.load(targetRef.definition, targetRef.aggregateId);
+    const loadTarget = () => (targetRef === undefined ? Promise.resolve(undefined) : this.load(targetRef.definition, targetRef.aggregateId));
 
+    // Authorize from the payload before reading anything, unless the scope depends on the target.
+    let target: Loaded<unknown> | undefined;
+    if (handler.scopeNeedsTarget === true) target = await loadTarget();
     const scope = handler.scope(payload, target);
     const decision = authorize(type, definition, caller, scope);
     if (!decision.ok) {
-      await this.recordDenial(caller, request, decision.code, decision.reason, scope);
-      return failure(commandError(decision.code, decision.reason), requestId);
+      const auditError = await this.recordDenial(caller, request, decision.code, decision.reason, scope);
+      const details = auditError === undefined ? undefined : { audit: 'failed', auditError: auditError.message };
+      return failure(commandError(decision.code, decision.reason, details), requestId);
     }
+    if (handler.scopeNeedsTarget !== true) target = await loadTarget();
 
     if (request.expectedRevision !== undefined) {
       const actual = target?.revision ?? 0;
@@ -207,7 +244,7 @@ export class CommandBus {
     code: 'forbidden' | 'out_of_scope',
     reason: string,
     scope: { ticketId?: string; nodeId?: string },
-  ): Promise<void> {
+  ): Promise<Error | undefined> {
     try {
       await this.store.append({
         streams: [
@@ -233,8 +270,12 @@ export class CommandBus {
         actor: caller.principal,
         requestId: request.requestId,
       });
-    } catch {
-      // The refusal stands even if the audit record could not be written.
+      return undefined;
+    } catch (error) {
+      // The refusal stands (fail closed), but the missing audit record is reported, not hidden.
+      const failed = error instanceof Error ? error : new Error(String(error));
+      this.reportError(failed, `could not record denial of ${request.type} (${request.requestId})`);
+      return failed;
     }
   }
 

@@ -24,8 +24,9 @@ const outOfScope = (reason: string): AuthorizationResult => ({ ok: false, code: 
  * 2. System-only commands: only the engine.
  * 3. Node agents (run token): only commands open to node agents, only on their own ticket and node.
  *
- * Everything else is allowed until the configurable policy lands (after MVP), except external MCP
- * clients, which stay read-only.
+ * 4. Unverified local clients (engine token only) and external MCP clients are read-only.
+ *
+ * Everything else is allowed until the configurable policy lands (after MVP).
  */
 export function authorize(type: string, definition: CommandDefinition, caller: CallerContext, target: CommandTarget): AuthorizationResult {
   const { principal } = caller;
@@ -56,7 +57,8 @@ export function authorize(type: string, definition: CommandDefinition, caller: C
     case 'human':
       return allow('human');
     case 'unverified':
-      return allow('local-default');
+      // Without a run token or the human credential nobody knows who this is: read-only.
+      return forbidden('unverified local clients are read-only: present a run token or the human credential');
     case 'agent': {
       if (principal.role === 'mcp.external') return forbidden('external MCP clients are read-only');
       if (principal.role !== 'node.agent') return allow('panel-default');

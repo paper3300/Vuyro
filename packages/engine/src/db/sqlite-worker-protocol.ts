@@ -27,6 +27,11 @@ export interface SqliteWorkerConfig {
   readonly synchronous?: SynchronousMode;
   /** Default 5000 ms. */
   readonly busyTimeoutMs?: number;
+  /**
+   * Tests only: kill the whole process (not just the worker) right after the n-th statement executed
+   * inside a transaction whose SQL starts with `afterStatement`. Makes crash tests stop at an exact point.
+   */
+  readonly testCrash?: { readonly afterStatement: string; readonly occurrence: number };
 }
 
 export type SqliteRequest =

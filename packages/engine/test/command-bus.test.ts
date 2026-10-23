@@ -1,6 +1,10 @@
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CommandFailure, CommandResponse } from '@vuyro/contracts';
+import { HumanCredential } from '../src/commands/human-credential.ts';
+import { settleOrphanedRuns } from '../src/commands/recovery.ts';
+import { CommandBus } from '../src/commands/command-bus.ts';
+import { createUuidV7Generator, seededRandom } from '../src/runtime/ids.ts';
 import {
   CLI,
   type Harness,
@@ -114,6 +118,24 @@ describe('CommandBus', () => {
       const resumed = await h.ok('run.start', { ticketId, nodeId: 'spec', provider: 'claude', resumedFromRunId: run.runId }, SYSTEM);
       const rows = await h.store.query('SELECT resumed_from_run_id FROM p_runs WHERE run_id = ?', [(resumed.result as { runId: string }).runId]);
       expect(rows).toEqual([{ resumed_from_run_id: run.runId }]);
+    });
+
+    it('settles runs left running by a restart and revokes their tokens', async () => {
+      const { ticketId } = await seedTicket(h);
+      const finished = await startRun(h, ticketId, 'spec');
+      await h.ok('run.settle', { runId: finished.runId, outcome: 'succeeded' }, SYSTEM);
+      const orphan = await startRun(h, ticketId, 'dev');
+      await h.reopen();
+      expect(await settleOrphanedRuns(h.bus, h.store)).toEqual([orphan.runId]);
+      expect(await settleOrphanedRuns(h.bus, h.store)).toEqual([]);
+      expect(await h.store.query('SELECT status, terminal_reason FROM p_runs WHERE run_id = ?', [orphan.runId])).toEqual([
+        { status: 'abnormal_exit', terminal_reason: 'engine_restarted' },
+      ]);
+      const payload = { ticketId, nodeId: 'dev', slot: 'change', ref: REF };
+      expectFailure(await h.exec('artifact.add', payload, CLI, { auth: { runToken: orphan.runToken } }), 'unauthenticated');
+      // The workflow then issues a fresh run that resumes the orphaned one.
+      const next = await h.ok('run.start', { ticketId, nodeId: 'dev', provider: 'claude', resumedFromRunId: orphan.runId }, SYSTEM);
+      expect((next.result as { runToken: string }).runToken).toMatch(/^vrt_/);
     });
 
     it('treats an id of another aggregate type as not found', async () => {
@@ -258,6 +280,23 @@ describe('CommandBus', () => {
       ]);
     });
 
+    it('still refuses, and reports, when the denial cannot be audited', async () => {
+      const reported: string[] = [];
+      const bus = new CommandBus({
+        store: h.store,
+        ids: createUuidV7Generator({ clock: h.clock, random: seededRandom(77) }),
+        reportError: (error, context) => reported.push(`${context}: ${error.message}`),
+      });
+      const append = vi.spyOn(h.store, 'append').mockRejectedValueOnce(new Error('disk full'));
+      const request = { requestId: nextRequestId(), type: 'ticket.update', auth: { runToken: dev.runToken }, payload: { ticketId, title: 'hijack' } };
+      const response = expectFailure(await bus.execute(request, CLI), 'forbidden');
+      append.mockRestore();
+      expect(response.error.details).toEqual({ audit: 'failed', auditError: 'disk full' });
+      expect(reported).toEqual([expect.stringContaining('could not record denial of ticket.update')]);
+      expect(await h.store.query('SELECT COUNT(*) AS n FROM p_command_denials')).toEqual([{ n: 0 }]);
+      expect(await h.store.query('SELECT title FROM p_tickets WHERE ticket_id = ?', [ticketId])).toEqual([{ title: 'Add a notepad' }]);
+    });
+
     it('rejects malformed, unknown and revoked tokens instead of falling back to a wider caller', async () => {
       const payload = { ticketId, nodeId: 'dev', slot: 'change', ref: REF };
       // Malformed tokens are refused before any lookup.
@@ -272,6 +311,33 @@ describe('CommandBus', () => {
       expectFailure(viaUi, 'forbidden');
       const internal = await h.exec('ticket.update', { ticketId, title: 'x' }, SYSTEM, { auth: { runToken: dev.runToken } });
       expectFailure(internal, 'unauthenticated');
+    });
+
+    it('refuses out-of-scope node agent commands before reading any aggregate', async () => {
+      const reads = vi.spyOn(h.store, 'readAggregate');
+      const otherTicket = { ticketId: otherTicketId, nodeId: 'dev', slot: 'change', ref: REF };
+      expectFailure(await asAgent(dev.runToken, 'artifact.add', otherTicket), 'out_of_scope');
+      expectFailure(await asAgent(dev.runToken, 'ticket.update', { ticketId, title: 'x' }), 'forbidden');
+      expect(reads).not.toHaveBeenCalled();
+      reads.mockRestore();
+    });
+
+    it('answers an exact retry after the run settled, and nothing else', async () => {
+      const payload = { ticketId, nodeId: 'dev', slot: 'change', ref: REF };
+      const request = { requestId: nextRequestId(), type: 'artifact.add', auth: { runToken: dev.runToken }, payload };
+      const first = await h.bus.execute(request, CLI);
+      expect(first.ok).toBe(true);
+      await h.ok('run.settle', { runId: dev.runId, outcome: 'succeeded', exitCode: 0 }, SYSTEM);
+
+      expect(await h.bus.execute(request, CLI)).toEqual({ ...first, replayed: true });
+      // Same id with other content, or a new request: the authentication error, no hint about stored results.
+      const changed = { ...request, payload: { ...payload, slot: 'other' } };
+      expect(expectFailure(await h.bus.execute(changed, CLI), 'unauthenticated').error.message).toMatch(/revoked/);
+      expectFailure(await asAgent(dev.runToken, 'artifact.add', payload), 'unauthenticated');
+      // Another settled run's token cannot replay this run's request.
+      const other = await startRun(h, ticketId, 'dev');
+      await h.ok('run.settle', { runId: other.runId, outcome: 'succeeded' }, SYSTEM);
+      expectFailure(await h.bus.execute({ ...request, auth: { runToken: other.runToken } }, CLI), 'unauthenticated');
     });
 
     it('keeps a retried artifact.add idempotent for the same run', async () => {
@@ -322,17 +388,68 @@ describe('CommandBus', () => {
   });
 
   describe('other principals', () => {
-    it('lets an unverified local client do ordinary work but not engine-only work', async () => {
-      const project = await h.ok('project.create', { name: 'from terminal' }, CLI);
-      const [event] = await h.store.readAggregate((project.result as { projectId: string }).projectId);
-      expect(event?.actor).toEqual({ kind: 'unverified', client: 'cli' });
+    it('keeps unverified local clients read-only, even for commands a node agent may run', async () => {
       const { ticketId } = await seedTicket(h);
-      expectFailure(await h.exec('run.start', { ticketId, nodeId: 'dev', provider: 'claude' }, CLI), 'forbidden');
+      const run = await startRun(h, ticketId, 'dev');
+      const payload = { ticketId, nodeId: 'qa', slot: 'report', ref: REF };
+      // With the token: out of scope. Dropping the token must not widen anything.
+      expectFailure(await h.exec('artifact.add', payload, CLI, { auth: { runToken: run.runToken } }), 'out_of_scope');
+      expectFailure(await h.exec('artifact.add', payload, CLI), 'forbidden');
+      expectFailure(await h.exec('project.create', { name: 'from terminal' }, CLI), 'forbidden');
+      expectFailure(await h.exec('ticket.update', { ticketId, title: 'x' }, { kind: 'engine-token', client: 'unknown' }), 'forbidden');
+      expect(await h.store.query('SELECT COUNT(*) AS n FROM p_artifacts')).toEqual([{ n: 0 }]);
+      const denials = await h.store.query("SELECT actor_kind FROM p_command_denials WHERE actor_kind = 'unverified'");
+      expect(denials).toHaveLength(3);
+    });
+
+    it('does not let anyone except the engine run engine-only commands', async () => {
+      const { ticketId } = await seedTicket(h);
       expectFailure(await h.exec('run.start', { ticketId, nodeId: 'dev', provider: 'claude' }, HUMAN), 'forbidden');
     });
 
     it('keeps external MCP clients read-only', async () => {
       expectFailure(await h.exec('project.create', { name: 'x' }, MCP), 'forbidden');
     });
+
+    it('refuses a human proof when no human credential is configured', async () => {
+      const transport = { kind: 'engine-token', client: 'cli', humanProof: 'vhc_anything' } as const;
+      expectFailure(await h.exec('project.create', { name: 'x' }, transport), 'unauthenticated');
+    });
+  });
+});
+
+describe('CommandBus with an injected human credential', () => {
+  let temp: ReturnType<typeof tempDir>;
+  let h: Harness;
+  const { credential, secret } = HumanCredential.generate(seededRandom(9));
+  const asHuman = { kind: 'engine-token', client: 'cli', humanProof: secret } as const;
+
+  beforeEach(async () => {
+    temp = tempDir('vuyro-bus-human-');
+    h = await openHarness(join(temp.dir, 'engine.db'), {}, { humanCredential: credential });
+  });
+
+  afterEach(async () => {
+    await h.close();
+    temp.dispose();
+  });
+
+  it('treats a CLI connection with the human credential as the human', async () => {
+    const project = await h.ok('project.create', { name: 'from terminal' }, asHuman);
+    const [event] = await h.store.readAggregate((project.result as { projectId: string }).projectId);
+    expect(event?.actor).toEqual({ kind: 'human', userId: 'local', via: 'cli' });
+    expect((await h.exec('permission.edit', { scope: 'app', rules: [RULE] }, asHuman)).ok).toBe(true);
+  });
+
+  it('fails closed on a wrong proof instead of falling back to an unverified caller', async () => {
+    const wrong = { kind: 'engine-token', client: 'cli', humanProof: `${secret}x` } as const;
+    expectFailure(await h.exec('project.create', { name: 'x' }, wrong), 'unauthenticated');
+    expect(await h.store.lastSequence()).toBe(0);
+  });
+
+  it('still narrows to the node agent when a run token comes with the human proof', async () => {
+    const { ticketId } = await seedTicket(h);
+    const run = await startRun(h, ticketId, 'dev');
+    expectFailure(await h.exec('ticket.update', { ticketId, title: 'x' }, asHuman, { auth: { runToken: run.runToken } }), 'forbidden');
   });
 });

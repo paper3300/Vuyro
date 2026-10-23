@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CommandResponse, CommandSuccess } from '@vuyro/contracts';
-import { CommandBus } from '../../src/commands/command-bus.ts';
+import { CommandBus, type CommandBusOptions } from '../../src/commands/command-bus.ts';
 import type { TransportIdentity } from '../../src/commands/caller.ts';
 import { VirtualClock } from '../../src/runtime/clock.ts';
 import { createUuidV7Generator, seededRandom } from '../../src/runtime/ids.ts';
@@ -36,13 +36,17 @@ export function nextRequestId(): string {
 }
 
 /** Event store + command bus on a temp database, a virtual clock and seeded randomness. */
-export async function openHarness(path: string, options: Partial<EventStoreOptions> = {}): Promise<Harness> {
+export async function openHarness(
+  path: string,
+  options: Partial<EventStoreOptions> = {},
+  busOptions: Partial<CommandBusOptions> = {},
+): Promise<Harness> {
   const clock = new VirtualClock();
   const ids = createUuidV7Generator({ clock, random: seededRandom(1) });
   const random = seededRandom(2);
   const open = async (extra: Partial<EventStoreOptions>) => {
     const store = await EventStore.open({ path, clock, ids, ...options, ...extra });
-    return { store, bus: new CommandBus({ store, ids, random }) };
+    return { store, bus: new CommandBus({ store, ids, random, ...busOptions }) };
   };
   let current = await open({});
   const harness: Harness = {

@@ -8,24 +8,21 @@ import { type Harness, openHarness, SYSTEM, tempDir } from './helpers/engine-har
 
 const writerScript = fileURLToPath(new URL('./helpers/crash-writer.ts', import.meta.url));
 
-/** Runs the writer in a child process and kills it hard once it acknowledged `target` commands. */
-async function writeUntilKilled(path: string, target: number): Promise<number> {
-  const child = spawn(process.execPath, [writerScript, path], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+/**
+ * Runs the writer in a child process. Its writer worker kills the process right after the
+ * `crashAfter`-th event insert, i.e. inside a transaction, before COMMIT.
+ */
+async function writeUntilCrash(path: string, crashAfter: number): Promise<{ acknowledged: number; code: number | null }> {
+  const child = spawn(process.execPath, [writerScript, path, String(crashAfter)], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   child.stdout.setEncoding('utf8');
   let stderr = '';
   child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
   const exited = new Promise<number | null>((resolve) => child.once('close', (code) => { resolve(code); }));
   let acknowledged = 0;
-  for await (const line of readLines(child.stdout)) {
-    acknowledged = Number(line);
-    if (acknowledged >= target) {
-      child.kill('SIGKILL');
-      break;
-    }
-  }
+  for await (const line of readLines(child.stdout)) acknowledged = Number(line);
   const code = await exited;
-  if (acknowledged < target) throw new Error(`writer stopped early (exit ${String(code)}): ${stderr}`);
-  return acknowledged;
+  if (stderr.includes('Error')) throw new Error(`writer failed: ${stderr}`);
+  return { acknowledged, code };
 }
 
 async function dumpProjections(h: Harness): Promise<Record<string, unknown[]>> {
@@ -49,11 +46,16 @@ describe('crash recovery', () => {
     temp.dispose();
   });
 
-  it('keeps log, projections and idempotency records consistent after the writer is killed', { timeout: 60_000 }, async () => {
+  it('keeps log, projections and idempotency records consistent after a kill inside a transaction', { timeout: 60_000 }, async () => {
     const path = join(temp.dir, 'engine.db');
-    const acknowledged = await writeUntilKilled(path, 60);
+    // 3 setup events + 20 observe commands × 5 events = 103; the kill lands after the 3rd event of the 21st command.
+    const { acknowledged, code } = await writeUntilCrash(path, 3 + 20 * 5 + 3);
+    expect(code).not.toBe(0);
+    expect(acknowledged).toBe(20);
     h = await openHarness(path);
 
+    // Exactly the 20 acknowledged commands are there; the interrupted one left nothing behind.
+    expect(await h.store.lastSequence()).toBe(103);
     // Log: gapless sequence and per-aggregate revisions.
     const [log] = await h.store.query<{ n: number; last: number }>('SELECT COUNT(*) AS n, MAX(sequence) AS last FROM events');
     expect(log?.n).toBe(log?.last);
@@ -71,8 +73,7 @@ describe('crash recovery', () => {
               (SELECT COUNT(*) FROM events WHERE type = 'run.messageRecorded') AS messages`,
     );
     expect(observed?.messages).toBe((observed?.commands ?? 0) * 5);
-    const [committed] = await h.store.query<{ n: number }>("SELECT COUNT(*) AS n FROM commands WHERE request_id NOT LIKE 'setup-%'");
-    expect(committed?.n).toBeGreaterThanOrEqual(acknowledged);
+    expect(observed).toEqual({ commands: 20, messages: 100 });
 
     // Projections match the log: the incremental tables equal a full replay.
     const [run] = await h.store.query<{ run_id: string; messages: number; revision: number }>('SELECT run_id, messages, revision FROM p_runs');

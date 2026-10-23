@@ -11,7 +11,7 @@ import {
   upcastEventData,
 } from '@vuyro/contracts';
 import { SqliteWorker, SqliteWorkerError } from '../db/sqlite-worker-client.ts';
-import type { SqliteStatement, SynchronousMode } from '../db/sqlite-worker-protocol.ts';
+import type { SqliteStatement, SqliteWorkerConfig, SynchronousMode } from '../db/sqlite-worker-protocol.ts';
 import type { Clock } from '../runtime/clock.ts';
 import type { IdGenerator } from '../runtime/ids.ts';
 import { BUILTIN_PROJECTORS, type Projector, projectionVersion } from './projections.ts';
@@ -88,6 +88,8 @@ export interface EventStoreOptions {
   readonly maxBatch?: number;
   /** Events per transaction while rebuilding projections. Default 500. */
   readonly rebuildBatch?: number;
+  /** Tests only: passed to the writer worker (see SqliteWorkerConfig.testCrash). */
+  readonly writerTestCrash?: SqliteWorkerConfig['testCrash'];
 }
 
 interface EventRow {
@@ -168,7 +170,11 @@ export class EventStore {
   }
 
   static async open(options: EventStoreOptions): Promise<EventStore> {
-    const writer = await SqliteWorker.open({ path: options.path, synchronous: options.synchronous ?? 'full' });
+    const writer = await SqliteWorker.open({
+      path: options.path,
+      synchronous: options.synchronous ?? 'full',
+      ...(options.writerTestCrash === undefined ? {} : { testCrash: options.writerTestCrash }),
+    });
     let reader: SqliteWorker | undefined;
     try {
       await migrate(writer);

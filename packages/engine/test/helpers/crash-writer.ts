@@ -1,7 +1,9 @@
 /**
- * Writes through the command bus as fast as it can until it is killed.
- * Used by crash-recovery.test.ts: `node crash-writer.ts <db path>`.
- * Prints the number of acknowledged commands after each one.
+ * Writes through the command bus until the writer worker kills the process at a fixed point.
+ * Used by crash-recovery.test.ts: `node crash-writer.ts <db path> <event insert to crash after>`.
+ *
+ * Setup writes 3 events (project, ticket, run); then each `run.observe` command writes 5 message events
+ * in one transaction, one command at a time. Prints the number of acknowledged observe commands.
  */
 import { CommandBus } from '../../src/commands/command-bus.ts';
 import type { TransportIdentity } from '../../src/commands/caller.ts';
@@ -9,11 +11,16 @@ import { systemClock } from '../../src/runtime/clock.ts';
 import { createUuidV7Generator } from '../../src/runtime/ids.ts';
 import { EventStore } from '../../src/store/event-store.ts';
 
-const path = process.argv[2];
-if (path === undefined) throw new Error('usage: crash-writer.ts <db path>');
+const [path, crashAfter] = process.argv.slice(2);
+if (path === undefined || crashAfter === undefined) throw new Error('usage: crash-writer.ts <db path> <event insert number>');
 
 const ids = createUuidV7Generator({ clock: systemClock });
-const store = await EventStore.open({ path, clock: systemClock, ids });
+const store = await EventStore.open({
+  path,
+  clock: systemClock,
+  ids,
+  writerTestCrash: { afterStatement: 'INSERT INTO events', occurrence: Number(crashAfter) },
+});
 const bus = new CommandBus({ store, ids });
 const engine: TransportIdentity = { kind: 'internal', component: 'crash-test' };
 const human: TransportIdentity = { kind: 'ui-session' };
@@ -29,14 +36,8 @@ const { ticketId } = await must('ticket.create', { projectId, title: 'crash test
 const { runId } = await must('run.start', { ticketId, nodeId: 'dev', provider: 'codex' }, engine);
 
 const messages = Array.from({ length: 5 }, (_, n) => ({ kind: 'message', role: 'assistant', text: `line ${n}` }));
-let acknowledged = 0;
-for (;;) {
-  // Two commands in flight at once, so the bus queue and group commit are both exercised.
-  const results = await Promise.all([
-    bus.execute({ requestId: `observe-${ids.next()}`, type: 'run.observe', payload: { runId, observations: messages } }, engine),
-    bus.execute({ requestId: `rename-${ids.next()}`, type: 'ticket.update', payload: { ticketId, title: `t${acknowledged}` } }, human),
-  ]);
-  for (const result of results) if (!result.ok) throw new Error(JSON.stringify(result.error));
-  acknowledged += results.length;
+for (let acknowledged = 1; ; acknowledged++) {
+  const result = await bus.execute({ requestId: `observe-${ids.next()}`, type: 'run.observe', payload: { runId, observations: messages } }, engine);
+  if (!result.ok) throw new Error(JSON.stringify(result.error));
   process.stdout.write(`${acknowledged}\n`);
 }
