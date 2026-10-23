@@ -71,10 +71,16 @@ function hookLog(path: string): Array<Record<string, unknown>> {
 describe('fixture files', () => {
   const files = [CLAUDE, CODEX].flatMap((dir) => readdirSync(new URL(dir, fixtures)).map((name) => dir + name));
 
+  // Read at run time; the real user name never appears in this file.
+  const user = userInfo().username.toLowerCase();
+  const userPrefixes = Array.from({ length: Math.max(0, user.length - 3) }, (_, i) => user.slice(0, user.length - i));
+
   it.each(files)('%s is sanitized', (file) => {
-    const content = text(file);
-    const user = userInfo().username;
-    if (user !== 'sample') expect(content.toLowerCase()).not.toContain(user.toLowerCase());
+    const content = text(file).toLowerCase();
+    // Also prefixes (4+ characters): tools truncate paths in their messages.
+    if (!'sample'.startsWith(user.slice(0, 4))) {
+      for (const prefix of userPrefixes) expect(content.includes(prefix), `contains "${prefix.slice(0, 2)}…"`).toBe(false);
+    }
     expect(content).not.toMatch(/vuyro-m0b\d*-\d+/);
   });
 

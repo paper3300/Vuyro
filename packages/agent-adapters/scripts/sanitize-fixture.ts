@@ -5,6 +5,8 @@
  *
  * - `--root`: the temporary directory the recording ran in → `C:\Users\sample\AppData\Local\Temp\vuyro-fixture`
  * - the current user name (also inside paths, slugs and the host name) → `sample`
+ * - every prefix of the user name with 4+ characters → `sample`, because tools
+ *   truncate paths in messages (PowerShell prints `C:\Users\<first chars>...`)
  *
  * JSONL and JSON inputs are rewritten value by value (so escaping stays valid);
  * anything else is treated as plain text.
@@ -37,8 +39,16 @@ const replacements: Array<[RegExp, string]> = [
   [new RegExp(escape(backslashed), 'gi'), FIXTURE_ROOT],
   [new RegExp(escape(slashed), 'gi'), FIXTURE_ROOT.replaceAll('\\', '/')],
   [new RegExp(escape(slug(backslashed)), 'gi'), slug(FIXTURE_ROOT)],
-  [new RegExp(escape(user), 'gi'), 'sample'],
+  // Longest first, so the full name is replaced before any of its prefixes.
+  ...userNamePrefixes(user).map((prefix): [RegExp, string] => [new RegExp(escape(prefix), 'gi'), 'sample']),
 ];
+
+/** The user name and all of its prefixes with at least 4 characters, longest first. */
+function userNamePrefixes(name: string): string[] {
+  const prefixes: string[] = [];
+  for (let length = name.length; length >= Math.min(4, name.length); length--) prefixes.push(name.slice(0, length));
+  return prefixes;
+}
 
 function scrub(text: string): string {
   return replacements.reduce((value, [pattern, replacement]) => value.replace(pattern, replacement), text);
@@ -75,8 +85,9 @@ switch (extname(input)) {
     result = scrub(source).replace(/\r\n/g, '\n');
 }
 
-if (new RegExp(escape(user), 'i').test(result)) {
-  console.error(`${output}: still contains the user name`);
+const leftover = userNamePrefixes(user).find((prefix) => result.toLowerCase().includes(prefix.toLowerCase()));
+if (leftover !== undefined) {
+  console.error(`${output}: still contains (part of) the user name`);
   process.exit(1);
 }
 writeFileSync(output, result);
