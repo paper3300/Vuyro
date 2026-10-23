@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a1690d-7db5-73f2-a38e-404e8879b087"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"file_change","changes":[{"path":"C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\codex\\work\\blocked.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"file_change","changes":[{"path":"C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\codex\\work\\blocked.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Created [blocked.txt](/C:/Users/sample/AppData/Local/Temp/vuyro-fixture/codex/work/blocked.txt) containing `blocked`."}}
+{"type":"turn.completed","usage":{"input_tokens":35162,"cached_input_tokens":29184,"cache_write_input_tokens":0,"output_tokens":84,"reasoning_output_tokens":0}}

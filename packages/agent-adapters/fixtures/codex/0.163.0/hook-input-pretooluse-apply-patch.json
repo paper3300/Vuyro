@@ -1,0 +1,14 @@
+{
+  "session_id": "01a1690d-2696-7063-8989-fad63189bded",
+  "turn_id": "01a1690d-2823-7472-807e-2ab238da36b3",
+  "transcript_path": "C:\\Users\\sample\\.codex\\sessions\\2026\\10\\23\\rollout-2026-10-23T22-57-12-01a1690d-2696-7063-8989-fad63189bded.jsonl",
+  "cwd": "C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\codex\\work",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-6-luna",
+  "permission_mode": "bypassPermissions",
+  "tool_name": "apply_patch",
+  "tool_input": {
+    "command": "*** Begin Patch\n*** Add File: blocked.txt\n+blocked\n*** End Patch"
+  },
+  "tool_use_id": "exec-ba3d6757-ac0a-41f5-8ddf-88b1b95a93d2"
+}

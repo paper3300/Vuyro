@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"01a1690d-94e4-7f33-b277-16cdd6651006"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"I’ll create `blocked.txt` with the requested content using `apply_patch`."}}
+{"type":"item.started","item":{"id":"item_3","type":"file_change","changes":[{"path":"C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\codex\\work\\blocked.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"file_change","changes":[{"path":"C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\codex\\work\\blocked.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"Created [blocked.txt](/C:/Users/sample/AppData/Local/Temp/vuyro-fixture/codex/work/blocked.txt)."}}
+{"type":"turn.completed","usage":{"input_tokens":33465,"cached_input_tokens":28288,"cache_write_input_tokens":0,"output_tokens":103,"reasoning_output_tokens":0}}

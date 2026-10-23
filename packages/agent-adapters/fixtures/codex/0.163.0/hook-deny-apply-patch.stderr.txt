@@ -1,0 +1,5 @@
+Reading additional input from stdin...
+2026-10-23T13:57:15.841312Z ERROR codex_core::tools::router: error=Command blocked by PreToolUse hook: Vuyro: internal checkout required. Command: *** Begin Patch
+*** Add File: blocked.txt
++blocked
+*** End Patch

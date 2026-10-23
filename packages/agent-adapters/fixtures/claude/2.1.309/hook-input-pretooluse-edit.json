@@ -1,0 +1,19 @@
+{
+  "session_id": "6c65ef1c-34d3-4f5d-b0c9-955cdc047a14",
+  "transcript_path": "C:\\Users\\sample\\.claude\\projects\\C--Users-sample-AppData-Local-Temp-vuyro-fixture-claude-work\\6c65ef1c-34d3-4f5d-b0c9-955cdc047a14.jsonl",
+  "cwd": "C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\claude\\work",
+  "prompt_id": "cfd0db1d-92e6-448f-b05f-54cbe44bd0bc",
+  "permission_mode": "acceptEdits",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\claude\\work\\input.txt",
+    "old_string": "hello vuyro",
+    "new_string": "bye vuyro",
+    "replace_all": false
+  },
+  "tool_use_id": "toolu_015J9sH6FyCaCmyNtrNAGy9z"
+}

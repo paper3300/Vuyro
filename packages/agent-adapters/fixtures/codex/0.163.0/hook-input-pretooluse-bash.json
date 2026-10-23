@@ -1,0 +1,14 @@
+{
+  "session_id": "01a1690d-ae28-7cf1-8f53-853df5b7cb72",
+  "turn_id": "01a1690d-af90-7513-a049-c86f9eaa99f0",
+  "transcript_path": "C:\\Users\\sample\\.codex\\sessions\\2026\\10\\23\\rollout-2026-10-23T22-57-46-01a1690d-ae28-7cf1-8f53-853df5b7cb72.jsonl",
+  "cwd": "C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\codex\\work",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-6-luna",
+  "permission_mode": "bypassPermissions",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "Set-Content -Path shell.txt -Value shell -NoNewline"
+  },
+  "tool_use_id": "exec-7f385538-0c6b-477e-b419-006fe300bcdc"
+}

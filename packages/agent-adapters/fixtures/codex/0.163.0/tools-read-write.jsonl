@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"01a1690c-b85e-7191-998e-3154a955a765"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll read `input.txt` and create `output.txt` with its contents uppercased."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"\"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\" -Command 'Get-Content -Raw input.txt'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"\"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\" -Command 'Get-Content -Raw input.txt'","aggregated_output":"hello vuyro\n\r\n","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\codex\\work\\output.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\codex\\work\\output.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":52877,"cached_input_tokens":40960,"cache_write_input_tokens":0,"output_tokens":113,"reasoning_output_tokens":0}}

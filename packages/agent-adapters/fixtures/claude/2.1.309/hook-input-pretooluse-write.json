@@ -1,0 +1,17 @@
+{
+  "session_id": "04fa4028-5125-4fa8-963b-23a436f25fb9",
+  "transcript_path": "C:\\Users\\sample\\.claude\\projects\\C--Users-sample-AppData-Local-Temp-vuyro-fixture-claude-work\\04fa4028-5125-4fa8-963b-23a436f25fb9.jsonl",
+  "cwd": "C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\claude\\work",
+  "prompt_id": "eec3ccdd-c9f7-4035-a68f-a0d7be1b0fc9",
+  "permission_mode": "acceptEdits",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\claude\\work\\blocked.txt",
+    "content": "blocked"
+  },
+  "tool_use_id": "toolu_01FAgpnBgvVB7qoR2NTQSu5H"
+}
