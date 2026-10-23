@@ -1,0 +1,9 @@
+packages:
+  - packages/*
+  - apps/*
+  - tools/*
+
+# pnpm blocks dependency install scripts unless listed here.
+onlyBuiltDependencies:
+  - koffi # selects its prebuilt binary
+  - unrs-resolver # checks its prebuilt binary (used by eslint-plugin-import-x)

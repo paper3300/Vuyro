@@ -1,0 +1,28 @@
+{
+  "name": "@vuyro/engine",
+  "version": "0.0.0",
+  "description": "Vuyro workflow engine",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "spike:pipe": "node spikes/pipe-security.ts",
+    "spike:sqlite": "node spikes/sqlite-wal-bench.ts"
+  },
+  "dependencies": {
+    "@vuyro/agent-adapters": "workspace:*",
+    "@vuyro/contracts": "workspace:*",
+    "koffi": "^3.3.3"
+  }
+}

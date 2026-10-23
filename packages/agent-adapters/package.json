@@ -1,0 +1,22 @@
+{
+  "name": "@vuyro/agent-adapters",
+  "version": "0.0.0",
+  "description": "Adapters that run agent CLIs and normalize their output",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vuyro/contracts": "workspace:*"
+  }
+}

@@ -59,6 +59,13 @@ Vuyro는 작업(티켓)이 기획부터 QA까지 거치는 단계를 그래프�
   - 에이전트가 실제로 작업할 대상은 **이 저장소 밖에 새로 만드는 작은 샘플 git 저장소**다(메모장 같은 앱).
   - 샘플 저장소를 이 저장소 안에 넣지 않는다.
 
+## 개발 명령
+
+- Node 24.16 이상(24.x), pnpm 10(`packageManager`에 고정). pnpm이 없으면 `npm i -g pnpm@10.34.7`.
+- `pnpm install && pnpm -r build && pnpm -r test && pnpm lint`가 마일스톤 공통 완료 기준이다. `pnpm lint`는 ESLint와 패키지별 타입 검사를 함께 돈다.
+- 소스(`.ts`)는 Node 24로 바로 실행된다. 예: `pnpm --filter @vuyro/engine spike:sqlite`.
+- 데스크톱 셸 확인: `VUYRO_SMOKE=1 pnpm --filter @vuyro/desktop start` (처음 실행할 때 Electron 바이너리를 받는다).
+
 ## 금지
 
 - **사용자의 다른 업무 프로젝트·회사 이름, 그 코드, 사내 링크, 비밀값을 이 저장소 어디에도 넣지 않는다.** 이 저장소는 **공개** GitHub 저장소다.

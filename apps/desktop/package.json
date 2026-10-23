@@ -1,0 +1,24 @@
+{
+  "name": "@vuyro/desktop",
+  "version": "0.0.0",
+  "description": "Vuyro desktop app (Electron main, preload and UI)",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "@vuyro/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "electron": "^45.0.0"
+  },
+  "files": [
+    "dist",
+    "static"
+  ]
+}
