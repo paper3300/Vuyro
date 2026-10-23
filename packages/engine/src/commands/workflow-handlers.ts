@@ -62,6 +62,10 @@ async function openWorkflow(ctx: HandlerContext, ticket: Loaded<TicketState>, ne
   const pin = ticket.state.template;
   if (pin === undefined) return fail('invariant_violated', `ticket ${ticket.aggregateId} does not run a workflow`);
   if (needOpen && ticket.state.status !== 'open') return fail('invariant_violated', `ticket ${ticket.aggregateId} is already ${ticket.state.status}`);
+  if (ticket.state.attention !== undefined) {
+    // Fail closed: a ticket with events in a retired format is not carried on (§6, pre-release format change).
+    return fail('invariant_violated', `ticket ${ticket.aggregateId} needs attention: its log has events in an older format (${ticket.state.attention.event})`);
+  }
   if (ctx.definitions === undefined) return fail('invariant_violated', 'this engine has no definition store');
   try {
     return await ctx.definitions.workflow(pin);

@@ -23,6 +23,7 @@ import {
   SchemaValidator,
   UnsupportedSchemaVersionError,
   upcastEventData,
+  isRetiredEvent,
   uuidV7Timestamp,
 } from '../src/index.ts';
 
@@ -239,6 +240,14 @@ describe('event schema versions', () => {
       schemaVersion: 3,
       data: { a: 1, b: 0, c: 'x' },
     });
+  });
+
+  it('reads a retired version as stored, without converting it', () => {
+    const retiredCatalog = { 'thing.happened': { version: 2, retired: [1] } };
+    expect(upcastEventData('thing.happened', 1, { a: 1 }, { catalog: retiredCatalog, upcasters: {} })).toEqual({ schemaVersion: 1, data: { a: 1 } });
+    expect(isRetiredEvent({ type: 'node.activated', schemaVersion: 1 })).toBe(true);
+    expect(isRetiredEvent({ type: 'node.activated', schemaVersion: 2 })).toBe(false);
+    expect(isRetiredEvent({ type: 'ticket.created', schemaVersion: 1 })).toBe(false);
   });
 
   it('fails closed on newer versions, unknown types and missing upcasters', () => {

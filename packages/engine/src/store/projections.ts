@@ -1,4 +1,4 @@
-import type { DomainEvent } from '@vuyro/contracts';
+import { type DomainEvent, isRetiredEvent } from '@vuyro/contracts';
 import type { SqliteStatement } from '../db/sqlite-worker-protocol.ts';
 
 /**
@@ -40,7 +40,7 @@ const projects: Projector = {
 
 const tickets: Projector = {
   name: 'tickets',
-  version: 2,
+  version: 3,
   tables: ['p_tickets', 'p_artifacts'],
   ddl: [
     `CREATE TABLE p_tickets (
@@ -55,7 +55,8 @@ const tickets: Projector = {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       completed_at INTEGER,
-      revision INTEGER NOT NULL
+      revision INTEGER NOT NULL,
+      attention TEXT
     ) STRICT`,
     'CREATE INDEX p_tickets_by_project ON p_tickets (project_id)',
     // Artifact registry: every registration is kept; the latest per slot is the current one.
@@ -77,88 +78,95 @@ const tickets: Projector = {
     'CREATE INDEX p_artifacts_by_slot ON p_artifacts (ticket_id, node_id, slot, sequence)',
   ],
   apply(event) {
-    switch (event.type) {
-      case 'ticket.created':
-        return [
-          {
-            sql: `INSERT INTO p_tickets
-                    (ticket_id, project_id, title, description, status, template_id, template_version, template_hash,
-                     created_at, updated_at, revision)
-                  VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)`,
-            params: [
-              event.data.ticketId,
-              event.data.projectId,
-              event.data.title,
-              event.data.description ?? null,
-              event.data.template?.id ?? null,
-              event.data.template?.version ?? null,
-              event.data.template?.hash ?? null,
-              event.timestamp,
-              event.timestamp,
-              event.revision,
-            ],
-          },
-        ];
-      case 'ticket.updated':
-        return [
-          {
-            sql: `UPDATE p_tickets SET
-                    title = COALESCE(?, title),
-                    description = CASE WHEN ? THEN ? ELSE description END,
-                    updated_at = ?, revision = ?
-                  WHERE ticket_id = ?`,
-            params: [
-              event.data.title ?? null,
-              event.data.description === undefined ? 0 : 1,
-              event.data.description ?? null,
-              event.timestamp,
-              event.revision,
-              event.data.ticketId,
-            ],
-          },
-        ];
-      case 'artifact.added': {
-        const { ref } = event.data;
-        return [
-          { sql: 'UPDATE p_tickets SET updated_at = ?, revision = ? WHERE ticket_id = ?', params: [event.timestamp, event.revision, event.data.ticketId] },
-          {
-            sql: `INSERT INTO p_artifacts
-                    (sequence, ticket_id, node_id, slot, kind, uri, version, title, mime_type, content_hash, run_id, lane, added_at)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            params: [
-              event.sequence,
-              event.data.ticketId,
-              event.data.nodeId,
-              event.data.slot,
-              ref.kind,
-              ref.uri,
-              ref.version ?? null,
-              ref.title ?? null,
-              ref.mimeType ?? null,
-              ref.contentHash ?? null,
-              event.data.runId ?? null,
-              event.data.lane ?? null,
-              event.timestamp,
-            ],
-          },
-        ];
-      }
-      case 'ticket.completed':
-        return [
-          {
-            sql: "UPDATE p_tickets SET status = 'done', completed_at = ?, updated_at = ?, revision = ? WHERE ticket_id = ?",
-            params: [event.timestamp, event.timestamp, event.revision, event.data.ticketId],
-          },
-        ];
-      default:
-        // Every other ticket event moves the revision too (the UI uses it for optimistic concurrency).
-        if (event.aggregateType !== 'ticket') return [];
-        return [
-          { sql: 'UPDATE p_tickets SET updated_at = ?, revision = ? WHERE ticket_id = ?', params: [event.timestamp, event.revision, event.aggregateId] },
-        ];
-    }
+    const statements = ticketStatements(event);
+    // A ticket with events in a retired format needs attention: the engine does not carry it on (§6).
+    if (event.aggregateType !== 'ticket' || !isRetiredEvent(event)) return statements;
+    return [...statements, { sql: "UPDATE p_tickets SET attention = COALESCE(attention, 'legacy-events') WHERE ticket_id = ?", params: [event.aggregateId] }];
   },
 };
+
+function ticketStatements(event: DomainEvent): SqliteStatement[] {
+  switch (event.type) {
+    case 'ticket.created':
+      return [
+        {
+          sql: `INSERT INTO p_tickets
+                  (ticket_id, project_id, title, description, status, template_id, template_version, template_hash,
+                   created_at, updated_at, revision)
+                VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)`,
+          params: [
+            event.data.ticketId,
+            event.data.projectId,
+            event.data.title,
+            event.data.description ?? null,
+            event.data.template?.id ?? null,
+            event.data.template?.version ?? null,
+            event.data.template?.hash ?? null,
+            event.timestamp,
+            event.timestamp,
+            event.revision,
+          ],
+        },
+      ];
+    case 'ticket.updated':
+      return [
+        {
+          sql: `UPDATE p_tickets SET
+                  title = COALESCE(?, title),
+                  description = CASE WHEN ? THEN ? ELSE description END,
+                  updated_at = ?, revision = ?
+                WHERE ticket_id = ?`,
+          params: [
+            event.data.title ?? null,
+            event.data.description === undefined ? 0 : 1,
+            event.data.description ?? null,
+            event.timestamp,
+            event.revision,
+            event.data.ticketId,
+          ],
+        },
+      ];
+    case 'artifact.added': {
+      const { ref } = event.data;
+      return [
+        { sql: 'UPDATE p_tickets SET updated_at = ?, revision = ? WHERE ticket_id = ?', params: [event.timestamp, event.revision, event.data.ticketId] },
+        {
+          sql: `INSERT INTO p_artifacts
+                  (sequence, ticket_id, node_id, slot, kind, uri, version, title, mime_type, content_hash, run_id, lane, added_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
+            event.sequence,
+            event.data.ticketId,
+            event.data.nodeId,
+            event.data.slot,
+            ref.kind,
+            ref.uri,
+            ref.version ?? null,
+            ref.title ?? null,
+            ref.mimeType ?? null,
+            ref.contentHash ?? null,
+            event.data.runId ?? null,
+            event.data.lane ?? null,
+            event.timestamp,
+          ],
+        },
+      ];
+    }
+    case 'ticket.completed':
+      return [
+        {
+          sql: "UPDATE p_tickets SET status = 'done', completed_at = ?, updated_at = ?, revision = ? WHERE ticket_id = ?",
+          params: [event.timestamp, event.timestamp, event.revision, event.data.ticketId],
+        },
+      ];
+    default:
+      // Every other ticket event moves the revision too (the UI uses it for optimistic concurrency).
+      if (event.aggregateType !== 'ticket') return [];
+      return [
+        { sql: 'UPDATE p_tickets SET updated_at = ?, revision = ? WHERE ticket_id = ?', params: [event.timestamp, event.revision, event.aggregateId] },
+      ];
+  }
+}
 
 type LaneKey = { readonly ticketId: string; readonly nodeId: string; readonly lane: string; readonly run: number };
 

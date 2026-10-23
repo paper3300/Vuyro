@@ -56,7 +56,7 @@ export interface WorkflowHarness {
   ticket(ticketId: string): Promise<TicketWorkflow>;
   status(ticketId: string, nodeId: string, lane?: string): Promise<string>;
   /** Closes and reopens everything on the same database and files (an engine restart). */
-  restart(options?: { behavior?: ScriptedBehavior; noEngine?: boolean }): Promise<void>;
+  restart(options?: { behavior?: ScriptedBehavior; noEngine?: boolean; whileClosed?: (dbPath: string) => void | Promise<void> }): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -185,6 +185,7 @@ export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}):
       parts.writer.stop();
       await activity.idle();
       await parts.store.close();
+      await next.whileClosed?.(join(temp.dir, 'engine.db'));
       if (next.behavior !== undefined) behavior = next.behavior;
       parts = await build({ engine: next.noEngine !== true });
       await parts.writer.recover();

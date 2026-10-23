@@ -111,14 +111,15 @@ function basisLive(state: TicketWorkflow, basis: Basis): boolean {
 }
 
 /**
- * The generation record of what an execution sends: a fan-out lane's is its group; any other's is its own record
- * plus the groups its deliveries opened (it started that generation, e.g. a review whose rejection made a new plan).
+ * The generation record of what an execution sends: a fan-out lane's is its group. An execution whose deliveries
+ * opened groups sends work of exactly those generations (a plan and the review of that plan both go when a newer
+ * plan replaces it), whatever it rested on itself. Any other sends its own record.
  */
 export function outgoingBasis(state: TicketWorkflow, exec: Execution): Basis {
   const group = laneOf(state, exec.nodeId, exec.lane)?.group;
   if (group !== undefined) return { groups: [group] };
   const opened = exec.opened ?? [];
-  return opened.length === 0 ? (exec.basis ?? FREE) : mergeBasis([exec.basis ?? FREE, { groups: [...opened] }]);
+  return opened.length === 0 ? (exec.basis ?? FREE) : { groups: [...new Set(opened)].sort() };
 }
 
 /**
@@ -629,8 +630,9 @@ export interface WaitReason {
   /**
    * 'active': someone (executor or person) still has to act. 'failed': a failure no edge took; retry it.
    * 'stale': a success whose items all answered replaced work, so it went nowhere (D-021); retry it.
+   * 'attention': the log holds events in a retired format (§6); nothing carries the ticket on.
    */
-  readonly kind: 'active' | 'failed' | 'stale';
+  readonly kind: 'active' | 'failed' | 'stale' | 'attention';
   readonly status: string;
 }
 
@@ -639,6 +641,7 @@ export interface WaitReason {
  * do not count: a newer group replaced their work.
  */
 export function ticketWaitReasons(state: TicketWorkflow, workflow: CompiledWorkflow): WaitReason[] {
+  if (state.attention !== undefined) return [{ nodeId: '', lane: '', run: 0, kind: 'attention', status: state.attention.reason }];
   const reasons: WaitReason[] = [];
   for (const nodeId of workflow.nodes.keys()) {
     const progress = nodeProgress(state, nodeId);

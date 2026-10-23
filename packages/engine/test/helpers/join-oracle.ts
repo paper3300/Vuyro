@@ -403,8 +403,8 @@ export class JoinOracle {
   }
 
   /**
-   * The classes of what a source delivers: a fan-out lane's group, a passed-over group, or what the execution consumed
-   * plus the groups its own deliveries opened (it started that generation).
+   * The classes of what a source delivers: a fan-out lane's group, a passed-over group, the groups an execution's own
+   * deliveries opened (it started those generations, so everything it sends belongs to them), else what it consumed.
    */
   private sourceClasses(source: Source, notOpened?: string): string[] {
     if (source.kind === 'group') return [`g:${source.group}`];
@@ -413,7 +413,7 @@ export class JoinOracle {
     const group = this.laneGroup.get(`${exec.node}#${exec.lane}`);
     if (group !== undefined) return [`g:${group}`];
     const opened = (this.opened.get(`${exec.node}#${exec.run}`) ?? []).filter((id) => id !== notOpened);
-    return [...this.consumedClasses(exec.node, exec.run), ...opened.map((id) => `g:${id}`)];
+    return opened.length > 0 ? opened.map((id) => `g:${id}`) : this.consumedClasses(exec.node, exec.run);
   }
 
   /** What an execution consumed and the classes of its paths, for counterexamples. */
@@ -616,7 +616,7 @@ export class JoinOracle {
     const direct = pending.findIndex((entry) => itemKeys(inputs[entry.port] ?? []).join(',') === entry.keys.join(','));
     if (direct >= 0) {
       const [taken] = pending.splice(direct, 1);
-      return taken === undefined ? [] : [taken.source];
+      return taken === undefined ? [] : [taken.source, ...this.otherPorts(target, new Set([taken.port]))];
     }
     const ready = this.readyFanIns(target);
     if (ready.size === 0) {
@@ -636,7 +636,25 @@ export class JoinOracle {
       const actual = itemKeys(inputs[port] ?? []).join(',');
       if (actual !== keys.join(',')) this.violate(`fan-in ${target.id} took [${actual}] on '${port}', but the contributions are [${keys.join(',')}]`);
     }
-    return [...ready].flatMap(([source, edges]) => this.contributionSource(source, edges, since));
+    const given = new Set([...ready.values()].flat().map((edge) => this.workflow.edges[edge]?.edge.to.port ?? ''));
+    return [...[...ready].flatMap(([source, edges]) => this.contributionSource(source, edges, since)), ...this.otherPorts(target, given)];
+  }
+
+  /** What a whole-input activation consumes on the ports it was not activated for: each edge's latest delivery. */
+  private otherPorts(target: CompiledNode, given: ReadonlySet<string>): Source[] {
+    return target.inputs
+      .filter((port) => !given.has(port.name))
+      .flatMap((port) => target.incoming.filter((edge) => this.workflow.edges[edge]?.edge.to.port === port.name))
+      .flatMap((edge) => {
+        const from = this.workflow.edges[edge]?.edge.from.node;
+        if (from === undefined) return [];
+        if (this.isFanOut(this.node(from))) return this.contributionSource(from, [edge], 0);
+        let latest: Exec | undefined;
+        for (const exec of this.execs.get(from) ?? []) {
+          if (exec.completedAt !== undefined && exec.routes.has(edge) && (latest === undefined || exec.completedAt > (latest.completedAt ?? 0))) latest = exec;
+        }
+        return latest === undefined || !this.execLive(latest) ? [] : [{ kind: 'exec' as const, node: latest.node, run: latest.run }];
+      });
   }
 
   // -------------------------------------------------------------------------

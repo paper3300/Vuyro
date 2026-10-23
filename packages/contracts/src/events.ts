@@ -143,8 +143,8 @@ const EdgeTarget = Type.Object({ edge: Type.Integer({ minimum: 0 }), to: NodeIdS
 
 /**
  * The generation record of an execution or a delivery ([[명령·이벤트 계약]] §10.6 item 3): the fan-out groups the
- * work rests on, and `free` when it also rests on something that never passed a fan-out. Optional on every event
- * that carries it (events written before it existed have none and count as free).
+ * work rests on, and `free` when it also rests on something that never passed a fan-out. Required from v2 of the
+ * workflow events; v1 events are retired (their tickets are blocked, not read as if they were free).
  */
 export const BasisSchema = Type.Object(
   {
@@ -167,6 +167,11 @@ interface EventDefinition {
   /** Current version of `data`. Bump only for breaking changes and add an upcaster. */
   readonly version: number;
   readonly schema: TSchema;
+  /**
+   * Versions retired by a format change before release ([[명령·이벤트 계약]] §6): read as stored, never converted.
+   * Whoever folds them must refuse to carry on with the aggregate (fail closed). After release, use upcasters.
+   */
+  readonly retired?: readonly number[];
 }
 
 export const EVENT_CATALOG = {
@@ -233,7 +238,9 @@ export const EVENT_CATALOG = {
   /** A node execution got its inputs. `status` is where it starts: queued (executor), review (human) or rejected. */
   'node.activated': {
     aggregateType: 'ticket',
-    version: 1,
+    // v2 (pre-release): generation records (`basis`). v1 logs are retired, not converted: their tickets need attention.
+    version: 2,
+    retired: [1],
     schema: Type.Object(
       {
         ...EXECUTION_FIELDS,
@@ -250,7 +257,7 @@ export const EVENT_CATALOG = {
         /** Reviewer feedback for a `review` re-activation. */
         feedback: Type.Optional(Type.Object({ run: RunNumber, comment: Type.Optional(Type.String({ maxLength: 65536 })) }, strict)),
         /** Generation record: the union of what the activation consumed (empty deliveries included). */
-        basis: Type.Optional(BasisSchema),
+        basis: BasisSchema,
         /** On the activation that opens a new group: the execution whose delivery opened it. */
         openedBy: Type.Optional(Type.Object({ nodeId: NodeIdSchema, run: RunNumber }, strict)),
       },
@@ -301,7 +308,9 @@ export const EVENT_CATALOG = {
    */
   'node.completed': {
     aggregateType: 'ticket',
-    version: 1,
+    // v2 (pre-release): generation records (`basis`). v1 logs are retired, not converted: their tickets need attention.
+    version: 2,
+    retired: [1],
     schema: Type.Object(
       {
         ...EXECUTION_FIELDS,
@@ -325,7 +334,7 @@ export const EVENT_CATALOG = {
          */
         stale: Type.Optional(Type.Array(Type.Object({ ...EdgeTarget.properties, items: Type.Array(Type.Integer({ minimum: 0 }), { minItems: 1 }) }, strict))),
         /** Generation record of what this completion delivers (routes and empty deliveries alike). */
-        basis: Type.Optional(BasisSchema),
+        basis: BasisSchema,
       },
       strict,
     ),
@@ -337,7 +346,9 @@ export const EVENT_CATALOG = {
    */
   'node.passedOver': {
     aggregateType: 'ticket',
-    version: 1,
+    // v2 (pre-release): generation records (`basis`). v1 logs are retired, not converted: their tickets need attention.
+    version: 2,
+    retired: [1],
     schema: Type.Object(
       {
         ticketId: TicketId,
@@ -347,7 +358,7 @@ export const EVENT_CATALOG = {
         groupParent: Type.Optional(GroupId),
         edges: Type.Array(EdgeTarget),
         /** Generation record of the empty deliveries it passes on: the passed-over group. */
-        basis: Type.Optional(BasisSchema),
+        basis: BasisSchema,
         /** When the group is new: the execution whose empty delivery opened it. */
         openedBy: Type.Optional(Type.Object({ nodeId: NodeIdSchema, run: RunNumber }, strict)),
       },
@@ -554,7 +565,7 @@ export type Upcaster = (data: unknown) => unknown;
 
 export type UpcasterRegistry = { readonly [T in EventType]?: Readonly<Record<number, Upcaster>> };
 
-/** Upcasters for events whose `version` was bumped. Empty while every event is at version 1. */
+/** Upcasters for events whose `version` was bumped after release. Pre-release bumps retire versions instead. */
 export const EVENT_UPCASTERS: UpcasterRegistry = {};
 
 export class UnsupportedSchemaVersionError extends Error {
@@ -574,19 +585,21 @@ export class UnsupportedSchemaVersionError extends Error {
 /**
  * Brings stored event data up to the catalog's current version.
  * Stored events are never rewritten; this runs on every read.
+ * A retired version comes back as stored, with its old `schemaVersion` (see `isRetiredEvent`).
  * A version newer than the catalog, a missing upcaster or an unknown type throws (fail closed).
  */
 export function upcastEventData(
   type: string,
   schemaVersion: number,
   data: unknown,
-  options: { catalog?: Readonly<Record<string, { version: number }>>; upcasters?: UpcasterRegistry } = {},
+  options: { catalog?: Readonly<Record<string, { version: number; retired?: readonly number[] }>>; upcasters?: UpcasterRegistry } = {},
 ): { schemaVersion: number; data: unknown } {
-  const catalog: Readonly<Record<string, { version: number }>> = options.catalog ?? EVENT_CATALOG;
+  const catalog: Readonly<Record<string, { version: number; retired?: readonly number[] }>> = options.catalog ?? EVENT_CATALOG;
   const upcasters = (options.upcasters ?? EVENT_UPCASTERS) as Readonly<Record<string, Readonly<Record<number, Upcaster>>>>;
   const definition = Object.hasOwn(catalog, type) ? catalog[type] : undefined;
   if (definition === undefined) throw new UnsupportedSchemaVersionError(type, schemaVersion, 0);
   if (schemaVersion > definition.version) throw new UnsupportedSchemaVersionError(type, schemaVersion, definition.version);
+  if (schemaVersion < definition.version && definition.retired?.includes(schemaVersion) === true) return { schemaVersion, data };
   let version = schemaVersion;
   let current = data;
   while (version < definition.version) {
@@ -596,4 +609,10 @@ export function upcastEventData(
     version += 1;
   }
   return { schemaVersion: version, data: current };
+}
+
+/** True for a stored event in a retired (pre-release) format: its aggregate must not be carried on. */
+export function isRetiredEvent(event: { readonly type: string; readonly schemaVersion?: number }): boolean {
+  const definition: EventDefinition | undefined = Object.hasOwn(EVENT_CATALOG, event.type) ? (EVENT_CATALOG as Readonly<Record<string, EventDefinition>>)[event.type] : undefined;
+  return definition !== undefined && event.schemaVersion !== undefined && event.schemaVersion < definition.version && definition.retired?.includes(event.schemaVersion) === true;
 }

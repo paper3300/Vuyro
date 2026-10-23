@@ -1,13 +1,15 @@
-import type {
-  ActivationCause,
-  ArtifactRef,
-  Basis,
-  ExecutionStatus,
-  HandoffItem,
-  NodeRunOutput,
-  NodeStatus,
-  PinnedTemplate,
+import {
+  type ActivationCause,
+  type ArtifactRef,
+  type Basis,
+  type ExecutionStatus,
+  type HandoffItem,
+  isRetiredEvent,
+  type NodeRunOutput,
+  type NodeStatus,
+  type PinnedTemplate,
 } from '@vuyro/contracts';
+import type { DomainEvent } from '@vuyro/contracts';
 import type { NewEvent } from '../store/event-store.ts';
 
 /**
@@ -87,6 +89,11 @@ export interface TicketWorkflow {
   readonly nodes: Readonly<Record<string, NodeProgress>>;
   /** Fan-out groups by id. */
   readonly groups: Readonly<Record<string, Group>>;
+  /**
+   * Set when the log holds events in a retired format (§6): the ticket needs attention and nothing carries it on.
+   * `event` names the first such event (type and version).
+   */
+  readonly attention?: { readonly reason: 'legacy-events'; readonly event: string };
   /**
    * Counts activations, completions and pass-overs in order ([[명령·이벤트 계약]] §10.6 item 1): "after X" compares
    * these steps.
@@ -184,7 +191,10 @@ function withoutUndefined<T extends object>(value: Loose<T>): T {
 }
 
 /** Folds one ticket event into the workflow state. */
-export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWorkflow {
+export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEvent): TicketWorkflow {
+  if ('schemaVersion' in event && state.attention === undefined && isRetiredEvent(event)) {
+    state = { ...state, attention: { reason: 'legacy-events', event: `${event.type} v${event.schemaVersion}` } };
+  }
   switch (event.type) {
     case 'ticket.created': {
       const { data } = event;

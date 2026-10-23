@@ -195,7 +195,8 @@ export class WorkflowEngine {
       const exec = nodeProgress(state, live.nodeId).executions[live.run - 1];
       if (current?.run !== live.run || exec?.status === 'superseded' || exec?.pauseRequested === true) this.cancel(live);
     }
-    if (state.template === undefined || state.status !== 'open') return;
+    // A ticket that needs attention (events in a retired format) is not resumed (fail closed).
+    if (state.template === undefined || state.status !== 'open' || state.attention !== undefined) return;
     let workflow: CompiledWorkflow;
     try {
       workflow = await this.options.definitions.workflow(state.template);
