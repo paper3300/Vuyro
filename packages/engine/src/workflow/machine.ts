@@ -34,8 +34,10 @@ import {
  *   every lane of the source's group has finished, then takes the latest output of each lane.
  * - Each input port: every item gets a lane. An item whose lineage leads back to one of the node's own
  *   lanes re-runs that lane (rework, e.g. QA rejected item 3); other items open new lanes in one group.
+ * - Input over a back edge (one that closes a loop, like approval reject → spec) is rework of the target.
  * - Join nodes wait until every incoming edge has delivered and at least one delivered something new.
- * - The ticket is done when an end node (no output ports) finished and nothing else is active.
+ * - The ticket is done when an end node (no output ports) finished, nothing else is active, and no lane's
+ *   latest run failed without an error edge taking the failure somewhere.
  */
 
 const MAIN = 'main';
@@ -321,7 +323,13 @@ export function completeTicketIfDone(draft: WorkflowDraft): void {
   const endDone = workflow.ends.some((id) => nodeProgress(state, id).executions.some((exec) => exec.status === 'done'));
   if (!endDone) return;
   for (const nodeId of workflow.nodes.keys()) {
-    if (nodeProgress(state, nodeId).executions.some((exec) => ACTIVE_STATUSES.has(exec.status))) return;
+    const progress = nodeProgress(state, nodeId);
+    if (progress.executions.some((exec) => ACTIVE_STATUSES.has(exec.status))) return;
+    // A lane that failed and whose failure went nowhere (no error edge took it) still needs a person: retry it.
+    for (const lane of progress.laneOrder) {
+      const exec = currentExecution(state, nodeId, lane);
+      if (exec?.status === 'failed' && Object.keys(exec.routes).length === 0) return;
+    }
   }
   draft.emit({ type: 'ticket.completed', data: { ticketId: draft.ticketId } });
 }
