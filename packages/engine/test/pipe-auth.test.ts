@@ -1,12 +1,20 @@
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
-import { afterEach, describe, expect, it } from 'vitest';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createEngineToken, type VerifiedEngineToken } from '../src/ipc/engine-token.ts';
 import {
   AUTH_PROTOCOL,
   type AuthenticatedPipeServerOptions,
   connectAuthenticatedPipe,
+  type EnginePipeOptions,
   listenAuthenticatedPipe,
+  startEnginePipe,
 } from '../src/ipc/pipe-auth.ts';
+import { ERROR_ACCESS_DENIED, win32 } from '../src/platform/win32/ffi.ts';
+import { getCurrentUserSid, setFileDacl } from '../src/platform/win32/security.ts';
 
 const isWindows = process.platform === 'win32';
 
@@ -89,19 +97,51 @@ async function writeUntilClosed(client: Awaited<ReturnType<typeof rawClient>>, d
   return client.isClosed;
 }
 
+/** Fails if anything listens on `path`. */
+async function expectNotListening(path: string): Promise<void> {
+  const code = await new Promise<string | undefined>((resolve) => {
+    const socket = net.connect(path);
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve('connected');
+    });
+    socket.once('error', (error: NodeJS.ErrnoException) => {
+      resolve(error.code);
+    });
+  });
+  expect(code).toBe('ENOENT');
+}
+
 describe.runIf(isWindows)('authenticated engine pipe', () => {
   const cleanup: Array<() => Promise<void> | void> = [];
   afterEach(async () => {
+    vi.restoreAllMocks();
     for (const fn of cleanup.splice(0).reverse()) await fn();
   });
 
+  function tokenPath(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'vuyro-pipe-token-'));
+    cleanup.push(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+    return join(dir, 'engine.token');
+  }
+
+  async function start(
+    handler: (socket: net.Socket) => Promise<void> | void,
+    options: EnginePipeOptions = {},
+    path = pipePath(),
+  ) {
+    const server = await startEnginePipe(path, handler, { tokenPath: tokenPath(), ...options });
+    cleanup.push(() => server.close());
+    return server;
+  }
+
   async function serve(options: AuthenticatedPipeServerOptions = {}) {
     const path = pipePath();
-    const token = randomBytes(32);
     const { seen, handler } = recorder();
-    const server = await listenAuthenticatedPipe(path, token, handler, options);
-    cleanup.push(() => server.close());
-    return { path, token, seen, server };
+    const server = await start(handler, options, path);
+    return { path, token: server.token.secret, seen, server };
   }
 
   async function roundTrip(socket: net.Socket, text: string): Promise<string> {
@@ -231,14 +271,11 @@ describe.runIf(isWindows)('authenticated engine pipe', () => {
   });
 
   it('does not lose the first request when the handler attaches its listeners late', async () => {
-    const path = pipePath();
-    const token = randomBytes(32);
-    const server = await listenAuthenticatedPipe(path, token, async (socket) => {
+    const server = await start(async (socket) => {
       await sleep(50);
       socket.on('data', (chunk) => socket.write(chunk));
     });
-    cleanup.push(() => server.close());
-    const socket = await connectAuthenticatedPipe(path, token);
+    const socket = await connectAuthenticatedPipe(server.path, server.token.secret);
     cleanup.push(() => {
       socket.destroy();
     });
@@ -246,13 +283,10 @@ describe.runIf(isWindows)('authenticated engine pipe', () => {
   });
 
   it('destroys the socket of a handler that throws', async () => {
-    const path = pipePath();
-    const token = randomBytes(32);
-    const server = await listenAuthenticatedPipe(path, token, () => {
+    const server = await start(() => {
       throw new Error('handler failed');
     });
-    cleanup.push(() => server.close());
-    const socket = await connectAuthenticatedPipe(path, token);
+    const socket = await connectAuthenticatedPipe(server.path, server.token.secret);
     socket.on('error', () => undefined);
     socket.resume();
     await new Promise<void>((resolve) => socket.once('close', () => { resolve(); }));
@@ -293,13 +327,125 @@ describe.runIf(isWindows)('authenticated engine pipe', () => {
 
   it('refuses to listen on a name that already exists (squatting, second instance)', async () => {
     const served = await serve();
-    await expect(listenAuthenticatedPipe(served.path, randomBytes(32), () => undefined)).rejects.toMatchObject({
+    await expect(startEnginePipe(served.path, () => undefined, { tokenPath: tokenPath() })).rejects.toMatchObject({
       code: 'EADDRINUSE',
     });
   });
 
-  it('refuses tokens that are too short', async () => {
-    await expect(listenAuthenticatedPipe(pipePath(), Buffer.alloc(8), () => undefined)).rejects.toThrow(/at least 16 bytes/);
+  it('client refuses tokens that are too short', async () => {
     await expect(connectAuthenticatedPipe(pipePath(), Buffer.alloc(8))).rejects.toThrow(/at least 16 bytes/);
+  });
+
+  // --- [1] no listening without a verified token file ---------------------------------
+
+  it('does not listen when the token file ACL cannot be applied', async () => {
+    const path = pipePath();
+    const file = tokenPath();
+    vi.spyOn(win32(), 'SetSecurityInfo').mockReturnValue(ERROR_ACCESS_DENIED);
+    await expect(startEnginePipe(path, () => undefined, { tokenPath: file })).rejects.toThrow(/SetSecurityInfo/);
+    vi.restoreAllMocks();
+    await expectNotListening(path);
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it('does not listen when the token file ACL silently stays inherited', async () => {
+    const path = pipePath();
+    vi.spyOn(win32(), 'SetSecurityInfo').mockReturnValue(0); // "success" without applying
+    await expect(startEnginePipe(path, () => undefined, { tokenPath: tokenPath() })).rejects.toThrow(/not restricted/);
+    vi.restoreAllMocks();
+    await expectNotListening(path);
+  });
+
+  it.each([
+    ['a raw Buffer', () => randomBytes(32)],
+    ['a look-alike object', () => ({ path: 'x', secret: randomBytes(32) })],
+  ])('refuses to listen with %s instead of an issued token', async (_label, forge) => {
+    const path = pipePath();
+    const forged = forge() as unknown as VerifiedEngineToken;
+    await expect(listenAuthenticatedPipe(path, forged, () => undefined)).rejects.toThrow(/Not an engine token/);
+    await expectNotListening(path);
+  });
+
+  it('refuses to listen when the issued token file was opened up afterwards', async () => {
+    const path = pipePath();
+    const token = createEngineToken(tokenPath());
+    setFileDacl(token.path, `D:P(A;;FA;;;${getCurrentUserSid()})(A;;FR;;;WD)`); // Everyone may read
+    await expect(listenAuthenticatedPipe(path, token, () => undefined)).rejects.toThrow(/not current-user-only/);
+    await expectNotListening(path);
+  });
+
+  it('refuses to listen when the issued token file now holds another secret', async () => {
+    const path = pipePath();
+    const token = createEngineToken(tokenPath());
+    writeFileSync(token.path, randomBytes(32).toString('hex'));
+    await expect(listenAuthenticatedPipe(path, token, () => undefined)).rejects.toThrow(/no longer holds this token/);
+    await expectNotListening(path);
+  });
+
+  it('refuses to listen when the issued token file is gone', async () => {
+    const path = pipePath();
+    const token = createEngineToken(tokenPath());
+    rmSync(token.path);
+    await expect(listenAuthenticatedPipe(path, token, () => undefined)).rejects.toThrow();
+    await expectNotListening(path);
+  });
+
+  // --- [2] limits must be positive integers -----------------------------------------
+
+  const badValues: unknown[] = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -1, 1.5, '16', null];
+  const limitCases = (['maxPendingAuth', 'maxPreAuthBytes', 'authTimeoutMs'] as const).flatMap((name) =>
+    badValues.map((value) => [name, value] as const),
+  );
+
+  it.each(limitCases)('refuses to start with %s = %s (before writing a token)', async (name, value) => {
+    const path = pipePath();
+    const file = tokenPath();
+    const options = { tokenPath: file, [name]: value } as unknown as EnginePipeOptions;
+    await expect(startEnginePipe(path, () => undefined, options)).rejects.toThrow(RangeError);
+    await expectNotListening(path);
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it.each(limitCases)('listenAuthenticatedPipe also refuses %s = %s', async (name, value) => {
+    const path = pipePath();
+    const token = createEngineToken(tokenPath());
+    const options = { [name]: value } as unknown as AuthenticatedPipeServerOptions;
+    await expect(listenAuthenticatedPipe(path, token, () => undefined, options)).rejects.toThrow(RangeError);
+    await expectNotListening(path);
+  });
+
+  it('refuses an auth timeout longer than setTimeout supports', async () => {
+    await expect(startEnginePipe(pipePath(), () => undefined, { tokenPath: tokenPath(), authTimeoutMs: 2 ** 31 })).rejects.toThrow(RangeError);
+  });
+
+  it.each(badValues)('client refuses timeoutMs = %s', async (value) => {
+    const options = { timeoutMs: value } as unknown as { timeoutMs: number };
+    await expect(connectAuthenticatedPipe(pipePath(), randomBytes(32), options)).rejects.toThrow(RangeError);
+  });
+
+  // --- [recommended] only handshake bytes count toward the pre-auth limit ------------
+
+  it('accepts a 3 KiB first request sent right after the response', async () => {
+    const served = await serve({ maxPreAuthBytes: 2048 });
+    const client = await rawClient(served.path);
+    const clientNonce = randomBytes(32);
+    client.send(`${JSON.stringify({ type: 'auth.hello', protocol: AUTH_PROTOCOL, nonce: clientNonce.toString('hex') })}\n`);
+    const challenge = JSON.parse((await client.line()) ?? 'null') as { nonce: string };
+    const response = proof(served.token, 'client', clientNonce, Buffer.from(challenge.nonce, 'hex'));
+    const request = 'r'.repeat(3 * 1024);
+    client.send(`${JSON.stringify({ type: 'auth.response', proof: response })}\n${request}\n`);
+    expect(await client.line()).toBe(JSON.stringify({ type: 'auth.ok' }));
+    expect(await client.line()).toBe(request);
+    expect(served.server.stats.oversized).toBe(0);
+    client.socket.destroy();
+  });
+
+  it('still counts a long handshake line that ends with a newline', async () => {
+    const served = await serve({ maxPreAuthBytes: 512 });
+    const client = await rawClient(served.path);
+    client.send(`${JSON.stringify({ type: 'auth.hello', protocol: AUTH_PROTOCOL, nonce: '11'.repeat(32), pad: 'x'.repeat(600) })}\n`);
+    await client.closed;
+    expect(client.text).toBe('');
+    expect(served.server.stats.oversized).toBe(1);
   });
 });

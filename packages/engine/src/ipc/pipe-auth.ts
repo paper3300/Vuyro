@@ -1,5 +1,6 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import net from 'node:net';
+import { createEngineToken, reverifyEngineToken, type VerifiedEngineToken } from './engine-token.ts';
 
 /**
  * Engine pipe authentication (decision C in 기술 스택 결정 §3/§14).
@@ -18,6 +19,11 @@ import net from 'node:net';
  * only read the pipe gets nothing. Proofs are compared in constant time. Any
  * malformed, oversized, late or wrong message closes the connection without a
  * reason; the handler is never called before `auth.ok`.
+ *
+ * Start the server with `startEnginePipe`, which creates and verifies the token
+ * file before listening. `listenAuthenticatedPipe` only takes a
+ * `VerifiedEngineToken` and re-verifies its file, so there is no way to listen
+ * on a secret whose file ACL was not confirmed.
  */
 
 export const AUTH_PROTOCOL = 'vuyro-auth-1';
@@ -28,8 +34,17 @@ export interface AuthenticatedPipeServerOptions {
   readonly maxPendingAuth?: number;
   /** Time a client has to complete the handshake. Default 5000 ms. */
   readonly authTimeoutMs?: number;
-  /** Bytes a client may send before it is authenticated. Default 2048. */
+  /**
+   * Bytes of handshake messages (hello and response lines, including a partial
+   * one) a client may send. Application bytes after the response are not counted.
+   * Default 2048.
+   */
   readonly maxPreAuthBytes?: number;
+}
+
+export interface EnginePipeOptions extends AuthenticatedPipeServerOptions {
+  /** Where to write the token file. Default `defaultTokenPath()`. */
+  readonly tokenPath?: string;
 }
 
 export interface AuthStats {
@@ -46,26 +61,43 @@ export interface AuthStats {
 export interface AuthenticatedPipeServer {
   readonly path: string;
   readonly server: net.Server;
+  readonly token: VerifiedEngineToken;
   readonly stats: Readonly<AuthStats>;
   close(): Promise<void>;
+}
+
+/** Largest delay setTimeout accepts. */
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+
+/**
+ * The engine's only start path: validates the options, writes and verifies the
+ * token file, then listens. Fails, without listening, if any step fails.
+ */
+export async function startEnginePipe(
+  pipePath: string,
+  onConnection: (socket: net.Socket) => Promise<void> | void,
+  options: EnginePipeOptions = {},
+): Promise<AuthenticatedPipeServer> {
+  serverLimits(options); // reject bad options before touching the token file
+  const token = createEngineToken(options.tokenPath);
+  return listenAuthenticatedPipe(pipePath, token, onConnection, options);
 }
 
 /**
  * Listens on a named pipe and passes only authenticated sockets to `onConnection`.
  * The socket is paused with any bytes after the handshake buffered; it is resumed
  * once the handler returns or its promise settles. A handler that throws gets its
- * socket destroyed.
+ * socket destroyed. Prefer `startEnginePipe`.
  */
 export async function listenAuthenticatedPipe(
   pipePath: string,
-  token: Buffer,
+  token: VerifiedEngineToken,
   onConnection: (socket: net.Socket) => Promise<void> | void,
   options: AuthenticatedPipeServerOptions = {},
 ): Promise<AuthenticatedPipeServer> {
-  assertToken(token);
-  const maxPending = options.maxPendingAuth ?? 16;
-  const timeoutMs = options.authTimeoutMs ?? 5000;
-  const maxBytes = options.maxPreAuthBytes ?? 2048;
+  const { maxPending, timeoutMs, maxBytes } = serverLimits(options);
+  reverifyEngineToken(token);
+  const secret = token.secret;
   const stats: AuthStats = { authenticated: 0, rejected: 0, timedOut: 0, overPendingLimit: 0, oversized: 0 };
   let pending = 0;
 
@@ -78,7 +110,8 @@ export async function listenAuthenticatedPipe(
     }
     pending += 1;
     let settled = false;
-    let received = 0;
+    /** Bytes of complete handshake lines consumed so far. */
+    let handshakeBytes = 0;
     let buffered = Buffer.alloc(0);
     let clientNonce: Buffer | undefined;
     let serverNonce: Buffer | undefined;
@@ -112,12 +145,12 @@ export async function listenAuthenticatedPipe(
         if (nonce === undefined) return reject();
         clientNonce = nonce;
         serverNonce = randomBytes(NONCE_BYTES);
-        send(socket, { type: 'auth.challenge', nonce: serverNonce.toString('hex'), proof: proof(token, 'server', clientNonce, serverNonce).toString('hex') });
+        send(socket, { type: 'auth.challenge', nonce: serverNonce.toString('hex'), proof: proof(secret, 'server', clientNonce, serverNonce).toString('hex') });
         return 'continue';
       }
       if (message?.type !== 'auth.response' || serverNonce === undefined) return reject();
       const given = hexBytes(message.proof, 32);
-      if (given === undefined || !timingSafeEqual(given, proof(token, 'client', clientNonce, serverNonce))) return reject();
+      if (given === undefined || !timingSafeEqual(given, proof(secret, 'client', clientNonce, serverNonce))) return reject();
       return 'authenticated';
     };
     const reject = (): 'rejected' => {
@@ -127,13 +160,13 @@ export async function listenAuthenticatedPipe(
 
     const onData = (chunk: Buffer): void => {
       if (settled) return;
-      received += chunk.length;
-      if (received > maxBytes) {
-        fail('oversized');
-        return;
-      }
       buffered = Buffer.concat([buffered, chunk]);
       for (let newline = buffered.indexOf(0x0a); newline !== -1; newline = buffered.indexOf(0x0a)) {
+        handshakeBytes += newline + 1;
+        if (handshakeBytes > maxBytes) {
+          fail('oversized');
+          return;
+        }
         const line = buffered.subarray(0, newline).toString('utf8');
         buffered = buffered.subarray(newline + 1);
         const outcome = onLine(line);
@@ -148,6 +181,8 @@ export async function listenAuthenticatedPipe(
           return;
         }
       }
+      // Still authenticating: the unfinished line counts too.
+      if (handshakeBytes + buffered.length > maxBytes) fail('oversized');
     };
 
     socket.on('data', onData);
@@ -165,6 +200,7 @@ export async function listenAuthenticatedPipe(
   return {
     path: pipePath,
     server,
+    token,
     stats,
     close: () =>
       new Promise((resolve) => {
@@ -186,7 +222,8 @@ export interface ConnectOptions {
  * knows the token (a squatter) or does not answer in time.
  */
 export async function connectAuthenticatedPipe(pipePath: string, token: Buffer, options: ConnectOptions = {}): Promise<net.Socket> {
-  assertToken(token);
+  if (token.length < 16) throw new Error('Engine token must be at least 16 bytes');
+  const timeoutMs = positiveInteger('timeoutMs', options.timeoutMs, 5000, MAX_TIMEOUT_MS);
   return new Promise((resolve, reject) => {
     const socket = net.connect(pipePath);
     const clientNonce = randomBytes(NONCE_BYTES);
@@ -203,7 +240,7 @@ export async function connectAuthenticatedPipe(pipePath: string, token: Buffer, 
     };
     const timer = setTimeout(() => {
       fail(new Error('Engine pipe handshake timed out'));
-    }, options.timeoutMs ?? 5000);
+    }, timeoutMs);
 
     const onLine = (line: string): boolean => {
       const message = parseMessage(line);
@@ -292,8 +329,21 @@ function send(socket: net.Socket, message: Record<string, string>): void {
   socket.write(`${JSON.stringify(message)}\n`);
 }
 
-function assertToken(token: Buffer): void {
-  if (token.length < 16) throw new Error('Engine token must be at least 16 bytes');
+function serverLimits(options: AuthenticatedPipeServerOptions): { maxPending: number; timeoutMs: number; maxBytes: number } {
+  return {
+    maxPending: positiveInteger('maxPendingAuth', options.maxPendingAuth, 16, 65_536),
+    timeoutMs: positiveInteger('authTimeoutMs', options.authTimeoutMs, 5000, MAX_TIMEOUT_MS),
+    maxBytes: positiveInteger('maxPreAuthBytes', options.maxPreAuthBytes, 2048, 1024 * 1024),
+  };
+}
+
+/** A limit must be a positive safe integer no larger than `max`; anything else fails startup. */
+function positiveInteger(name: string, value: unknown, fallback: number, max: number): number {
+  const chosen = value === undefined ? fallback : value;
+  if (typeof chosen !== 'number' || !Number.isSafeInteger(chosen) || chosen <= 0 || chosen > max) {
+    throw new RangeError(`${name} must be an integer between 1 and ${max} (got ${typeof chosen === 'number' ? chosen : typeof chosen})`);
+  }
+  return chosen;
 }
 
 async function handOff(socket: net.Socket, onConnection: (socket: net.Socket) => Promise<void> | void): Promise<void> {

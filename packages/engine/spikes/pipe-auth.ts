@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createEngineToken } from '../src/ipc/engine-token.ts';
-import { connectAuthenticatedPipe, listenAuthenticatedPipe } from '../src/ipc/pipe-auth.ts';
+import { connectAuthenticatedPipe, startEnginePipe } from '../src/ipc/pipe-auth.ts';
 import { getCurrentUserSid, readFileSecurity } from '../src/platform/win32/security.ts';
 
 const sid = getCurrentUserSid();
@@ -33,9 +33,14 @@ try {
   console.log(`create + restrict + verify + move: median ${median(timings).toFixed(2)} ms (20 runs)\n`);
 
   const pipePath = String.raw`\\.\pipe\vuyro-spike-` + randomUUID();
-  const server = await listenAuthenticatedPipe(pipePath, token.secret, (socket) => {
-    socket.on('data', (chunk) => socket.write(chunk));
-  });
+  const server = await startEnginePipe(
+    pipePath,
+    (socket) => {
+      socket.on('data', (chunk) => socket.write(chunk));
+    },
+    { tokenPath: path },
+  );
+  token = server.token;
   const handshakes: number[] = [];
   for (let i = 0; i < 50; i++) {
     const started = performance.now();

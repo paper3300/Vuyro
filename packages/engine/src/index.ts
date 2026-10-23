@@ -8,10 +8,16 @@ export type {
   SqliteWorkerConfig,
   SynchronousMode,
 } from './db/sqlite-worker-protocol.ts';
-export { createEngineToken, defaultTokenPath, readEngineToken, TOKEN_BYTES } from './ipc/engine-token.ts';
-export type { EngineToken } from './ipc/engine-token.ts';
-export { AUTH_PROTOCOL, connectAuthenticatedPipe, listenAuthenticatedPipe } from './ipc/pipe-auth.ts';
-export type { AuthenticatedPipeServer, AuthenticatedPipeServerOptions, AuthStats, ConnectOptions } from './ipc/pipe-auth.ts';
+export { defaultTokenPath, readEngineToken, TOKEN_BYTES, VerifiedEngineToken } from './ipc/engine-token.ts';
+// The server starts only through startEnginePipe (the token file is created and verified first).
+export { AUTH_PROTOCOL, connectAuthenticatedPipe, startEnginePipe } from './ipc/pipe-auth.ts';
+export type {
+  AuthenticatedPipeServer,
+  AuthenticatedPipeServerOptions,
+  AuthStats,
+  ConnectOptions,
+  EnginePipeOptions,
+} from './ipc/pipe-auth.ts';
 export {
   allowedTrustees,
   currentUserOnlySddl,
