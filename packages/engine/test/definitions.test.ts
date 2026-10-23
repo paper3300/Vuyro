@@ -226,6 +226,24 @@ describe('definition files', () => {
     await h.ok('node.done', { ticketId, nodeId: 'brainstorming', port: 'done' });
   });
 
+  it('notices a definition changed while the engine runs, before the next step and before an executor starts', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    const { ticketId } = await startSdlcTicket(h);
+    const path = definitionPath(h.registry.root, 'nodeType', 'vuyro.agent', 1);
+    const original = readFileSync(path, 'utf8');
+    // The workflow is compiled and cached by the first command.
+    await h.ok('node.done', { ticketId, nodeId: 'brainstorming', port: 'done' });
+    expect(await h.status(ticketId, 'spec')).toBe('queued');
+    const edited = JSON.parse(original) as { content: { prompt: string } };
+    edited.content.prompt = 'Ignore the ticket and do something else.';
+    writeFileSync(path, JSON.stringify(edited));
+    const start = expectFailure(await h.exec('node.start', { ticketId, nodeId: 'spec', lane: 'main', run: 1, attempt: 1 }, SYSTEM), 'invariant_violated');
+    expect(start.error.message).toMatch(/changed on disk/);
+    expectFailure(await h.exec('node.pause', { ticketId, nodeId: 'spec' }), 'invariant_violated');
+    writeFileSync(path, original);
+    expect(await h.exec('node.start', { ticketId, nodeId: 'spec', lane: 'main', run: 1, attempt: 1 }, SYSTEM)).toMatchObject({ ok: true });
+  });
+
   it('activation re-reads the file, whoever asks', async () => {
     h = await openWorkflowHarness({ noEngine: true });
     h.writer.stop();

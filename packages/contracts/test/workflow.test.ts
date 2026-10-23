@@ -48,8 +48,12 @@ describe('workflow contracts', () => {
   });
 
   it('reserves VUYRO_* environment names for the engine', () => {
-    const script = { ...nodeType, completion: 'script', script: { program: 'x', env: { VUYRO_RUN_TOKEN: 'steal' } } };
-    expect(validator.validate(NodeTypeSpecSchema, script).some((issue) => issue.path.includes('/script/env'))).toBe(true);
+    for (const name of ['VUYRO_RUN_TOKEN', 'vuyro_run_token', 'Vuyro_Ticket']) {
+      const script = { ...nodeType, completion: 'script', script: { program: 'x', env: { [name]: 'steal' } } };
+      expect(validator.validate(NodeTypeSpecSchema, script).some((issue) => issue.path.includes('/script/env')), name).toBe(true);
+    }
+    const allowed = { ...nodeType, completion: 'script', script: { program: 'x', env: { VUYROX: '1', MY_VUYRO_: '1' } } };
+    expect(validator.validate(NodeTypeSpecSchema, allowed)).toEqual([]);
   });
 
   it('validates templates and definition envelopes', () => {

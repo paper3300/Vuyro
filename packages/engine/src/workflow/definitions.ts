@@ -155,10 +155,14 @@ export class DefinitionRegistry implements DefinitionResolver {
     return envelope;
   }
 
+  /**
+   * Compiled forms are cached by hash, but the file is read and hashed again on every use, so a file
+   * edited while the engine runs stops being used at the next command that needs it (fail closed).
+   */
   private async compiledNodeType(type: string, version: number, hash: string): Promise<CompiledNodeType> {
+    const envelope = (await this.verified('nodeType', type, version, hash)) as NodeTypeDefinition;
     const cached = this.nodeTypes.get(hash);
     if (cached !== undefined) return cached;
-    const envelope = (await this.verified('nodeType', type, version, hash)) as NodeTypeDefinition;
     const { nodeType, issues } = compileNodeType(envelope.content, this.dataValidator);
     if (nodeType === undefined) throw new DefinitionError(`node type ${type}@${version}`, issues);
     this.nodeTypes.set(hash, nodeType);
@@ -187,16 +191,21 @@ export class DefinitionRegistry implements DefinitionResolver {
     return { pin, workflow: await this.workflow(pin) };
   }
 
+  /**
+   * The workflow a ticket pinned. Every call re-reads the template and node type files and checks their
+   * hashes (the compiled graph itself is cached). Every workflow command and every executor start goes
+   * through here, so a definition edited on disk stops the ticket before its next step.
+   */
   async workflow(pin: PinnedTemplate): Promise<CompiledWorkflow> {
     const key = canonicalJson(pin);
-    const cached = this.workflows.get(key);
-    if (cached !== undefined) return cached;
     const envelope = (await this.verified('template', pin.id, pin.version, pin.hash)) as TemplateDefinition;
     const types = new Map<string, CompiledNodeType>();
     for (const [typeKey, hash] of Object.entries(pin.nodeTypes)) {
       const at = typeKey.lastIndexOf('@');
       types.set(typeKey, await this.compiledNodeType(typeKey.slice(0, at), Number(typeKey.slice(at + 1)), hash));
     }
+    const cached = this.workflows.get(key);
+    if (cached !== undefined) return cached;
     const { workflow, issues } = compileWorkflow(envelope.content, types, this.dataValidator);
     if (workflow === undefined) throw new DefinitionError(`template ${pin.id}@${pin.version}`, issues);
     this.workflows.set(key, workflow);

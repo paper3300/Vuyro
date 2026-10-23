@@ -248,13 +248,14 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
         routes: Object.fromEntries(data.routes.map((route) => [route.edge, route.items])),
         completedOrder: completions,
       }));
-      // Record deliveries per target edge; targets read them to decide when to fire.
-      let seq = next.deliverySeq;
-      for (const route of data.routes) {
-        seq += 1;
-        next = setNode(next, route.to, (node) => ({ ...node, deliveries: { ...node.deliveries, [route.edge]: seq } }));
-      }
-      return { ...next, deliverySeq: seq };
+      // Record deliveries per target edge (empty ones too); targets read them to decide when to fire.
+      return deliver(next, [...data.routes, ...(data.empty ?? [])]);
+    }
+    case 'node.passedOver': {
+      const { data } = event;
+      let next: TicketWorkflow = { ...state, groups: { ...state.groups, [data.group]: { node: data.nodeId } } };
+      next = setNode(next, data.nodeId, (node) => ({ ...node, group: data.group }));
+      return deliver(next, data.edges);
     }
     case 'node.requeued':
       return setExecution(state, event.data.nodeId, event.data.run, (current) =>
@@ -291,6 +292,17 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
     default:
       return state;
   }
+}
+
+function deliver(state: TicketWorkflow, edges: readonly { edge: number; to: string }[]): TicketWorkflow {
+  let next = state;
+  let seq = state.deliverySeq;
+  for (const { edge, to } of edges) {
+    seq += 1;
+    const at = seq;
+    next = setNode(next, to, (node) => ({ ...node, deliveries: { ...node.deliveries, [edge]: at } }));
+  }
+  return { ...next, deliverySeq: seq };
 }
 
 /** Which execution an artifact registration belongs to: the run's execution, else the named or only active lane. */

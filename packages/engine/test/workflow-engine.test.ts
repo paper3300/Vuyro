@@ -411,10 +411,12 @@ describe('WorkflowEngine', () => {
 
   it('supersedes a running execution when new input arrives, and ignores the old run', async () => {
     let oldDone: CommandResponse | undefined;
+    let oldArtifact: CommandResponse | undefined;
     h = await openWorkflowHarness({
       behavior: async (s) => {
         if (s.request.run === 1) {
           await s.sleep(10 * MINUTE);
+          oldArtifact = await s.vuyro('artifact.add', { ticketId: s.request.ticketId, nodeId: 'write', slot: 'draft', ref: { kind: 'file', uri: 'old.md' } });
           oldDone = await s.vuyro('node.done', { ticketId: s.request.ticketId, nodeId: 'write', port: 'done' });
           return undefined;
         }
@@ -443,6 +445,8 @@ describe('WorkflowEngine', () => {
     expect(currentExecution(state, 'write', 'main')?.output?.items[0]?.summary).toBe('second');
     // The cancelled first run can no longer report: its execution was superseded (or its token is gone).
     expect(oldDone?.ok).toBe(false);
+    expect(oldArtifact?.ok).toBe(false);
+    expect(await h.store.query("SELECT uri FROM p_artifacts WHERE uri = 'old.md'")).toEqual([]);
     if (oldDone !== undefined && !oldDone.ok) expect(['invariant_violated', 'unauthenticated']).toContain(oldDone.error.code);
     expect(state.status).toBe('done');
   });

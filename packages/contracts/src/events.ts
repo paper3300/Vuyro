@@ -138,6 +138,9 @@ export const EXECUTION_FIELDS = {
 /** Fan-out group id: lanes created together. Inherited along chained fan-out nodes. */
 const GroupId = Type.String({ minLength: 1, maxLength: 160 });
 
+/** An edge (template index) and the node at its far end. */
+const EdgeTarget = Type.Object({ edge: Type.Integer({ minimum: 0 }), to: NodeIdSchema }, strict);
+
 const DefinitionKey = {
   kind: Type.Union(DEFINITION_KINDS.map((kind) => Type.Literal(kind))),
   id: Type.String({ pattern: DEFINITION_ID_PATTERN }),
@@ -256,11 +259,17 @@ export const EVENT_CATALOG = {
     version: 1,
     schema: Type.Object({ ...EXECUTION_FIELDS, runId: RunId, output: NodeRunOutputSchema }, strict),
   },
-  /** Review gate: the output waits for a person before it is routed. */
+  /**
+   * The output waits for a person before it is routed: a review gate, or (`reason: 'empty'`) an output
+   * with no items on a port that leads somewhere. Approving an empty output skips what it would have fed.
+   */
   'node.reviewRequested': {
     aggregateType: 'ticket',
     version: 1,
-    schema: Type.Object({ ...EXECUTION_FIELDS, output: NodeRunOutputSchema }, strict),
+    schema: Type.Object(
+      { ...EXECUTION_FIELDS, output: NodeRunOutputSchema, reason: Type.Optional(Type.Literal('empty')) },
+      strict,
+    ),
   },
   /** A reviewer sent the held output back. The execution is discarded; a `review` activation follows. */
   'node.returned': {
@@ -290,9 +299,25 @@ export const EVENT_CATALOG = {
         error: Type.Optional(Type.String({ maxLength: 65536 })),
         /** Top-level data fields the port schema does not declare (kept, shown as undeclared). */
         undeclared: Type.Optional(Type.Array(Type.String({ maxLength: 256 }), { maxItems: 256 })),
+        /** Edges that carried an empty delivery (the output had no items and a person accepted that). */
+        empty: Type.Optional(Type.Array(EdgeTarget)),
+        /**
+         * Items not delivered because their lineage leads to lanes of an older fan-out group of the target
+         * (the work they answer was replaced, e.g. by a new plan).
+         */
+        stale: Type.Optional(Type.Array(Type.Object({ ...EdgeTarget.properties, items: Type.Array(Type.Integer({ minimum: 0 }), { minItems: 1 }) }, strict))),
       },
       strict,
     ),
+  },
+  /**
+   * A fan-out node received an empty delivery: it opens an empty group (no lanes) and passes the empty
+   * delivery on along its non-error outgoing edges, so whatever gathers its lanes runs with no items.
+   */
+  'node.passedOver': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object({ ticketId: TicketId, nodeId: NodeIdSchema, group: GroupId, edges: Type.Array(EdgeTarget) }, strict),
   },
   /** The executor stopped without a result for a reason worth another attempt (engine restart). */
   'node.requeued': {

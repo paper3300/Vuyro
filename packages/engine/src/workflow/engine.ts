@@ -36,9 +36,22 @@ export interface WorkflowEngineOptions {
    * Nothing else is inherited, so engine secrets never reach a script.
    */
   readonly scriptEnv?: Readonly<Record<string, string>>;
-  /** Working directory for a ticket's agents and scripts (worktrees arrive in M4). */
-  readonly workspace?: (ticket: { ticketId: string; projectId: string }) => string | undefined;
+  /**
+   * Working directory of one execution (M4: the shared folder, or a worktree per ticket or per node run).
+   * Undefined = the process default.
+   */
+  readonly workspace?: (target: WorkspaceTarget) => string | undefined;
   readonly reportError?: (error: Error, context: string) => void;
+}
+
+/** Which execution needs a working directory. `run` is the node's execution number (ItemRef.run). */
+export interface WorkspaceTarget {
+  readonly ticketId: string;
+  readonly projectId: string;
+  readonly nodeId: string;
+  readonly lane: string;
+  readonly run: number;
+  readonly attempt: number;
 }
 
 interface LiveExecution {
@@ -291,7 +304,7 @@ export class WorkflowEngine {
     const prompt = agentPrompt(node, context, state.title, exec.lane, exec.run);
     const resume = await this.resumeTarget(runId);
     const model = typeof context.params === 'object' && context.params !== null ? (context.params as Record<string, unknown>).model : undefined;
-    const cwd = this.options.workspace?.({ ticketId, projectId: state.projectId });
+    const cwd = this.options.workspace?.({ ticketId, projectId: state.projectId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt });
     let handle: AgentRunHandle;
     try {
       handle = adapter.start({
@@ -371,7 +384,10 @@ export class WorkflowEngine {
     });
     const env: Record<string, string> = { ...this.scriptEnv };
     for (const [name, value] of script.env) env[name] = stringifyValue(resolveTemplateValue(value, context));
-    const cwd = script.cwd === undefined ? this.options.workspace?.({ ticketId, projectId: state.projectId }) : stringifyValue(resolveTemplateValue(script.cwd, context));
+    const cwd =
+      script.cwd === undefined
+        ? this.options.workspace?.({ ticketId, projectId: state.projectId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt })
+        : stringifyValue(resolveTemplateValue(script.cwd, context));
     if (program === '') {
       await finish({ exitCode: null, error: 'the program resolved to an empty string' });
       return;

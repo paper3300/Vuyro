@@ -138,6 +138,24 @@ describe('conditions', () => {
     expect(compileCondition(wide).issues.some((issue) => /more than/.test(issue.message))).toBe(true);
   });
 
+  it('stops at the first limit instead of walking a huge input', () => {
+    const huge = { any: Array.from({ length: 10_000 }, () => ({ op: 'exists', left: { value: 1 } })) };
+    const result = compileCondition(huge);
+    expect(result.condition).toBeUndefined();
+    expect(result.issues).toHaveLength(1);
+    const noisy = { any: Array.from({ length: 400 }, () => ({ op: 'nope' })) };
+    expect(compileCondition(noisy).issues.length).toBeLessThanOrEqual(50);
+  });
+
+  it('bounds literal size', () => {
+    const big = compileCondition({ op: 'in', left: { path: 'item.x' }, right: { value: Array.from({ length: 20_000 }, (_, index) => index) } });
+    expect(big.condition).toBeUndefined();
+    expect(big.issues.map((issue) => issue.message).join(' ')).toMatch(/more than 10000 values/);
+    const long = compileCondition({ op: 'eq', left: { path: 'item.x' }, right: { value: 'x'.repeat(70_000) } });
+    expect(long.condition).toBeUndefined();
+    expect(compileCondition({ op: 'eq', left: { path: 'item.x' }, right: { value: 'x'.repeat(100) } }).condition).toBeDefined();
+  });
+
   it('compares JSON structurally', () => {
     expect(jsonEqual({ a: [1, { b: 2 }] }, { a: [1, { b: 2 }] })).toBe(true);
     expect(jsonEqual({ a: 1, b: 2 }, { b: 2, a: 1 })).toBe(true);

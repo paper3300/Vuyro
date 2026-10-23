@@ -63,7 +63,7 @@ export { DefinitionWriter } from './workflow/definition-writer.ts';
 export type { DefinitionWriterOptions, ScanReport } from './workflow/definition-writer.ts';
 export { BUILTIN_DEFINITIONS_DIR, DEFAULT_TEMPLATE_ID, installBuiltins, loadBuiltinDefinitions } from './workflow/builtins.ts';
 export { WorkflowEngine } from './workflow/engine.ts';
-export type { WorkflowEngineOptions } from './workflow/engine.ts';
+export type { WorkflowEngineOptions, WorkspaceTarget } from './workflow/engine.ts';
 export { ScriptedAgentAdapter } from './workflow/scripted-agent.ts';
 export type { ScriptedAgentOptions, ScriptedBehavior, ScriptedSession } from './workflow/scripted-agent.ts';
 export { ancestorsOf, executionContext } from './workflow/context.ts';

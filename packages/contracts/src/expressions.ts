@@ -50,6 +50,12 @@ export const EXPRESSION_LIMITS = {
   conditionDepth: 32,
   /** Most condition nodes. */
   conditionNodes: 512,
+  /** Most JSON values inside the literals of one condition. */
+  conditionLiteralValues: 10_000,
+  /** Longest string in a condition literal. */
+  conditionLiteralString: 65_536,
+  /** Most issues reported before checking stops. */
+  conditionIssues: 50,
 } as const;
 
 /** Names that would reach object machinery instead of data. Refused while parsing and while evaluating. */
@@ -266,10 +272,19 @@ export function compileCondition(condition: unknown): { condition?: CompiledCond
   const issues: ConditionIssue[] = [];
   const paths: PathExpression[] = [];
   let count = 0;
+  // Checking stops at the first limit hit (or after enough issues), so a huge input costs little.
+  const state = { stopped: false };
+  // A function, so the check is not narrowed away between calls that may set it.
+  const halted = (): boolean => state.stopped;
+  const literalBudget: { values: number } = { values: EXPRESSION_LIMITS.conditionLiteralValues };
+  const report = (issue: ConditionIssue): void => {
+    issues.push(issue);
+    if (issues.length >= EXPRESSION_LIMITS.conditionIssues) state.stopped = true;
+  };
 
   const operand = (value: unknown, at: string): CompiledOperand | undefined => {
     if (!isPlainObject(value)) {
-      issues.push({ path: at, message: 'operand must be {path} or {value}' });
+      report({ path: at, message: 'operand must be {path} or {value}' });
       return undefined;
     }
     const keys = Object.keys(value);
@@ -279,39 +294,46 @@ export function compileCondition(condition: unknown): { condition?: CompiledCond
         paths.push(parsed);
         return { path: parsed };
       } catch (error) {
-        issues.push({ path: `${at}/path`, message: (error as Error).message });
+        report({ path: `${at}/path`, message: (error as Error).message });
         return undefined;
       }
     }
     if (keys.length === 1 && keys[0] === 'value') {
-      if (!isJsonValue(value.value, 0)) {
-        issues.push({ path: `${at}/value`, message: 'value must be plain JSON' });
+      if (!isJsonValue(value.value, 0, literalBudget)) {
+        if (literalBudget.values < 0) {
+          report({ path: `${at}/value`, message: `literals hold more than ${EXPRESSION_LIMITS.conditionLiteralValues} values` });
+          state.stopped = true;
+        } else {
+          report({ path: `${at}/value`, message: 'value must be plain JSON (strings up to 65536 characters)' });
+        }
         return undefined;
       }
       return { value: value.value };
     }
-    issues.push({ path: at, message: 'operand must have exactly one of path or value' });
+    report({ path: at, message: 'operand must have exactly one of path or value' });
     return undefined;
   };
 
   const visit = (node: unknown, at: string, depth: number): CompiledCondition | undefined => {
+    if (halted()) return undefined;
     count += 1;
     if (count > EXPRESSION_LIMITS.conditionNodes) {
-      issues.push({ path: at, message: `more than ${EXPRESSION_LIMITS.conditionNodes} condition nodes` });
+      report({ path: at, message: `more than ${EXPRESSION_LIMITS.conditionNodes} condition nodes` });
+      state.stopped = true;
       return undefined;
     }
     if (depth > EXPRESSION_LIMITS.conditionDepth) {
-      issues.push({ path: at, message: `deeper than ${EXPRESSION_LIMITS.conditionDepth}` });
+      report({ path: at, message: `deeper than ${EXPRESSION_LIMITS.conditionDepth}` });
       return undefined;
     }
     if (!isPlainObject(node)) {
-      issues.push({ path: at, message: 'condition must be an object' });
+      report({ path: at, message: 'condition must be an object' });
       return undefined;
     }
     const keys = Object.keys(node).sort();
     const only = (...allowed: string[]): boolean => {
       const extra = keys.filter((key) => !allowed.includes(key));
-      if (extra.length > 0) issues.push({ path: at, message: `unknown keys: ${extra.join(', ')}` });
+      if (extra.length > 0) report({ path: at, message: `unknown keys: ${extra.join(', ')}` });
       return extra.length === 0;
     };
     if ('all' in node || 'any' in node) {
@@ -319,11 +341,18 @@ export function compileCondition(condition: unknown): { condition?: CompiledCond
       if (!only(kind)) return undefined;
       const list = node[kind];
       if (!Array.isArray(list) || list.length === 0) {
-        issues.push({ path: `${at}/${kind}`, message: 'must be a non-empty array' });
+        report({ path: `${at}/${kind}`, message: 'must be a non-empty array' });
         return undefined;
       }
-      const children = list.map((child: unknown, index) => visit(child, `${at}/${kind}/${index}`, depth + 1));
-      return children.every((child) => child !== undefined) ? { kind, children } : undefined;
+      const children: CompiledCondition[] = [];
+      let complete = true;
+      for (const [index, child] of (list as unknown[]).entries()) {
+        if (halted()) return undefined;
+        const compiled = visit(child, `${at}/${kind}/${index}`, depth + 1);
+        if (compiled === undefined) complete = false;
+        else children.push(compiled);
+      }
+      return complete ? { kind, children } : undefined;
     }
     if ('not' in node) {
       if (!only('not')) return undefined;
@@ -343,10 +372,10 @@ export function compileCondition(condition: unknown): { condition?: CompiledCond
         const right = operand(node.right, `${at}/right`);
         return left === undefined || right === undefined ? undefined : { kind: 'compare', op: op as ComparisonOp, left, right };
       }
-      issues.push({ path: `${at}/op`, message: `unknown operator '${String(op)}'` });
+      report({ path: `${at}/op`, message: `unknown operator '${String(op)}'` });
       return undefined;
     }
-    issues.push({ path: at, message: 'expected all, any, not or op' });
+    report({ path: at, message: 'expected all, any, not or op' });
     return undefined;
   };
 
@@ -354,13 +383,16 @@ export function compileCondition(condition: unknown): { condition?: CompiledCond
   return issues.length === 0 && compiled !== undefined ? { condition: compiled, issues, paths } : { issues, paths };
 }
 
-function isJsonValue(value: unknown, depth: number): boolean {
-  if (depth > EXPRESSION_LIMITS.conditionDepth) return false;
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+/** Plain JSON within the depth limit; `budget.values` counts down per value and stops the walk at zero. */
+function isJsonValue(value: unknown, depth: number, budget: { values: number }): boolean {
+  budget.values -= 1;
+  if (budget.values < 0 || depth > EXPRESSION_LIMITS.conditionDepth) return false;
+  if (value === null || typeof value === 'boolean') return true;
+  if (typeof value === 'string') return value.length <= EXPRESSION_LIMITS.conditionLiteralString;
   if (typeof value === 'number') return Number.isFinite(value);
-  if (Array.isArray(value)) return value.every((item) => isJsonValue(item, depth + 1));
+  if (Array.isArray(value)) return value.every((item) => isJsonValue(item, depth + 1, budget));
   if (isPlainObject(value)) {
-    return Object.entries(value).every(([key, item]) => !FORBIDDEN_KEYS.has(key) && isJsonValue(item, depth + 1));
+    return Object.entries(value).every(([key, item]) => !FORBIDDEN_KEYS.has(key) && isJsonValue(item, depth + 1, budget));
   }
   return false;
 }

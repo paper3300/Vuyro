@@ -10,6 +10,7 @@ import type { RandomSource } from '../runtime/ids.ts';
 import type { IdGenerator } from '../runtime/ids.ts';
 import type { NewEvent, StreamAppend } from '../store/event-store.ts';
 import type { DefinitionResolver } from '../workflow/definitions.ts';
+import { currentExecution, execution } from '../workflow/state.ts';
 import {
   type AggregateDefinition,
   permissionsAggregate,
@@ -197,6 +198,15 @@ export const HANDLERS: HandlerMap = {
       if (!ticket.state.exists) return Promise.resolve(fail('not_found', `ticket ${payload.ticketId} does not exist`));
       const runId = ctx.caller.binding?.runId;
       const data = { ...payload, ...(runId === undefined ? {} : { runId }) };
+      if (runId !== undefined && Object.hasOwn(ticket.state.runIndex, runId)) {
+        // A workflow run may register artifacts only while it still drives its lane (not once superseded).
+        const owner = ticket.state.runIndex[runId];
+        const exec = owner === undefined ? undefined : execution(ticket.state, owner.nodeId, owner.run);
+        const current = exec === undefined ? undefined : currentExecution(ticket.state, exec.nodeId, exec.lane);
+        if (exec === undefined || current?.run !== exec.run || exec.status !== 'running' || exec.runIds.at(-1) !== runId) {
+          return Promise.resolve(fail('invariant_violated', `run ${runId} no longer drives its lane (it is ${exec?.status ?? 'unknown'})`));
+        }
+      }
       return Promise.resolve({
         ok: true,
         appends: [stream('ticket', ticket.aggregateId, ticket.revision, [{ type: 'artifact.added', data }])],

@@ -11,7 +11,7 @@ import { EventStore } from '../../src/store/event-store.ts';
 import { installBuiltins } from '../../src/workflow/builtins.ts';
 import { DefinitionWriter } from '../../src/workflow/definition-writer.ts';
 import { DefinitionRegistry } from '../../src/workflow/definitions.ts';
-import { WorkflowEngine } from '../../src/workflow/engine.ts';
+import { WorkflowEngine, type WorkflowEngineOptions } from '../../src/workflow/engine.ts';
 import { type ScriptedBehavior, ScriptedAgentAdapter } from '../../src/workflow/scripted-agent.ts';
 import { currentExecution, evolveTicket, EMPTY_TICKET, laneStatus, nodeProgress, type TicketWorkflow } from '../../src/workflow/state.ts';
 import { HUMAN, nextRequestId, SYSTEM, tempDir } from './engine-harness.ts';
@@ -24,6 +24,7 @@ export interface WorkflowHarnessOptions {
   readonly bare?: boolean;
   /** Do not start the workflow engine (scheduler). */
   readonly noEngine?: boolean;
+  readonly workspace?: WorkflowEngineOptions['workspace'];
 }
 
 export interface WorkflowHarness {
@@ -83,6 +84,7 @@ export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}):
           scriptEnv: { PATH: '/bin' },
           reportError,
           ...(options.maxConcurrent === undefined ? {} : { maxConcurrent: options.maxConcurrent }),
+          ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
         })
       : undefined;
     return { store, registry, bus, writer, adapter, engine };

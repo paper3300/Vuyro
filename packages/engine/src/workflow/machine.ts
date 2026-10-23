@@ -36,6 +36,12 @@ import {
  *   lanes re-runs that lane (rework, e.g. QA rejected item 3); other items open new lanes in one group.
  * - Input over a back edge (one that closes a loop, like approval reject → spec) is rework of the target.
  * - Join nodes wait until every incoming edge has delivered and at least one delivered something new.
+ * - An agent or script output with no items on a port that leads somewhere waits in Review (reason 'empty').
+ *   Rejecting runs the node again; approving (or a person finishing a human node with no items) sends an
+ *   empty delivery: a fan-out node passes over (empty group, passes the empty delivery on), a whole input
+ *   runs with no items, a join fires with what it has.
+ * - Items whose lineage leads only to lanes of an older group of a fan-out target are stale (the work they
+ *   answer was replaced, e.g. by a new plan): they are recorded as `stale` and delivered nowhere.
  * - The ticket is done when an end node (no output ports) finished, nothing else is active, and no lane's
  *   latest run failed without an error edge taking the failure somewhere.
  */
@@ -286,15 +292,29 @@ export function complete(
   const node = draft.node(nodeId);
   const exec = draft.exec(nodeId, run);
   const routes: { edge: number; to: string; items: number[] }[] = [];
-  for (const edgeIndex of node.outgoing.get(output.port) ?? []) {
+  const stale: { edge: number; to: string; items: number[] }[] = [];
+  const portEdges = node.outgoing.get(output.port) ?? [];
+  for (const edgeIndex of portEdges) {
     const edge = draft.workflow.edges[edgeIndex];
     if (edge === undefined) continue;
-    const items = output.items
+    const passing = output.items
       .map((item, index) => ({ item, index }))
-      .filter(({ item }) => edge.when === undefined || evaluateCondition(edge.when, edgeContext(draft.state, draft.workflow, draft.ticketId, { node, exec }, item)))
-      .map(({ index }) => index);
+      .filter(({ item }) => edge.when === undefined || evaluateCondition(edge.when, edgeContext(draft.state, draft.workflow, draft.ticketId, { node, exec }, item)));
+    const target = draft.node(edge.edge.to.node);
+    const each = target.inputs.find((input) => input.name === edge.edge.to.port)?.mode === 'each';
+    const isStale = (item: HandoffItem): boolean => each && answersOnlyOldLanes(draft, item, target.id);
+    const items = passing.filter(({ item }) => !isStale(item)).map(({ index }) => index);
+    const old = passing.filter(({ item }) => isStale(item)).map(({ index }) => index);
     if (items.length > 0) routes.push({ edge: edgeIndex, to: edge.edge.to.node, items });
+    if (old.length > 0) stale.push({ edge: edgeIndex, to: edge.edge.to.node, items: old });
   }
+  const empty =
+    output.items.length === 0
+      ? portEdges.flatMap((edgeIndex) => {
+          const edge = draft.workflow.edges[edgeIndex];
+          return edge === undefined ? [] : [{ edge: edgeIndex, to: edge.edge.to.node }];
+        })
+      : [];
   draft.emit({
     type: 'node.completed',
     data: {
@@ -307,14 +327,61 @@ export function complete(
       routes,
       ...(extra.error === undefined ? {} : { error: extra.error.slice(0, 65536) }),
       ...(extra.undeclared === undefined || extra.undeclared.length === 0 ? {} : { undeclared: [...extra.undeclared].slice(0, 256) }),
+      ...(empty.length === 0 ? {} : { empty }),
+      ...(stale.length === 0 ? {} : { stale }),
     },
   });
   const finished = draft.exec(nodeId, run);
   const routed = new Set(routes.map((route) => route.edge));
+  const emptied = new Set(empty.map((entry) => entry.edge));
   // Every outgoing edge (any port) may matter: a fan-in waits for lanes that end through other ports too.
   const outgoing = [...node.outgoing.values()].flat().sort((a, b) => a - b);
-  for (const edgeIndex of outgoing) propagate(draft, edgeIndex, finished, routed.has(edgeIndex));
+  for (const edgeIndex of outgoing) {
+    if (emptied.has(edgeIndex)) propagateEmpty(draft, edgeIndex, new Set());
+    else propagate(draft, edgeIndex, finished, routed.has(edgeIndex));
+  }
   completeTicketIfDone(draft);
+}
+
+/** The item descends from lanes of the target, but only from lanes outside the target's current group. */
+function answersOnlyOldLanes(draft: WorkflowDraft, item: HandoffItem, target: string): boolean {
+  const refs = ancestorsOf(draft.state, item.lineage ?? [], target);
+  if (refs.length === 0) return false;
+  const current = nodeProgress(draft.state, target).group;
+  return refs.every((ref) => {
+    const lane = execution(draft.state, target, ref.run)?.lane;
+    return lane === undefined || laneOf(draft.state, target, lane)?.group !== current;
+  });
+}
+
+/** Carries an empty delivery over one edge (see the rules above). `seen` stops loops of fan-out nodes. */
+function propagateEmpty(draft: WorkflowDraft, edgeIndex: number, seen: Set<string>): void {
+  const edge = draft.workflow.edges[edgeIndex];
+  if (edge === undefined) return;
+  const target = draft.node(edge.edge.to.node);
+  const port = target.inputs.find((input) => input.name === edge.edge.to.port);
+  if (port === undefined) return;
+  if (port.mode === 'each') {
+    if (seen.has(target.id)) return;
+    seen.add(target.id);
+    const edges = [...target.outgoing.entries()]
+      .filter(([name]) => name !== 'error')
+      .flatMap(([, indexes]) => indexes)
+      .sort((a, b) => a - b)
+      .flatMap((index) => {
+        const next = draft.workflow.edges[index];
+        return next === undefined ? [] : [{ edge: index, to: next.edge.to.node }];
+      });
+    const group = `g${Object.keys(draft.state.groups).length + 1}`;
+    draft.emit({ type: 'node.passedOver', data: { ticketId: draft.ticketId, nodeId: target.id, group, edges } });
+    for (const next of edges) propagateEmpty(draft, next.edge, seen);
+    return;
+  }
+  if (target.completion === 'join') {
+    tryJoin(draft, target);
+    return;
+  }
+  activateWhole(draft, target, port.name, [], edge.back);
 }
 
 export function completeTicketIfDone(draft: WorkflowDraft): void {
@@ -445,10 +512,13 @@ export function failureOutput(node: CompiledNode, exec: Execution, error: string
  */
 export function finishWithOutput(draft: WorkflowDraft, node: CompiledNode, exec: Execution, output: NodeRunOutput, undeclared: readonly string[] = []): void {
   const status = output.port === 'error' ? 'failed' : 'done';
-  if (status === 'done' && node.review === 'human') {
+  // A person finishing a human node decides for themselves, including "nothing to pass on".
+  const executor = node.completion !== 'human';
+  const empty = executor && status === 'done' && output.items.length === 0 && (node.outgoing.get(output.port)?.length ?? 0) > 0;
+  if (status === 'done' && executor && (node.review === 'human' || empty)) {
     draft.emit({
       type: 'node.reviewRequested',
-      data: { ticketId: draft.ticketId, nodeId: node.id, lane: exec.lane, run: exec.run, output },
+      data: { ticketId: draft.ticketId, nodeId: node.id, lane: exec.lane, run: exec.run, output, ...(empty ? { reason: 'empty' as const } : {}) },
     });
     return;
   }

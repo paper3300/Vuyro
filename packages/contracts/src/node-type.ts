@@ -94,8 +94,11 @@ export const ClaimSpecSchema = Type.Object(
   { additionalProperties: false },
 );
 
-/** Environment variable names a script may set. `VUYRO_*` is reserved for the engine. */
-export const ENV_NAME_PATTERN = '^(?!VUYRO_)[A-Za-z_][A-Za-z0-9_]{0,127}$';
+/**
+ * Environment variable names a script may set. `VUYRO_*` is reserved for the engine, in any letter case
+ * (Windows environment names are case-insensitive, so `vuyro_run_token` would be the same variable).
+ */
+export const ENV_NAME_PATTERN = '^(?![Vv][Uu][Yy][Rr][Oo]_)[A-Za-z_][A-Za-z0-9_]{0,127}$';
 export const EXIT_PORT_KEY_PATTERN = '^(default|0|-?[1-9][0-9]{0,9})$';
 
 /**
