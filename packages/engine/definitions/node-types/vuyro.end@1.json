@@ -1,0 +1,19 @@
+{
+  "vuyro": "export",
+  "formatVersion": 1,
+  "kind": "nodeType",
+  "id": "vuyro.end",
+  "version": 1,
+  "name": "Done",
+  "author": "Vuyro",
+  "content": {
+    "type": "vuyro.end",
+    "version": 1,
+    "label": "Done",
+    "description": "End of the workflow. The ticket is done when this finishes and nothing else is active.",
+    "completion": "join",
+    "inputs": [{ "name": "in", "label": "Result" }],
+    "outputs": [],
+    "params": []
+  }
+}

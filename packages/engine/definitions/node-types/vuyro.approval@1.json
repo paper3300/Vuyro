@@ -1,0 +1,32 @@
+{
+  "vuyro": "export",
+  "formatVersion": 1,
+  "kind": "nodeType",
+  "id": "vuyro.approval",
+  "version": 1,
+  "name": "Approval",
+  "author": "Vuyro",
+  "content": {
+    "type": "vuyro.approval",
+    "version": 1,
+    "label": "Approval",
+    "description": "A person approves or rejects the input. Rejecting sends it back along the reject edge.",
+    "completion": "human",
+    "inputs": [{ "name": "in", "label": "To review" }],
+    "outputs": [
+      {
+        "name": "approve",
+        "label": "Approve",
+        "schema": { "type": "object", "properties": { "comment": { "type": "string", "description": "Why it was approved." } } }
+      },
+      {
+        "name": "reject",
+        "label": "Reject",
+        "schema": { "type": "object", "properties": { "comment": { "type": "string", "description": "What has to change." } } }
+      }
+    ],
+    "params": [
+      { "name": "instructions", "label": "What to check", "schema": { "type": "string", "default": "" } }
+    ]
+  }
+}

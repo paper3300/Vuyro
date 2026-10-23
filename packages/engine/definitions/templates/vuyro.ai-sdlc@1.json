@@ -1,0 +1,308 @@
+{
+  "vuyro": "export",
+  "formatVersion": 1,
+  "kind": "template",
+  "id": "vuyro/ai-sdlc",
+  "version": 1,
+  "name": "AI-Native SDLC",
+  "author": "Vuyro",
+  "description": "BrainStorming -> Spec -> Spec approval -> Plan -> parallel Dev -> Join -> QA (agent + human review) -> Done. QA rejects only the tasks that need rework.",
+  "content": {
+    "id": "vuyro/ai-sdlc",
+    "version": 1,
+    "name": "AI-Native SDLC",
+    "description": "Default workflow: a person brainstorms, agents write the spec, plan and code, an agent reviews with a person confirming.",
+    "nodes": [
+      {
+        "id": "brainstorming",
+        "type": "vuyro.human-task",
+        "version": 1,
+        "label": "BrainStorming",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "params": {
+          "instructions": "Write down the idea, the goal and any constraints. Put the gist in the summary."
+        }
+      },
+      {
+        "id": "spec",
+        "type": "vuyro.agent",
+        "version": 1,
+        "label": "Spec",
+        "position": {
+          "x": 240,
+          "y": 0
+        },
+        "params": {
+          "instructions": "Write a specification for the idea below. Save it as a document, register it as the 'specDoc' artifact, then finish on 'done' with the title and the acceptance criteria."
+        },
+        "ports": {
+          "done": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "title",
+                "acceptanceCriteria"
+              ],
+              "properties": {
+                "title": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "acceptanceCriteria": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "artifacts": [
+              {
+                "slot": "specDoc",
+                "kinds": [
+                  "file",
+                  "confluence",
+                  "url"
+                ],
+                "required": true
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "specApproval",
+        "type": "vuyro.approval",
+        "version": 1,
+        "label": "Spec approval",
+        "position": {
+          "x": 480,
+          "y": 0
+        },
+        "params": {
+          "instructions": "Check that the spec matches the idea and that the acceptance criteria are testable."
+        }
+      },
+      {
+        "id": "plan",
+        "type": "vuyro.agent",
+        "version": 1,
+        "label": "Plan",
+        "position": {
+          "x": 720,
+          "y": 0
+        },
+        "params": {
+          "instructions": "Split the approved spec into independent tasks that can be implemented in parallel. Finish on 'done' with one item per task (taskId, scope, files)."
+        },
+        "ports": {
+          "done": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "taskId",
+                "scope"
+              ],
+              "properties": {
+                "taskId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "scope": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "files": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": "dev",
+        "type": "vuyro.agent",
+        "version": 1,
+        "label": "Dev",
+        "position": {
+          "x": 960,
+          "y": 0
+        },
+        "params": {
+          "instructions": "Implement this task: {{ nodes.plan.item.data.scope }} (task {{ nodes.plan.item.data.taskId }}). If QA sent feedback, it is in the input data: {{ input.data.feedback }}. Register the change as the 'change' artifact and finish on 'done'."
+        },
+        "ports": {
+          "in": {
+            "mode": "each"
+          },
+          "done": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "taskId"
+              ],
+              "properties": {
+                "taskId": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "notes": {
+                  "type": "string"
+                }
+              }
+            },
+            "artifacts": [
+              {
+                "slot": "change",
+                "kinds": [
+                  "git",
+                  "p4",
+                  "file"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      {
+        "id": "join",
+        "type": "vuyro.join",
+        "version": 1,
+        "label": "Join",
+        "position": {
+          "x": 1200,
+          "y": 0
+        }
+      },
+      {
+        "id": "qa",
+        "type": "vuyro.review-agent",
+        "version": 1,
+        "label": "QA",
+        "position": {
+          "x": 1440,
+          "y": 0
+        },
+        "review": "human",
+        "params": {
+          "instructions": "Check every task against the spec's acceptance criteria ({{ nodes.spec.data.acceptanceCriteria }})."
+        }
+      },
+      {
+        "id": "done",
+        "type": "vuyro.end",
+        "version": 1,
+        "label": "Done",
+        "position": {
+          "x": 1680,
+          "y": 0
+        }
+      }
+    ],
+    "edges": [
+      {
+        "from": {
+          "node": "brainstorming",
+          "port": "done"
+        },
+        "to": {
+          "node": "spec",
+          "port": "in"
+        }
+      },
+      {
+        "from": {
+          "node": "spec",
+          "port": "done"
+        },
+        "to": {
+          "node": "specApproval",
+          "port": "in"
+        }
+      },
+      {
+        "from": {
+          "node": "specApproval",
+          "port": "approve"
+        },
+        "to": {
+          "node": "plan",
+          "port": "in"
+        }
+      },
+      {
+        "from": {
+          "node": "specApproval",
+          "port": "reject"
+        },
+        "to": {
+          "node": "spec",
+          "port": "in"
+        },
+        "label": "rework"
+      },
+      {
+        "from": {
+          "node": "plan",
+          "port": "done"
+        },
+        "to": {
+          "node": "dev",
+          "port": "in"
+        }
+      },
+      {
+        "from": {
+          "node": "dev",
+          "port": "done"
+        },
+        "to": {
+          "node": "join",
+          "port": "in"
+        }
+      },
+      {
+        "from": {
+          "node": "join",
+          "port": "done"
+        },
+        "to": {
+          "node": "qa",
+          "port": "in"
+        }
+      },
+      {
+        "from": {
+          "node": "qa",
+          "port": "approve"
+        },
+        "to": {
+          "node": "done",
+          "port": "in"
+        }
+      },
+      {
+        "from": {
+          "node": "qa",
+          "port": "reject"
+        },
+        "to": {
+          "node": "dev",
+          "port": "in"
+        },
+        "label": "rework (rejected tasks only)"
+      }
+    ],
+    "settings": {
+      "workspaceMode": "shared"
+    }
+  }
+}

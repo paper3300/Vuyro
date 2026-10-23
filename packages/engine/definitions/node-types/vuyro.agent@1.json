@@ -1,0 +1,73 @@
+{
+  "vuyro": "export",
+  "formatVersion": 1,
+  "kind": "nodeType",
+  "id": "vuyro.agent",
+  "version": 1,
+  "name": "Agent",
+  "author": "Vuyro",
+  "content": {
+    "type": "vuyro.agent",
+    "version": 1,
+    "label": "Agent",
+    "description": "Runs an agent CLI (Claude Code or Codex) with the instructions and the input. The agent reports through 'vuyro node done'.",
+    "completion": "agent",
+    "inputs": [
+      {
+        "name": "in",
+        "label": "Input"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "done",
+        "label": "Done"
+      },
+      {
+        "name": "error",
+        "label": "Could not finish"
+      }
+    ],
+    "attachments": [
+      {
+        "name": "agent",
+        "kinds": [
+          "agentAdapter"
+        ]
+      }
+    ],
+    "params": [
+      {
+        "name": "provider",
+        "label": "Agent CLI",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "claude",
+            "codex"
+          ],
+          "default": "claude"
+        }
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "description": "Empty = the CLI default.",
+        "schema": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      {
+        "name": "instructions",
+        "label": "Instructions",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    ],
+    "prompt": "{{ params.instructions }}\n\n## Ticket\n{{ ticket.title }}\n\n{{ ticket.description }}\n\n## Input\n{{ input.summary }}\n\nData:\n{{ input.data }}\n\nArtifacts (location and version; read them with your own tools):\n{{ input.artifacts }}\n\n## Reviewer feedback on your previous attempt\n{{ feedback.comment }}"
+  }
+}

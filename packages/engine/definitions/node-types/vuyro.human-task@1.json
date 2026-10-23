@@ -1,0 +1,21 @@
+{
+  "vuyro": "export",
+  "formatVersion": 1,
+  "kind": "nodeType",
+  "id": "vuyro.human-task",
+  "version": 1,
+  "name": "Human task",
+  "author": "Vuyro",
+  "content": {
+    "type": "vuyro.human-task",
+    "version": 1,
+    "label": "Human task",
+    "description": "A person does the work and finishes it with 'node.done' (for example brainstorming).",
+    "completion": "human",
+    "inputs": [{ "name": "in", "label": "Input" }],
+    "outputs": [{ "name": "done", "label": "Done" }],
+    "params": [
+      { "name": "instructions", "label": "Instructions", "description": "What the person should do.", "schema": { "type": "string", "default": "" } }
+    ]
+  }
+}

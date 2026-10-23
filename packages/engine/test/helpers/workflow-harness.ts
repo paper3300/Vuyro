@@ -1,0 +1,178 @@
+import { join } from 'node:path';
+import type { CommandResponse, CommandSuccess } from '@vuyro/contracts';
+import { CommandBus } from '../../src/commands/command-bus.ts';
+import type { TransportIdentity } from '../../src/commands/caller.ts';
+import { ActivityTracker } from '../../src/runtime/activity.ts';
+import { VirtualClock } from '../../src/runtime/clock.ts';
+import { type FileSystem, nodeFileSystem } from '../../src/runtime/fs.ts';
+import { createUuidV7Generator, seededRandom } from '../../src/runtime/ids.ts';
+import { FakeProcessRunner } from '../../src/runtime/process.ts';
+import { EventStore } from '../../src/store/event-store.ts';
+import { installBuiltins } from '../../src/workflow/builtins.ts';
+import { DefinitionWriter } from '../../src/workflow/definition-writer.ts';
+import { DefinitionRegistry } from '../../src/workflow/definitions.ts';
+import { WorkflowEngine } from '../../src/workflow/engine.ts';
+import { type ScriptedBehavior, ScriptedAgentAdapter } from '../../src/workflow/scripted-agent.ts';
+import { currentExecution, evolveTicket, EMPTY_TICKET, laneStatus, nodeProgress, type TicketWorkflow } from '../../src/workflow/state.ts';
+import { HUMAN, nextRequestId, SYSTEM, tempDir } from './engine-harness.ts';
+
+export interface WorkflowHarnessOptions {
+  readonly behavior?: ScriptedBehavior;
+  readonly maxConcurrent?: number;
+  readonly fs?: FileSystem;
+  /** Skip installing the built-in definitions. */
+  readonly bare?: boolean;
+  /** Do not start the workflow engine (scheduler). */
+  readonly noEngine?: boolean;
+}
+
+export interface WorkflowHarness {
+  readonly dir: string;
+  readonly clock: VirtualClock;
+  readonly activity: ActivityTracker;
+  readonly processes: FakeProcessRunner;
+  readonly errors: { error: Error; context: string }[];
+  store: EventStore;
+  bus: CommandBus;
+  registry: DefinitionRegistry;
+  writer: DefinitionWriter;
+  engine: WorkflowEngine | undefined;
+  adapter: ScriptedAgentAdapter;
+  setBehavior(behavior: ScriptedBehavior): void;
+  exec(type: string, payload: unknown, transport?: TransportIdentity, extra?: Record<string, unknown>): Promise<CommandResponse>;
+  ok(type: string, payload: unknown, transport?: TransportIdentity, extra?: Record<string, unknown>): Promise<CommandSuccess>;
+  /** Runs until nothing is left to do but wait for time that no timer will bring. */
+  drive(limit?: number): Promise<void>;
+  ticket(ticketId: string): Promise<TicketWorkflow>;
+  status(ticketId: string, nodeId: string, lane?: string): Promise<string>;
+  /** Closes and reopens everything on the same database and files (an engine restart). */
+  restart(options?: { behavior?: ScriptedBehavior; noEngine?: boolean }): Promise<void>;
+  close(): Promise<void>;
+}
+
+export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}): Promise<WorkflowHarness> {
+  const temp = tempDir('vuyro-wf-');
+  const clock = new VirtualClock();
+  const ids = createUuidV7Generator({ clock, random: seededRandom(7) });
+  const random = seededRandom(8);
+  const activity = new ActivityTracker();
+  const processes = new FakeProcessRunner(clock);
+  const fs = options.fs ?? nodeFileSystem;
+  const errors: { error: Error; context: string }[] = [];
+  const reportError = (error: Error, context: string) => {
+    errors.push({ error, context });
+  };
+  let behavior: ScriptedBehavior = options.behavior ?? (() => Promise.resolve(undefined));
+
+  const build = async (start: { engine: boolean }) => {
+    const store = await EventStore.open({ path: join(temp.dir, 'engine.db'), clock, ids });
+    const registry = new DefinitionRegistry({ root: join(temp.dir, 'definitions'), fs, store });
+    const bus = new CommandBus({ store, ids, random, definitions: registry, reportError });
+    const writer = new DefinitionWriter({ registry, fs, bus, store, activity, reportError });
+    writer.start();
+    const adapter = new ScriptedAgentAdapter({ provider: 'claude', clock, bus, activity, behavior: (session) => behavior(session) });
+    const engine = start.engine
+      ? new WorkflowEngine({
+          bus,
+          store,
+          definitions: registry,
+          clock,
+          adapters: { claude: adapter },
+          processRunner: processes,
+          activity,
+          scriptEnv: { PATH: '/bin' },
+          reportError,
+          ...(options.maxConcurrent === undefined ? {} : { maxConcurrent: options.maxConcurrent }),
+        })
+      : undefined;
+    return { store, registry, bus, writer, adapter, engine };
+  };
+
+  let parts = await build({ engine: options.noEngine !== true });
+  if (options.bare !== true) {
+    for (const response of await installBuiltins(parts.writer)) {
+      if (!response.ok) throw new Error(`installing built-ins failed: ${JSON.stringify(response.error)}`);
+    }
+  }
+  await parts.engine?.start();
+
+  const harness: WorkflowHarness = {
+    dir: temp.dir,
+    clock,
+    activity,
+    processes,
+    errors,
+    get store() {
+      return parts.store;
+    },
+    get bus() {
+      return parts.bus;
+    },
+    get registry() {
+      return parts.registry;
+    },
+    get writer() {
+      return parts.writer;
+    },
+    get engine() {
+      return parts.engine;
+    },
+    get adapter() {
+      return parts.adapter;
+    },
+    setBehavior(next) {
+      behavior = next;
+    },
+    exec: (type, payload, transport = HUMAN, extra = {}) => parts.bus.execute({ requestId: nextRequestId(), type, payload, ...extra }, transport),
+    async ok(type, payload, transport = HUMAN, extra = {}) {
+      const response = await harness.exec(type, payload, transport, extra);
+      if (!response.ok) throw new Error(`${type} failed: ${JSON.stringify(response.error)}`);
+      return response;
+    },
+    async drive(limit = 10_000) {
+      for (let step = 0; step < limit; step++) {
+        await activity.idle();
+        const next = clock.nextDueAt();
+        if (next === undefined) return;
+        await clock.advanceTo(next);
+      }
+      throw new Error('drive: too many steps');
+    },
+    async ticket(ticketId) {
+      let state = EMPTY_TICKET;
+      for (const event of await parts.store.readAggregate(ticketId)) state = evolveTicket(state, event);
+      return state;
+    },
+    async status(ticketId, nodeId, lane = 'main') {
+      return laneStatus(await harness.ticket(ticketId), nodeId, lane);
+    },
+    async restart(next = {}) {
+      parts.engine?.stop();
+      parts.writer.stop();
+      await activity.idle();
+      await parts.store.close();
+      if (next.behavior !== undefined) behavior = next.behavior;
+      parts = await build({ engine: next.noEngine !== true });
+      await parts.writer.recover();
+      await parts.engine?.start();
+    },
+    async close() {
+      parts.engine?.stop({ cancelRunning: true });
+      parts.writer.stop();
+      await activity.idle();
+      await parts.store.close();
+      temp.dispose();
+    },
+  };
+  return harness;
+}
+
+/** Creates a project and a ticket running the default template. */
+export async function startSdlcTicket(h: WorkflowHarness, title = 'Add a notepad'): Promise<{ projectId: string; ticketId: string }> {
+  const project = await h.ok('project.create', { name: 'sample' });
+  const { projectId } = project.result as { projectId: string };
+  const ticket = await h.ok('ticket.create', { projectId, title, template: { id: 'vuyro/ai-sdlc' } });
+  return { projectId, ticketId: (ticket.result as { ticketId: string }).ticketId };
+}
+
+export { currentExecution, HUMAN, nodeProgress, SYSTEM };

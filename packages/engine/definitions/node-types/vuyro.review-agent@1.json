@@ -1,0 +1,100 @@
+{
+  "vuyro": "export",
+  "formatVersion": 1,
+  "kind": "nodeType",
+  "id": "vuyro.review-agent",
+  "version": 1,
+  "name": "Review agent",
+  "author": "Vuyro",
+  "content": {
+    "type": "vuyro.review-agent",
+    "version": 1,
+    "label": "Review agent",
+    "description": "An agent that checks its input and approves it or rejects some of the items (each reject item answers one input item with pairedInput).",
+    "completion": "agent",
+    "inputs": [
+      {
+        "name": "in",
+        "label": "To review"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "approve",
+        "label": "Approve",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "verdict": {
+              "type": "string"
+            },
+            "notes": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "name": "reject",
+        "label": "Reject",
+        "schema": {
+          "type": "object",
+          "required": [
+            "feedback"
+          ],
+          "properties": {
+            "feedback": {
+              "type": "string",
+              "description": "What is wrong with this item and how to fix it."
+            }
+          }
+        }
+      },
+      {
+        "name": "error",
+        "label": "Could not review"
+      }
+    ],
+    "attachments": [
+      {
+        "name": "agent",
+        "kinds": [
+          "agentAdapter"
+        ]
+      }
+    ],
+    "params": [
+      {
+        "name": "provider",
+        "label": "Agent CLI",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "claude",
+            "codex"
+          ],
+          "default": "claude"
+        }
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "description": "Empty = the CLI default.",
+        "schema": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      {
+        "name": "instructions",
+        "label": "Instructions",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    ],
+    "prompt": "{{ params.instructions }}\n\n## Ticket\n{{ ticket.title }}\n\n## Items to review (index: item)\n{{ inputs.in }}\n\nApprove when every item is acceptable. Otherwise report on the 'reject' port one item per failed input item,\nwith pairedInput set to that input's index and data.feedback explaining what to fix. Only those items run again.\n\n## Reviewer feedback on your previous review\n{{ feedback.comment }}"
+  }
+}

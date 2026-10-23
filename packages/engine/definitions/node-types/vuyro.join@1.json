@@ -1,0 +1,19 @@
+{
+  "vuyro": "export",
+  "formatVersion": 1,
+  "kind": "nodeType",
+  "id": "vuyro.join",
+  "version": 1,
+  "name": "Join",
+  "author": "Vuyro",
+  "content": {
+    "type": "vuyro.join",
+    "version": 1,
+    "label": "Join",
+    "description": "Waits for every incoming edge (and every lane of a fan-out) and passes all their items on.",
+    "completion": "join",
+    "inputs": [{ "name": "in", "label": "Inputs" }],
+    "outputs": [{ "name": "done", "label": "Joined" }],
+    "params": []
+  }
+}

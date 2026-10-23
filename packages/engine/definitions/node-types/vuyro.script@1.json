@@ -1,0 +1,30 @@
+{
+  "vuyro": "export",
+  "formatVersion": 1,
+  "kind": "nodeType",
+  "id": "vuyro.script",
+  "version": 1,
+  "name": "Script",
+  "author": "Vuyro",
+  "content": {
+    "type": "vuyro.script",
+    "version": 1,
+    "label": "Script",
+    "description": "Runs a program without a shell. Exit code 0 finishes through 'done', anything else through 'error'.",
+    "completion": "script",
+    "inputs": [{ "name": "in", "label": "Input" }],
+    "outputs": [
+      { "name": "done", "label": "Succeeded" },
+      { "name": "error", "label": "Failed" }
+    ],
+    "params": [
+      { "name": "program", "label": "Program", "required": true, "schema": { "type": "string", "minLength": 1 } },
+      { "name": "args", "label": "Arguments", "schema": { "type": "array", "items": { "type": "string" }, "default": [] } }
+    ],
+    "script": {
+      "program": "{{ params.program }}",
+      "args": ["{{ params.args }}"],
+      "output": "none"
+    }
+  }
+}
