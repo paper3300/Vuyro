@@ -19,6 +19,7 @@ import {
   PROTOCOL_VERSION,
   RUN_TOKEN_PATTERN,
   SchemaReferenceError,
+  SharedNodeSpecSchema,
   SchemaValidator,
   UnsupportedSchemaVersionError,
   upcastEventData,
@@ -61,7 +62,14 @@ describe('schemas compile under strict Ajv 2020-12', () => {
     for (const type of EVENT_TYPES) {
       expect(() => validator.compile(EVENT_CATALOG[type].schema), type).not.toThrow();
     }
-    for (const schema of [EventEnvelopeSchema, CommandRequestSchema, CommandResponseSchema, NodeRunOutputSchema, NodeTypeSpecSchema]) {
+    for (const schema of [
+      EventEnvelopeSchema,
+      CommandRequestSchema,
+      CommandResponseSchema,
+      NodeRunOutputSchema,
+      NodeTypeSpecSchema,
+      SharedNodeSpecSchema,
+    ]) {
       expect(() => validator.compile(schema)).not.toThrow();
     }
   });
@@ -179,6 +187,7 @@ describe('principals', () => {
     expect(isAiPrincipal({ kind: 'agent', role: 'node.agent', runId: ID })).toBe(true);
     expect(isAiPrincipal({ kind: 'unverified', client: 'cli' })).toBe(true);
     expect(isAiPrincipal({ kind: 'human', userId: 'local', via: 'ui' })).toBe(false);
+    expect(isAiPrincipal({ kind: 'human', userId: 'local', via: 'cli' })).toBe(false);
     expect(isAiPrincipal({ kind: 'system', component: 'workflow' })).toBe(false);
   });
 
@@ -207,6 +216,8 @@ describe('handoff envelope', () => {
     expect(validator.validate(NodeRunOutputSchema, { ...output, cost: 1 })).not.toEqual([]);
     const badItem = { ...output, items: [{ data: {}, tokens: 5 }] };
     expect(validator.validate(NodeRunOutputSchema, badItem)).not.toEqual([]);
+    const badSlot = { ...output, items: [{ data: {}, artifacts: { 'bad slot': { kind: 'git', uri: 'x' } } }] };
+    expect(validator.validate(NodeRunOutputSchema, badSlot)).not.toEqual([]);
   });
 });
 
@@ -234,5 +245,51 @@ describe('event schema versions', () => {
     expect(() => upcastEventData('thing.happened', 4, {}, { catalog, upcasters })).toThrow(UnsupportedSchemaVersionError);
     expect(() => upcastEventData('nope.happened', 1, {})).toThrow(UnsupportedSchemaVersionError);
     expect(() => upcastEventData('thing.happened', 1, {}, { catalog, upcasters: {} })).toThrow(/missing upcaster/);
+  });
+});
+
+describe('node type declarations (M4/M5 fields)', () => {
+  const devNode = {
+    type: 'vuyro.agent',
+    version: 1,
+    label: 'Dev',
+    completion: 'agent',
+    inputs: [{ name: 'in', label: 'Task', mode: 'each' }],
+    outputs: [{ name: 'done', label: 'Done', artifacts: [{ slot: 'change', kinds: ['git', 'p4'] }] }],
+    params: [{ name: 'prompt', label: 'Prompt', schema: { type: 'string' } }],
+    reads: ['project:design/styleGuide', 'app:glossary'],
+    writes: ['project:progress/*'],
+    claims: [{ path: 'Source/Game/UI/**', mode: 'exclusive', release: 'nodeDone', ttl: '2h', onConflict: 'firstWins', pauseMode: 'boundary' }],
+    extensions: { 'myteam.build': { anything: true } },
+  };
+
+  it('accepts BlackBoard reads/writes, start claims and plugin extensions', () => {
+    expect(validator.validate(NodeTypeSpecSchema, devNode)).toEqual([]);
+    expect(validator.validate(NodeTypeSpecSchema, { ...devNode, completion: 'shared' })).toEqual([]);
+  });
+
+  it('still rejects unknown fields and malformed keys, claims and namespaces', () => {
+    expect(validator.validate(NodeTypeSpecSchema, { ...devNode, blackboard: [] })).not.toEqual([]);
+    expect(validator.validate(NodeTypeSpecSchema, { ...devNode, reads: ['ticket:x'] })).not.toEqual([]);
+    expect(validator.validate(NodeTypeSpecSchema, { ...devNode, claims: [{ path: 'a', mode: 'lock' }] })).not.toEqual([]);
+    expect(validator.validate(NodeTypeSpecSchema, { ...devNode, claims: [{ path: 'a', mode: 'shared', ttl: '2 hours' }] })).not.toEqual([]);
+    expect(validator.validate(NodeTypeSpecSchema, { ...devNode, extensions: { 'Bad Name': 1 } })).not.toEqual([]);
+  });
+
+  it('describes a shared build node with batch trigger, protection and failure policy', () => {
+    const build = {
+      name: 'buildStation',
+      label: 'Build station',
+      node: { type: 'vuyro.script', version: 1, params: { command: 'build.bat' } },
+      requestSchema: { type: 'object' },
+      batchTrigger: { count: 3, window: '20m', afterPrevious: true, manual: true },
+      maxConcurrent: 1,
+      protect: [{ path: 'Source/**', mode: 'shared' }],
+      onBatchFailure: 'blame',
+      raiseBlamedPriority: true,
+    };
+    expect(validator.validate(SharedNodeSpecSchema, build)).toEqual([]);
+    expect(validator.validate(SharedNodeSpecSchema, { ...build, batchTrigger: {} })).not.toEqual([]);
+    expect(validator.validate(SharedNodeSpecSchema, { ...build, onBatchFailure: 'retry' })).not.toEqual([]);
   });
 });

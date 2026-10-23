@@ -14,8 +14,11 @@ export const HumanPrincipalSchema = Type.Object(
     kind: Type.Literal('human'),
     /** MVP is single-user; the local user is always 'local'. */
     userId: Type.String({ minLength: 1, maxLength: 64 }),
-    /** Only the app UI can prove it is the human (UI credential). See 명령·이벤트 계약 §호출자. */
-    via: Type.Literal('ui'),
+    /**
+     * How the human was verified. 'ui' = app connection with the UI credential;
+     * 'cli' = a CLI connection that presented the human credential (development and tests until M3).
+     */
+    via: Type.Union([Type.Literal('ui'), Type.Literal('cli')]),
   },
   { additionalProperties: false },
 );
@@ -44,7 +47,8 @@ export const SystemPrincipalSchema = Type.Object(
 
 /**
  * A local client that proved only the engine token (any process of the same OS user can read it).
- * It may be the human at a terminal or an agent that dropped its run token, so it is treated like an AI.
+ * It may be the human at a terminal or an agent that dropped its run token, so it is treated like an AI
+ * and is read-only.
  */
 export const UnverifiedPrincipalSchema = Type.Object(
   {

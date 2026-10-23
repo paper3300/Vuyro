@@ -41,7 +41,9 @@ export const HandoffItemSchema = Type.Object(
   {
     /** Validated against the port's declared schema; undeclared fields are kept (unless the node is strict). */
     data: Type.Record(Type.String(), Type.Unknown()),
-    artifacts: Type.Optional(Type.Record(Type.String({ pattern: SLOT_PATTERN }), ArtifactRefSchema)),
+    artifacts: Type.Optional(
+      Type.Record(Type.String({ pattern: SLOT_PATTERN }), ArtifactRefSchema, { additionalProperties: false }),
+    ),
     /** Markdown summary for the next agent and the reviewer. */
     summary: Type.Optional(Type.String({ maxLength: 65536 })),
     lineage: Type.Optional(Type.Array(ItemRefSchema)),
