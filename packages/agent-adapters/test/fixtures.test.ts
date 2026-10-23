@@ -45,6 +45,29 @@ function items(lines: Line[], type: string): Array<Record<string, unknown>> {
     .filter((item) => item.type === type);
 }
 
+type Settle = 'succeeded' | 'failed' | 'unsettled';
+
+/** Settle rule from 초기 검증 결과 M0b: is_error/terminal_reason, never subtype. */
+function claudeSettle(lines: Line[]): Settle {
+  const result = only(lines, 'result').at(-1);
+  if (result === undefined) return 'unsettled';
+  return result.is_error === false && result.terminal_reason === 'completed' ? 'succeeded' : 'failed';
+}
+
+/** Settle rule from 초기 검증 결과 M0b: the last turn.completed / turn.failed. */
+function codexSettle(lines: Line[]): Settle {
+  const end = lines.filter((line) => line.type === 'turn.completed' || line.type === 'turn.failed').at(-1);
+  if (end === undefined) return 'unsettled';
+  return end.type === 'turn.completed' ? 'succeeded' : 'failed';
+}
+
+function hookLog(path: string): Array<Record<string, unknown>> {
+  return text(path)
+    .split('\n')
+    .filter((line) => line !== '')
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
 describe('fixture files', () => {
   const files = [CLAUDE, CODEX].flatMap((dir) => readdirSync(new URL(dir, fixtures)).map((name) => dir + name));
 
@@ -52,10 +75,12 @@ describe('fixture files', () => {
     const content = text(file);
     const user = userInfo().username;
     if (user !== 'sample') expect(content.toLowerCase()).not.toContain(user.toLowerCase());
-    expect(content).not.toMatch(/vuyro-m0b-\d+/);
+    expect(content).not.toMatch(/vuyro-m0b\d*-\d+/);
   });
 
-  it.each(files.filter((file) => file.endsWith('.jsonl')))('%s is JSONL with a type on every line', (file) => {
+  // Hook logs hold the hooks' stdin payloads, which have no `type`.
+  const streams = files.filter((file) => file.endsWith('.jsonl') && !file.endsWith('.hook-log.jsonl'));
+  it.each(streams)('%s is JSONL with a type on every line', (file) => {
     for (const line of jsonl(file)) expect(typeof line.type).toBe('string');
   });
 });
@@ -98,6 +123,40 @@ describe('Claude Code 2.1.309 stream-json', () => {
     const resumed = jsonl(`${CLAUDE}resume.jsonl`);
     expect(first(resumed, 'system', 'init').session_id).toBe(original.session_id);
     expect(first(resumed, 'result').result).toBe('pong');
+  });
+
+  it('cannot tell a run from its resume by session id and turn count (Vuyro run id is the key)', () => {
+    const original = first(jsonl(`${CLAUDE}simple.jsonl`), 'result');
+    const resumed = first(jsonl(`${CLAUDE}resume.jsonl`), 'result');
+    expect([resumed.session_id, resumed.num_turns]).toEqual([original.session_id, original.num_turns]);
+  });
+
+  it('gives the hook the same tool_use_id as the stream', () => {
+    const hook = JSON.parse(text(`${CLAUDE}hook-input-pretooluse-write.json`)) as { tool_use_id: string };
+    const uses = contentBlocks(jsonl(`${CLAUDE}hook-deny-json.jsonl`), 'assistant').filter((b) => b.type === 'tool_use');
+    expect(uses.map((use) => use.id)).toEqual([hook.tool_use_id]);
+  });
+
+  it('omits is_error on successful tool results', () => {
+    const results = contentBlocks(jsonl(`${CLAUDE}tools-read-write.jsonl`), 'user').filter((b) => b.type === 'tool_result');
+    expect(results).toHaveLength(2);
+    for (const result of results) expect('is_error' in result).toBe(false);
+  });
+
+  it('reports a failing tool as an error result without failing the run', () => {
+    const lines = jsonl(`${CLAUDE}tool-failure.jsonl`);
+    const results = contentBlocks(lines, 'user').filter((b) => b.type === 'tool_result');
+    expect(results).toMatchObject([{ is_error: true }]);
+    expect(first(lines, 'result').permission_denials).toEqual([]); // not a hook/permission denial
+    expect(claudeSettle(lines)).toBe('succeeded');
+  });
+
+  it.each([
+    ['simple', 'succeeded'],
+    ['error-unknown-model', 'failed'],
+    ['synthetic-truncated-no-result', 'unsettled'],
+  ] as const)('settles %s as %s', (name, expected) => {
+    expect(claudeSettle(jsonl(`${CLAUDE}${name}.jsonl`))).toBe(expected);
   });
 
   it.each(['hook-deny-json', 'hook-deny-exit2', 'hook-deny-edit'])('%s: a PreToolUse hook denial is visible', (name) => {
@@ -154,8 +213,42 @@ describe('Codex CLI 0.163.0 exec --json', () => {
     expect(text(`${CODEX}hook-deny-apply-patch.stderr.txt`)).toContain('Command blocked by PreToolUse hook');
   });
 
-  it.each(['hook-exit2-not-blocked', 'hook-untrusted-not-run'])('%s: the patch went through', (name) => {
-    expect(items(jsonl(`${CODEX}${name}.jsonl`), 'file_change')).toHaveLength(1);
+  it('exit 2 does not block: the hook ran (log) and the patch still went through', () => {
+    const log = hookLog(`${CODEX}hook-exit2-not-blocked.hook-log.jsonl`);
+    expect(log).toMatchObject([{ hook_event_name: 'PreToolUse', tool_name: 'apply_patch' }]);
+    const lines = jsonl(`${CODEX}hook-exit2-not-blocked.jsonl`);
+    expect(log[0]?.session_id).toBe(first(lines, 'thread.started').thread_id);
+    expect(items(lines, 'file_change')).toMatchObject([{ status: 'completed' }]);
+  });
+
+  it('without hook trust the injected hook is never called', () => {
+    expect(text(`${CODEX}hook-untrusted-not-run.hook-log.jsonl`)).toBe('');
+    expect(items(jsonl(`${CODEX}hook-untrusted-not-run.jsonl`), 'file_change')).toMatchObject([{ status: 'completed' }]);
+  });
+
+  it('hook tool_use_id and stream item.id of the same allowed call differ (not a join key)', () => {
+    const [call] = hookLog(`${CODEX}hook-allowed-apply-patch.hook-log.jsonl`);
+    const lines = jsonl(`${CODEX}hook-allowed-apply-patch.jsonl`);
+    const [change] = items(lines, 'file_change');
+    expect(call).toMatchObject({ tool_name: 'apply_patch', tool_use_id: expect.stringMatching(/^exec-/) as string });
+    expect(change).toMatchObject({ id: expect.stringMatching(/^item_\d+$/) as string, status: 'completed' });
+    expect(call?.tool_use_id).not.toBe(change?.id);
+    // Only the session joins them: the hook's session_id is the stream's thread_id.
+    expect(call?.session_id).toBe(first(lines, 'thread.started').thread_id);
+  });
+
+  it('reports a failing command as a failed item without failing the turn', () => {
+    const lines = jsonl(`${CODEX}tool-failure.jsonl`);
+    expect(items(lines, 'command_execution')).toMatchObject([{ status: 'failed', exit_code: 1 }]);
+    expect(codexSettle(lines)).toBe('succeeded');
+  });
+
+  it.each([
+    ['simple', 'succeeded'],
+    ['error-unknown-model', 'failed'],
+    ['synthetic-truncated-no-turn-end', 'unsettled'],
+  ] as const)('settles %s as %s', (name, expected) => {
+    expect(codexSettle(jsonl(`${CODEX}${name}.jsonl`))).toBe(expected);
   });
 
   it('names hooked tools apply_patch and Bash', () => {

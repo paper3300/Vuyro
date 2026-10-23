@@ -1,0 +1,8 @@
+{"type":"thread.started","thread_id":"01a16921-ca90-7522-bc63-e9f797cf93d2"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\codex\\work\\allowed.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\codex\\work\\allowed.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":35144,"cached_input_tokens":29184,"cache_write_input_tokens":0,"output_tokens":43,"reasoning_output_tokens":0}}

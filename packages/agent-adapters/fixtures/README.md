@@ -18,8 +18,11 @@
 | `tools-read-write.jsonl` | (b) `input.txt`를 읽고 대문자로 바꿔 `output.txt`에 쓰기 |
 | `resume.jsonl` | (c) (a) 세션을 이어서 "이전 답이 뭐였나" |
 | `error-unknown-model.jsonl` | 없는 모델 이름으로 실행(토큰 소모 없음) |
+| `tool-failure.jsonl` | 없는 파일을 읽게 해서 도구 하나를 실패시킴 |
+| `synthetic-truncated-*.jsonl` | **합성 픽스처**: `simple.jsonl`에서 마지막 줄(정착 줄)을 지운 것. 종료 줄 없이 프로세스가 끝난 경우를 흉내 낸다 |
 | `hook-*.jsonl` | 파일 수정 직전 훅 시험 |
 | `hook-input-*.json` | 훅 프로세스가 stdin으로 받은 내용 |
+| `*.hook-log.jsonl` | 같은 이름 실행의 **훅 호출 로그**. 훅이 호출될 때마다 stdin을 한 줄 추가한다. 실행 전에 빈 파일로 만들었으므로, 비어 있으면 훅이 호출되지 않은 것이다 |
 | `*.stderr.txt` | 같은 실행의 stderr(정보가 stdout에 없을 때만 보관) |
 
 ### Claude Code 2.1.309 (`claude/2.1.309/`)
@@ -55,12 +58,14 @@ codex exec --json --ignore-user-config -m gpt-6-luna \
 ```
 
 (a)와 (c)는 `windows.sandbox` 없이 녹화했다. 도구를 쓰지 않으므로 출력에는 차이가 없다.
+`*.hook-log.jsonl`이 있는 실행과 `tool-failure.jsonl`은 2차 녹화분이다(훅 로그를 함께 보관하려고 다시 녹화했다).
 
 | 파일 | 훅 설정 | 결과 |
 |---|---|---|
 | `hook-deny-apply-patch.jsonl` | JSON deny, 신뢰 우회 플래그 | 막힘. stdout에는 흔적이 없고 stderr에만 남는다 |
-| `hook-exit2-not-blocked.jsonl` | exit 2, 신뢰 우회 플래그 | **막지 못함**, 파일 생성됨 |
-| `hook-untrusted-not-run.jsonl` | JSON deny, 신뢰 우회 플래그 없음 | **훅이 실행되지 않음**, 파일 생성됨 |
+| `hook-exit2-not-blocked.jsonl` (+ `.hook-log.jsonl`) | exit 2, 신뢰 우회 플래그 | 훅은 호출됨(로그 1줄), **막지 못함**, 파일 생성됨 |
+| `hook-untrusted-not-run.jsonl` (+ `.hook-log.jsonl`) | JSON deny, 신뢰 우회 플래그 없음 | **훅이 호출되지 않음**(빈 로그), 파일 생성됨 |
+| `hook-allowed-apply-patch.jsonl` (+ `.hook-log.jsonl`) | 로그만 남기는 훅(`log`), 신뢰 우회 플래그 | 허용된 같은 호출의 훅 `tool_use_id`와 stream `item.id` 한 쌍 |
 | `hook-input-pretooluse-bash.json` | `.*` 로그만 남기는 훅, PowerShell로 쓰기 | 셸 명령은 `tool_name: "Bash"`로 들어온다 |
 
 ## 훅 스크립트

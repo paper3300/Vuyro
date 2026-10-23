@@ -65,9 +65,8 @@ switch (extname(input)) {
     result = source
       .split(/\r?\n/)
       .filter((line) => line.trim() !== '')
-      .map((line) => JSON.stringify(scrubValue(JSON.parse(line))))
-      .join('\n');
-    result += '\n';
+      .map((line) => `${JSON.stringify(scrubValue(JSON.parse(line)))}\n`)
+      .join(''); // an empty hook log stays empty
     break;
   case '.json':
     result = `${JSON.stringify(scrubValue(JSON.parse(source)), null, 2)}\n`;
