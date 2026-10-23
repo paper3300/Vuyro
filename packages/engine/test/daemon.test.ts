@@ -49,6 +49,10 @@ describe.runIf(process.platform === 'win32')('engine daemon', () => {
       expect(error.data.code).toBe('forbidden');
       expect(error.rpcCode).toBe(-32002);
       expect(await cli.request<{ projects: unknown[] }>(RPC_METHODS.projects, {})).toEqual({ projects: [] });
+      // Saying "I am the UI" without the credential changes nothing.
+      const claimsUi = await h.connect({ client: 'ui' });
+      expect(claimsUi.hello.identity).toBe('unverified');
+      expect((await refused(claimsUi.execute({ requestId: rid(), type: 'project.create', payload: { name: 'x' } }))).data.code).toBe('forbidden');
     });
 
     it('the launch UI credential makes a ui-session that can write', async () => {
@@ -132,6 +136,7 @@ describe.runIf(process.platform === 'win32')('engine daemon', () => {
       await new Promise((resolve) => setTimeout(resolve, 250));
       // Checked again on every command, not only at hello.
       expect((await refused(human.execute({ requestId: rid(), type: 'project.create', payload: { name: 'x' } }))).data.code).toBe('unauthenticated');
+      expect((await refused(human.request(RPC_METHODS.shutdown, {}))).data.code).toBe('forbidden');
       await expect(h.connect({ humanCredential: credential })).rejects.toMatchObject({ data: { code: 'unauthenticated' } });
     });
 
