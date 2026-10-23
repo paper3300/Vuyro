@@ -247,7 +247,7 @@ function toEach(draft: WorkflowDraft, index: number): boolean {
   return edge !== undefined && draft.node(edge.edge.to.node).inputs.find((input) => input.name === edge.edge.to.port)?.mode === 'each';
 }
 
-/** Latest delivery over an edge: a fan-out source's contribution, else the latest current run that took it. */
+/** Latest delivery over an edge: a fan-out source's contribution, else the source's latest settled run if it took the edge. */
 function latestOver(draft: WorkflowDraft, edgeIndex: number): { items: HandoffItem[]; basis?: Basis } {
   const source = draft.workflow.edges[edgeIndex]?.edge.from.node;
   if (source === undefined) return { items: [] };
@@ -255,10 +255,12 @@ function latestOver(draft: WorkflowDraft, edgeIndex: number): { items: HandoffIt
     const contributed = contribution(draft, source, [edgeIndex], 0);
     return { items: contributedItems(contributed, [edgeIndex]), ...(contributed.basis === undefined ? {} : { basis: contributed.basis }) };
   }
+  // The source's latest settled result decides (item 11): if it left through another port, this edge is dead now,
+  // even when an earlier run took it.
   const latest = nodeProgress(draft.state, source)
-    .executions.filter((exec) => exec.completedOrder !== undefined && Object.hasOwn(exec.routes, edgeIndex))
+    .executions.filter(settled)
     .sort((a, b) => (b.completedOrder ?? 0) - (a.completedOrder ?? 0))[0];
-  if (latest === undefined || !executionLive(draft.state, latest)) return { items: [] };
+  if (latest === undefined || !Object.hasOwn(latest.routes, edgeIndex) || !executionLive(draft.state, latest)) return { items: [] };
   return { items: routedItems(edgeIndex, latest), basis: outgoingBasis(draft.state, latest) };
 }
 

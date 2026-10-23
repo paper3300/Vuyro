@@ -6,6 +6,7 @@ import type { ScriptedSession } from '../src/workflow/scripted-agent.ts';
 import { currentExecution, execution, nodeProgress, type TicketWorkflow } from '../src/workflow/state.ts';
 import { nextRequestId } from './helpers/engine-harness.ts';
 import { JoinOracle, type OracleCounts } from './helpers/join-oracle.ts';
+import { MERGE_NODE_TYPE } from './helpers/merge-node.ts';
 import { HUMAN, openWorkflowHarness, type WorkflowHarness } from './helpers/workflow-harness.ts';
 
 /**
@@ -29,11 +30,12 @@ const CASES = Number(process.env.PROPERTY_CASES ?? 300);
 const BASE_SEED = Number(process.env.PROPERTY_SEED ?? 20261024);
 const MAX_STEPS = 40;
 
-type Kind = 'agent' | 'each' | 'gated' | 'gate' | 'review' | 'join' | 'human';
+type Kind = 'agent' | 'each' | 'gated' | 'gate' | 'review' | 'join' | 'human' | 'merge';
 
 interface Graph {
   readonly nodes: readonly { readonly id: string; readonly kind: Kind | 'end' }[];
-  readonly edges: readonly { readonly from: string; readonly port: string; readonly to: string }[];
+  /** `toPort` is the target's input port ('in' when absent). */
+  readonly edges: readonly { readonly from: string; readonly port: string; readonly to: string; readonly toPort?: string }[];
 }
 
 /** mulberry32 */
@@ -62,13 +64,13 @@ function generate(seed: number): Graph {
   const middle = 2 + Math.floor(random() * 5);
   const kinds: Kind[] = ['agent', ...Array.from({ length: middle }, () => pick<Kind>(['agent', 'agent', 'each', 'gated', 'gate', 'review', 'review', 'join', 'join', 'human']))];
   const nodes: { id: string; kind: Kind | 'end' }[] = [...kinds.map((kind, index) => ({ id: `n${index}`, kind })), { id: 'end', kind: 'end' as const }];
-  const edges: { from: string; port: string; to: string }[] = [];
+  const edges: { from: string; port: string; to: string; toPort?: string }[] = [];
   const keys = new Set<string>();
-  const addById = (from: string, port: string, to: string): void => {
-    const key = `${from}.${port}>${to}`;
+  const addById = (from: string, port: string, to: string, toPort?: string): void => {
+    const key = `${from}.${port}>${to}.${toPort ?? 'in'}`;
     if (keys.has(key) || from === to) return;
     keys.add(key);
-    edges.push({ from, port, to });
+    edges.push({ from, port, to, ...(toPort === undefined ? {} : { toPort }) });
   };
   const add = (from: number, port: string, to: number): void => {
     addById(nodes[from]?.id ?? '', port, nodes[to]?.id ?? '');
@@ -146,6 +148,25 @@ function generate(seed: number): Graph {
       }
     }
   }
+  // A node with two input ports. Its left source re-runs now and then (a review sends it back, or a failure is
+  // retried) and may leave through another port: whatever activates the merge on one port, the other port takes only
+  // that source's latest result, nothing if that result went elsewhere.
+  if (random() < 0.6) {
+    const agents = indexesOf((kind, index) => kind === 'agent' && index >= 1);
+    if (agents.length > 0) {
+      const left = pick(agents);
+      // The right port is fed by a person who finishes later, after the left source may have re-run.
+      nodes.push({ id: 'rmerge', kind: 'merge' }, { id: 'rnote', kind: 'human' });
+      addById(nodes[left]?.id ?? '', 'done', 'rmerge', 'left');
+      addById('rnote', 'done', 'rmerge', 'right');
+      addById('rmerge', 'done', 'end');
+      // A review of the left source that may send it back (its re-run then leaves through the other port).
+      nodes.push({ id: 'rcheck', kind: 'review' });
+      addById(nodes[left]?.id ?? '', 'done', 'rcheck');
+      addById('rcheck', 'reject', nodes[left]?.id ?? '');
+      addById('rcheck', 'approve', 'end');
+    }
+  }
   // Every node but the entries needs an incoming edge.
   for (let index = 1; index <= last; index++) {
     if (!edges.some((edge) => edge.to === nodes[index]?.id)) {
@@ -167,6 +188,8 @@ function toTemplate(graph: Graph, id: string): TemplateDefinition {
         return { id: nodeId, type: 'vuyro.agent', version: 1, params: { instructions: nodeId }, ports: { in: { mode: 'each' } }, review: 'human' };
       case 'gate':
         return { id: nodeId, type: 'vuyro.agent', version: 1, params: { instructions: nodeId }, review: 'human' };
+      case 'merge':
+        return { id: nodeId, type: 'myteam.merge', version: 1, params: { instructions: nodeId } };
       case 'review':
         return { id: nodeId, type: 'vuyro.review-agent', version: 1, params: { instructions: nodeId } };
       case 'join':
@@ -177,14 +200,14 @@ function toTemplate(graph: Graph, id: string): TemplateDefinition {
         return { id: nodeId, type: 'vuyro.end', version: 1 };
     }
   });
-  const edges: TemplateEdge[] = graph.edges.map((edge) => ({ from: { node: edge.from, port: edge.port }, to: { node: edge.to, port: 'in' } }));
+  const edges: TemplateEdge[] = graph.edges.map((edge) => ({ from: { node: edge.from, port: edge.port }, to: { node: edge.to, port: edge.toPort ?? 'in' } }));
   return { vuyro: 'export', formatVersion: 1, kind: 'template', id, version: 1, name: id, content: { id, version: 1, name: id, nodes, edges } };
 }
 
 function describeGraph(graph: Graph): string {
   return [
     graph.nodes.map((node) => `${node.id}:${node.kind}`).join(' '),
-    ...graph.edges.map((edge) => `  ${edge.from}.${edge.port} -> ${edge.to}`),
+    ...graph.edges.map((edge) => `  ${edge.from}.${edge.port} -> ${edge.to}${edge.toPort === undefined ? '' : `.${edge.toPort}`}`),
   ].join('\n');
 }
 
@@ -209,6 +232,7 @@ const emptyCoverage = (): Coverage => ({
   replansAfterEnd: 0,
   mixedAtReplan: 0,
   retiredEmpty: 0,
+  otherPortDead: 0,
   fanOutLanes: 0,
   reworkRuns: 0,
   rejectLoops: 0,
@@ -244,6 +268,8 @@ interface CaseRun {
   readonly kinds: ReadonlyMap<string, Kind | 'end'>;
   /** Nodes that feed a fan-out node: their empty outputs (a skipped plan) matter most. */
   readonly planners: ReadonlySet<string>;
+  /** Nodes whose re-runs leave through the other port (the merge's left source): every second run fails. */
+  readonly switchers: ReadonlySet<string>;
 }
 
 describe('routing properties', () => {
@@ -302,6 +328,11 @@ describe('routing properties', () => {
       else await done('error', { data: { reason: 'review failed' } });
       return undefined;
     }
+    if (config.switchers.has(nodeId) && run % 2 === 0) {
+      // A re-run that leaves through the other port than the run before.
+      await done('error', { items: [{ data: { reason: 'took the other way' } }] });
+      return undefined;
+    }
     if (runs > 6 || roll < 0.75) {
       const shape = random();
       // A planner now and then plans nothing: a person approves the skip (an empty delivery) or sends it back.
@@ -320,6 +351,8 @@ describe('routing properties', () => {
 
   beforeAll(async () => {
     h = await openWorkflowHarness({ behavior: behave, maxConcurrent: 3 });
+    const saved = await h.writer.save(MERGE_NODE_TYPE, HUMAN, nextRequestId());
+    if (!saved.ok) throw new Error(saved.error.message);
   });
 
   afterAll(async () => {
@@ -343,7 +376,8 @@ describe('routing properties', () => {
     const ticketId = (ticket.result as { ticketId: string }).ticketId;
     const kinds = new Map(graph.nodes.map((node) => [node.id, node.kind]));
     const planners = new Set(graph.edges.filter((edge) => isLanes(kinds.get(edge.to))).map((edge) => edge.from));
-    cases.set(ticketId, { seed, kinds, planners });
+    const switchers = new Set(graph.edges.filter((edge) => edge.to === 'rmerge' && edge.toPort === 'left').map((edge) => edge.from));
+    cases.set(ticketId, { seed, kinds, planners, switchers });
     const errorsBefore = h.errors.length;
     const decide = prng(hash(seed, 'human'));
     const fail = async (message: string): Promise<string> => `${message}\n${await describeTicket(ticketId)}`;
@@ -489,6 +523,7 @@ describe('routing properties', () => {
     expect(coverage.replansAfterEnd).toBeGreaterThanOrEqual(CASES / 100);
     expect(coverage.mixedAtReplan).toBeGreaterThanOrEqual(CASES / 300);
     expect(coverage.retiredEmpty).toBeGreaterThanOrEqual(CASES / 300);
+    expect(coverage.otherPortDead).toBeGreaterThanOrEqual(CASES / 100);
     expect(stats.done).toBeGreaterThan(CASES / 3);
     expect(stats.runs).toBeGreaterThan(CASES * 2);
     // The generator must reach the interesting shapes, or the test proves little.

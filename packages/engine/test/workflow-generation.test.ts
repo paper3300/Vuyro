@@ -6,6 +6,7 @@ import { ticketWaitReasons } from '../src/workflow/machine.ts';
 import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
 import { nextRequestId } from './helpers/engine-harness.ts';
 import { JoinOracle } from './helpers/join-oracle.ts';
+import { MERGE_NODE_TYPE } from './helpers/merge-node.ts';
 import { HUMAN, openWorkflowHarness, type WorkflowHarness } from './helpers/workflow-harness.ts';
 
 /**
@@ -142,6 +143,59 @@ describe('generation records', () => {
     expect(await h.status(current, 'check')).toBe('review');
   });
 
+  it('takes nothing on another port from a source whose latest run left elsewhere', async () => {
+    // Final review counterexample (b6f6923): 'a' sends yes to m.left, is sent back, and its re-run leaves through no.
+    // When the note then activates m on 'right', the left port must not get a's old yes item back.
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId, run } = s.request;
+        if (nodeId === 'a') expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: run === 1 ? 'done' : 'error', data: { answer: run === 1 ? 'yes' : 'no' } }));
+        else if (nodeId === 'check') expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: run === 1 ? 'reject' : 'approve', data: { feedback: 'again' } }));
+        else expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { from: nodeId } }));
+        return undefined;
+      },
+    });
+    await save(h, MERGE_NODE_TYPE);
+    await save(
+      h,
+      template(
+        'myteam/port-switch',
+        [
+          human('start'),
+          human('note'),
+          agent('a'),
+          { id: 'check', type: 'vuyro.review-agent', version: 1, params: { instructions: 'check' } },
+          agent('log'),
+          { id: 'm', type: 'myteam.merge', version: 1, params: { instructions: 'merge' } },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [
+          edge('start', 'done', 'a'),
+          edge('a', 'done', 'm', 'left'),
+          edge('a', 'done', 'check'),
+          edge('check', 'reject', 'a'),
+          edge('check', 'approve', 'end'),
+          edge('a', 'error', 'log'),
+          edge('note', 'done', 'm', 'right'),
+          edge('m', 'done', 'end'),
+        ],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/port-switch');
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.drive();
+    let state = await h.ticket(ticketId);
+    expect(nodeProgress(state, 'a').executions.map((exec) => exec.output?.port)).toEqual(['done', 'error']);
+    expect(nodeProgress(state, 'm').executions[0]?.inputs.left?.map((item) => item.data.answer)).toEqual(['yes']);
+    await h.ok('node.done', { ticketId, nodeId: 'note', port: 'done', items: [{ data: { from: 'note' } }] });
+    await h.drive();
+    state = await h.ticket(ticketId);
+    const second = nodeProgress(state, 'm').executions[1];
+    expect(second?.inputs.right?.map((item) => item.data.from)).toEqual(['note']);
+    expect(second?.inputs.left).toEqual([]);
+    expect(second?.basis).toEqual({ groups: [], free: true });
+  });
+
   it('checks a node with two input ports: the port it was not activated for counts as consumed too', async () => {
     h = await openWorkflowHarness({
       behavior: async (s) => {
@@ -151,31 +205,7 @@ describe('generation records', () => {
         return undefined;
       },
     });
-    const merge: DefinitionEnvelope = {
-      vuyro: 'export',
-      formatVersion: 1,
-      kind: 'nodeType',
-      id: 'myteam.merge',
-      version: 1,
-      name: 'Merge',
-      content: {
-        type: 'myteam.merge',
-        version: 1,
-        label: 'Merge',
-        completion: 'agent',
-        inputs: [
-          { name: 'left', label: 'Left' },
-          { name: 'right', label: 'Right' },
-        ],
-        outputs: [
-          { name: 'done', label: 'Done' },
-          { name: 'error', label: 'Could not finish' },
-        ],
-        params: [{ name: 'instructions', label: 'Instructions', required: true, schema: { type: 'string', minLength: 1 } }],
-        prompt: '{{ params.instructions }}',
-      },
-    };
-    await save(h, merge);
+    await save(h, MERGE_NODE_TYPE);
     await save(
       h,
       template(

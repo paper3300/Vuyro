@@ -64,6 +64,8 @@ export interface OracleCounts {
   mixedAtReplan: number;
   /** Executions with no input items (only empty deliveries) retired by a new plan. */
   retiredEmpty: number;
+  /** Other-port gathers where the source's latest result left through another port though an earlier one took the edge. */
+  otherPortDead: number;
 }
 
 const refKey = (ref: ItemRef): string => `${ref.nodeId}#${ref.run}#${ref.item}`;
@@ -74,7 +76,7 @@ const itemKeys = (items: readonly HandoffItem[]): string[] => items.map((item) =
 
 export class JoinOracle {
   readonly violations: string[] = [];
-  readonly counts: OracleCounts = { replans: 0, retired: 0, retiredDownstream: 0, replansOverActive: 0, joinRuns: 0, multiSourceJoinRuns: 0, fanInRuns: 0, extendedGroups: 0, chainedGroups: 0, replansAfterEnd: 0, mixedAtReplan: 0, retiredEmpty: 0 };
+  readonly counts: OracleCounts = { replans: 0, retired: 0, retiredDownstream: 0, replansOverActive: 0, joinRuns: 0, multiSourceJoinRuns: 0, fanInRuns: 0, extendedGroups: 0, chainedGroups: 0, replansAfterEnd: 0, mixedAtReplan: 0, retiredEmpty: 0, otherPortDead: 0 };
   /** Item 1: the step counter. */
   private step = 0;
   private readonly execs = new Map<string, Exec[]>();
@@ -649,11 +651,16 @@ export class JoinOracle {
         const from = this.workflow.edges[edge]?.edge.from.node;
         if (from === undefined) return [];
         if (this.isFanOut(this.node(from))) return this.contributionSource(from, [edge], 0);
+        // Item 11: the source's latest settled result decides; if it left through another port, this edge is dead.
         let latest: Exec | undefined;
         for (const exec of this.execs.get(from) ?? []) {
-          if (exec.completedAt !== undefined && exec.routes.has(edge) && (latest === undefined || exec.completedAt > (latest.completedAt ?? 0))) latest = exec;
+          if (SETTLED.has(exec.status) && exec.completedAt !== undefined && (latest === undefined || exec.completedAt > (latest.completedAt ?? 0))) latest = exec;
         }
-        return latest === undefined || !this.execLive(latest) ? [] : [{ kind: 'exec' as const, node: latest.node, run: latest.run }];
+        if (latest === undefined || !latest.routes.has(edge)) {
+          if ((this.execs.get(from) ?? []).some((exec) => exec.routes.has(edge))) this.counts.otherPortDead += 1;
+          return [];
+        }
+        return this.execLive(latest) ? [{ kind: 'exec' as const, node: latest.node, run: latest.run }] : [];
       });
   }
 
