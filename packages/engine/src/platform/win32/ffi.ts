@@ -2,9 +2,9 @@ import { createRequire } from 'node:module';
 
 /**
  * Minimal Win32 bindings through koffi (prebuilt FFI, no compiler needed).
- * Node's `net` module cannot set a security descriptor on a named pipe, so the
- * engine calls the security APIs directly. Loaded lazily: importing the engine
- * on another platform must not fail.
+ * Used to read the current user's SID and to put an explicit current-user-only
+ * DACL on files (the engine token file); Node has no API for either. Loaded
+ * lazily: importing the engine on another platform must not fail.
  */
 
 /** Opaque native pointer (a koffi External). */
@@ -18,12 +18,9 @@ export type OutSlot<T> = [T | null];
 
 export const INVALID_HANDLE_VALUE = -1;
 
-export const GENERIC_READ = 0x80000000;
-export const GENERIC_WRITE = 0x40000000;
 export const READ_CONTROL = 0x00020000;
 export const WRITE_DAC = 0x00040000;
 export const OPEN_EXISTING = 3;
-export const FILE_READ_ATTRIBUTES = 0x0080;
 export const FILE_SHARE_ALL = 0x7;
 
 export const OWNER_SECURITY_INFORMATION = 0x1;
@@ -35,31 +32,9 @@ export const SDDL_REVISION_1 = 1;
 
 export const TOKEN_QUERY = 0x0008;
 export const TOKEN_USER_CLASS = 1;
-export const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
-export const PIPE_SERVER_END = 0x1;
-/** FILE_PIPE_LOCAL_INFORMATION.NamedPipeType bit set by PIPE_REJECT_REMOTE_CLIENTS. */
-export const FILE_PIPE_REJECT_REMOTE_CLIENTS = 0x2;
-/** FILE_PIPE_LOCAL_INFORMATION.NamedPipeState values. */
-export const FILE_PIPE_DISCONNECTED_STATE = 1;
-export const FILE_PIPE_LISTENING_STATE = 2;
-export const FILE_PIPE_CONNECTED_STATE = 3;
-export const FILE_PIPE_CLOSING_STATE = 4;
-export const FILE_TYPE_UNKNOWN = 0;
-export const FILE_TYPE_PIPE = 3;
-export const FILE_NAME_INFO_CLASS = 2;
-export const FILE_PIPE_LOCAL_INFORMATION_CLASS = 24;
-export const PROCESS_HANDLE_INFORMATION_CLASS = 51;
-export const STATUS_INFO_LENGTH_MISMATCH = 0xc0000004;
-
-export const NO_ERROR = 0;
-export const ERROR_FILE_NOT_FOUND = 2;
 export const ERROR_ACCESS_DENIED = 5;
 export const ERROR_INSUFFICIENT_BUFFER = 122;
-export const ERROR_PIPE_BUSY = 231;
-export const ERROR_NO_DATA = 232;
-export const ERROR_PIPE_NOT_CONNECTED = 233;
-export const ERROR_MORE_DATA = 234;
 
 export interface Win32 {
   CreateFileW(
@@ -74,19 +49,7 @@ export interface Win32 {
   CloseHandle(handle: Handle): number;
   GetLastError(): number;
   LocalFree(memory: NativePointer): unknown;
-  WriteFile(handle: Handle, data: Buffer, length: number, written: OutSlot<number>, overlapped: null): number;
   GetCurrentProcess(): Handle;
-  OpenProcess(access: number, inherit: number, pid: number): Handle;
-  GetNamedPipeServerProcessId(pipe: Handle, pid: OutSlot<number>): number;
-  GetNamedPipeClientProcessId(pipe: Handle, pid: OutSlot<number>): number;
-  GetNamedPipeInfo(pipe: Handle, flags: OutSlot<number>, outSize: null, inSize: null, maxInstances: null): number;
-  DisconnectNamedPipe(pipe: Handle): number;
-  GetFileInformationByHandleEx(handle: Handle, cls: number, buffer: Buffer, length: number): number;
-  GetFileType(handle: Handle): number;
-  /** Returns an NTSTATUS. */
-  NtQueryInformationProcess(process: Handle, cls: number, buffer: Buffer, length: number, returned: OutSlot<number>): number;
-  /** Returns an NTSTATUS. `ioStatus` is a 16-byte IO_STATUS_BLOCK. */
-  NtQueryInformationFile(handle: Handle, ioStatus: Buffer, buffer: Buffer, length: number, cls: number): number;
   OpenProcessToken(process: Handle, access: number, token: OutSlot<Handle>): number;
   GetTokenInformation(token: Handle, cls: number, buffer: Buffer | null, length: number, returned: OutSlot<number>): number;
   ConvertSidToStringSidW(sid: NativePointer, out: OutSlot<NativePointer>): number;
@@ -162,8 +125,6 @@ function bind(): Win32 {
   const advapi32 = koffi.load('advapi32.dll');
   const k = (definition: string) => kernel32.func(definition);
   const a = (definition: string) => advapi32.func(definition);
-  const ntdll = koffi.load('ntdll.dll');
-  const n = (definition: string) => ntdll.func(definition);
 
   // BOOL is declared as int, HANDLE as intptr_t, out pointers as `_Out_ void **`.
   const fns = {
@@ -173,21 +134,7 @@ function bind(): Win32 {
     CloseHandle: k('int CloseHandle(intptr_t handle)'),
     GetLastError: k('uint32_t GetLastError()'),
     LocalFree: k('void *LocalFree(void *memory)'),
-    WriteFile: k('int WriteFile(intptr_t handle, const void *data, uint32_t length, _Out_ uint32_t *written, void *overlapped)'),
     GetCurrentProcess: k('intptr_t GetCurrentProcess()'),
-    OpenProcess: k('intptr_t OpenProcess(uint32_t access, int inherit, uint32_t pid)'),
-    GetNamedPipeServerProcessId: k('int GetNamedPipeServerProcessId(intptr_t pipe, _Out_ uint32_t *pid)'),
-    GetNamedPipeClientProcessId: k('int GetNamedPipeClientProcessId(intptr_t pipe, _Out_ uint32_t *pid)'),
-    GetNamedPipeInfo: k('int GetNamedPipeInfo(intptr_t pipe, _Out_ uint32_t *flags, void *outSize, void *inSize, void *maxInstances)'),
-    DisconnectNamedPipe: k('int DisconnectNamedPipe(intptr_t pipe)'),
-    GetFileInformationByHandleEx: k('int GetFileInformationByHandleEx(intptr_t handle, int cls, void *buffer, uint32_t length)'),
-    GetFileType: k('uint32_t GetFileType(intptr_t handle)'),
-    NtQueryInformationProcess: n(
-      'int32_t NtQueryInformationProcess(intptr_t process, int cls, void *buffer, uint32_t length, _Out_ uint32_t *returned)',
-    ),
-    NtQueryInformationFile: n(
-      'int32_t NtQueryInformationFile(intptr_t handle, void *ioStatus, void *buffer, uint32_t length, int cls)',
-    ),
     OpenProcessToken: a('int OpenProcessToken(intptr_t process, uint32_t access, _Out_ intptr_t *token)'),
     GetTokenInformation: a(
       'int GetTokenInformation(intptr_t token, int cls, void *buffer, uint32_t length, _Out_ uint32_t *returned)',

@@ -17,7 +17,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "spike:pipe": "node spikes/pipe-security.ts",
+    "spike:pipe": "node spikes/pipe-auth.ts",
     "spike:sqlite": "node spikes/sqlite-wal-bench.ts"
   },
   "dependencies": {

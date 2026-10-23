@@ -8,19 +8,17 @@ export type {
   SqliteWorkerConfig,
   SynchronousMode,
 } from './db/sqlite-worker-protocol.ts';
-export { listenSecurePipe } from './ipc/secure-pipe-server.ts';
-export type { PipeClient, SecurePipeServer, SecurePipeServerOptions } from './ipc/secure-pipe-server.ts';
+export { createEngineToken, defaultTokenPath, readEngineToken, TOKEN_BYTES } from './ipc/engine-token.ts';
+export type { EngineToken } from './ipc/engine-token.ts';
+export { AUTH_PROTOCOL, connectAuthenticatedPipe, listenAuthenticatedPipe } from './ipc/pipe-auth.ts';
+export type { AuthenticatedPipeServer, AuthenticatedPipeServerOptions, AuthStats, ConnectOptions } from './ipc/pipe-auth.ts';
 export {
   allowedTrustees,
   currentUserOnlySddl,
-  disconnectPipeInstance,
-  findOwnPipeServerInstances,
   getCurrentUserSid,
-  getPipeServerUserSid,
-  getProcessUserSid,
-  readPipeSecurity,
-  setPipeDacl,
-  setPipeDaclOnHandle,
+  readFileSecurity,
+  restrictFileToCurrentUser,
+  setFileDacl,
   Win32Error,
-} from './platform/win32/pipe-security.ts';
-export type { CurrentUserOnlyOptions, PipeInstanceState, PipeSecurity, PipeServerInstance } from './platform/win32/pipe-security.ts';
+} from './platform/win32/security.ts';
+export type { ObjectSecurity } from './platform/win32/security.ts';
