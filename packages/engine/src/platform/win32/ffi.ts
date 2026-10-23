@@ -34,6 +34,13 @@ export const TOKEN_QUERY = 0x0008;
 export const TOKEN_USER_CLASS = 1;
 
 export const ERROR_ACCESS_DENIED = 5;
+export const ERROR_SHARING_VIOLATION = 32;
+export const GENERIC_READ = 0x80000000;
+export const GENERIC_WRITE = 0x40000000;
+export const OPEN_ALWAYS = 4;
+export const FILE_ATTRIBUTE_NORMAL = 0x80;
+export const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9;
+export const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000;
 export const ERROR_INSUFFICIENT_BUFFER = 122;
 
 export interface Win32 {
@@ -91,6 +98,9 @@ export interface Win32 {
     dacl: NativePointer,
     sacl: null,
   ): number;
+  CreateJobObjectW(securityAttributes: null, name: null): Handle;
+  SetInformationJobObject(job: Handle, infoClass: number, info: Buffer, length: number): number;
+  AssignProcessToJobObject(job: Handle, process: Handle): number;
   /** Reads a NUL-terminated UTF-16 string at a native pointer. */
   decodeString16(pointer: NativePointer): string;
   /** Reads a pointer stored at `offset` inside a buffer. */
@@ -155,6 +165,9 @@ function bind(): Win32 {
     SetSecurityInfo: a(
       'uint32_t SetSecurityInfo(intptr_t handle, int type, uint32_t info, void *owner, void *group, void *dacl, void *sacl)',
     ),
+    CreateJobObjectW: k('intptr_t CreateJobObjectW(void *sa, void *name)'),
+    SetInformationJobObject: k('int SetInformationJobObject(intptr_t job, int cls, void *info, uint32_t length)'),
+    AssignProcessToJobObject: k('int AssignProcessToJobObject(intptr_t job, intptr_t process)'),
   };
 
   return {

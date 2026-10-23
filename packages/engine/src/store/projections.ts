@@ -40,7 +40,7 @@ const projects: Projector = {
 
 const tickets: Projector = {
   name: 'tickets',
-  version: 3,
+  version: 4,
   tables: ['p_tickets', 'p_artifacts'],
   ddl: [
     `CREATE TABLE p_tickets (
@@ -59,9 +59,14 @@ const tickets: Projector = {
       attention TEXT
     ) STRICT`,
     'CREATE INDEX p_tickets_by_project ON p_tickets (project_id)',
-    // Artifact registry: every registration is kept; the latest per slot is the current one.
+    // Artifact registry (location + version): every registration (`artifact.add`, source 'added') and every
+    // artifact a finished execution handed on (source 'output', with its run and item) is kept.
     `CREATE TABLE p_artifacts (
-      sequence INTEGER PRIMARY KEY,
+      id INTEGER PRIMARY KEY,
+      sequence INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      exec_run INTEGER,
+      item INTEGER,
       ticket_id TEXT NOT NULL,
       node_id TEXT NOT NULL,
       slot TEXT NOT NULL,
@@ -132,8 +137,8 @@ function ticketStatements(event: DomainEvent): SqliteStatement[] {
         { sql: 'UPDATE p_tickets SET updated_at = ?, revision = ? WHERE ticket_id = ?', params: [event.timestamp, event.revision, event.data.ticketId] },
         {
           sql: `INSERT INTO p_artifacts
-                  (sequence, ticket_id, node_id, slot, kind, uri, version, title, mime_type, content_hash, run_id, lane, added_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  (sequence, source, ticket_id, node_id, slot, kind, uri, version, title, mime_type, content_hash, run_id, lane, added_at)
+                VALUES (?, 'added', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           params: [
             event.sequence,
             event.data.ticketId,
@@ -150,6 +155,35 @@ function ticketStatements(event: DomainEvent): SqliteStatement[] {
             event.timestamp,
           ],
         },
+      ];
+    }
+    case 'node.completed': {
+      const { data } = event;
+      return [
+        { sql: 'UPDATE p_tickets SET updated_at = ?, revision = ? WHERE ticket_id = ?', params: [event.timestamp, event.revision, event.aggregateId] },
+        ...data.output.items.flatMap((item, index) =>
+          Object.entries(item.artifacts ?? {}).map(([slot, ref]) => ({
+            sql: `INSERT INTO p_artifacts
+                    (sequence, source, exec_run, item, ticket_id, node_id, slot, kind, uri, version, title, mime_type, content_hash, lane, added_at)
+                  VALUES (?, 'output', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [
+              event.sequence,
+              data.run,
+              index,
+              data.ticketId,
+              data.nodeId,
+              slot,
+              ref.kind,
+              ref.uri,
+              ref.version ?? null,
+              ref.title ?? null,
+              ref.mimeType ?? null,
+              ref.contentHash ?? null,
+              data.lane,
+              event.timestamp,
+            ],
+          })),
+        ),
       ];
     }
     case 'ticket.completed':

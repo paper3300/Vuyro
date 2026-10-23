@@ -160,8 +160,11 @@ describe('AI-Native SDLC template', () => {
     expect(ticketRow).toMatchObject({ status: 'done', template_id: 'vuyro/ai-sdlc' });
 
     // The artifact registry kept every registration, attached to its lane by the run.
-    const changes = await h.store.query<{ uri: string; version: string }>("SELECT uri, version FROM p_artifacts WHERE slot = 'change' ORDER BY sequence");
+    const changes = await h.store.query<{ uri: string; version: string }>("SELECT uri, version FROM p_artifacts WHERE slot = 'change' AND source = 'added' ORDER BY sequence");
     expect(changes.map((row) => row.uri).sort()).toEqual(['repo:T1', 'repo:T2', 'repo:T2', 'repo:T3']);
+    // Outputs carry them on as well (source 'output'), one per finished Dev execution.
+    const outputs = await h.store.query<{ uri: string }>("SELECT uri FROM p_artifacts WHERE slot = 'change' AND source = 'output' AND node_id = 'dev'");
+    expect(outputs.map((row) => row.uri).sort()).toEqual(['repo:T1', 'repo:T2', 'repo:T2', 'repo:T3']);
 
     // Who did what: people approved, agents submitted, the engine routed.
     const events = await h.store.readAggregate(ticketId);

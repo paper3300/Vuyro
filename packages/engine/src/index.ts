@@ -72,3 +72,22 @@ export { endReached, ticketWaitReasons } from './workflow/machine.ts';
 export type { WaitReason } from './workflow/machine.ts';
 export type { Execution, Lane, NodeProgress, TicketWorkflow } from './workflow/state.ts';
 export { parseDuration } from './workflow/duration.ts';
+
+// M3: engine daemon, client, statistics.
+export { startEngineDaemon, engineVersion } from './daemon/daemon.ts';
+export type { EngineDaemon, EngineDaemonOptions } from './daemon/daemon.ts';
+export { daemonEntryPath, launchEngineDaemon } from './daemon/launch.ts';
+export type { LaunchOptions, LaunchResult } from './daemon/launch.ts';
+export { defaultDataDir, defaultPipePath, enginePaths } from './daemon/paths.ts';
+export type { EnginePaths } from './daemon/paths.ts';
+export { denyingApprover, windowsDialogApprover } from './daemon/approver.ts';
+export type { HumanApprover, PairingRequest } from './daemon/approver.ts';
+export { HumanCredentials } from './daemon/credentials.ts';
+export type { CredentialKind } from './daemon/credentials.ts';
+export { EngineQueries } from './daemon/queries.ts';
+export type { ArtifactRow, ProjectRow, TicketDetail, TicketRow } from './daemon/queries.ts';
+export { EngineClient, EngineRequestError, EngineUnavailableError, resolveEngineLocation } from './client/engine-client.ts';
+export type { EngineClientOptions } from './client/engine-client.ts';
+export { computeTicketStats, unionLength } from './stats/ticket-stats.ts';
+export type { NodeKind, TicketStatsInput } from './stats/ticket-stats.ts';
+export { bindDescendantsToProcess, DataDirectoryLockedError, lockDataDirectory } from './platform/win32/process-guard.ts';
