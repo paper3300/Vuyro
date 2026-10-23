@@ -12,6 +12,7 @@ export const PROTOCOL_VERSION = 1;
 export * from './commands.ts';
 export * from './errors.ts';
 export * from './events.ts';
+export * from './expressions.ts';
 export * from './handoff.ts';
 export * from './ids.ts';
 export * from './node-type.ts';
