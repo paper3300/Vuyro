@@ -35,8 +35,10 @@ import {
  * - Each input port: every item gets a lane. An item whose lineage leads back to one of the node's own
  *   lanes re-runs that lane (rework, e.g. QA rejected item 3); other items open new lanes in one group.
  * - Input over a back edge (one that closes a loop, like approval reject → spec) is rework of the target.
- * - Join nodes wait until every incoming edge has delivered and at least one delivered something new.
- * - An agent or script output with no items on a port that leads somewhere waits in Review (reason 'empty').
+ * - Join nodes wait until every source node (not every edge: a source's done and error edges are
+ *   alternatives) has delivered, and at least one delivered something new.
+ * - An agent or script output that would deliver nothing (no items, or no item passes any edge condition)
+ *   on a port that leads somewhere waits in Review (reason 'empty'), on every port, error included.
  *   Rejecting runs the node again; approving (or a person finishing a human node with no items) sends an
  *   empty delivery: a fan-out node passes over (empty group, passes the empty delivery on), a whole input
  *   runs with no items, a join fires with what it has.
@@ -230,19 +232,45 @@ function deliverEach(draft: WorkflowDraft, edgeIndex: number, source: Execution,
   });
 }
 
+/** Items a source node delivered over some edges: per lane of its current group, else from its latest run that used them. */
+function gatherFrom(draft: WorkflowDraft, source: string, edges: readonly number[]): HandoffItem[] {
+  const progress = nodeProgress(draft.state, source);
+  const pick = (exec: Execution): HandoffItem[] => edges.flatMap((index) => routedItems(draft, index, exec));
+  if (progress.group !== undefined) {
+    return progress.laneOrder.flatMap((name) => {
+      if (laneOf(draft.state, source, name)?.group !== progress.group) return [];
+      const exec = currentExecution(draft.state, source, name);
+      return exec === undefined ? [] : pick(exec);
+    });
+  }
+  const latest = progress.executions
+    .filter((exec) => exec.completedOrder !== undefined && edges.some((index) => Object.hasOwn(exec.routes, index)))
+    .sort((a, b) => (b.completedOrder ?? 0) - (a.completedOrder ?? 0))[0];
+  return latest === undefined ? [] : pick(latest);
+}
+
 function tryJoin(draft: WorkflowDraft, target: CompiledNode): void {
   const progress = nodeProgress(draft.state, target.id);
-  const delivered = target.incoming.map((index) => (Object.hasOwn(progress.deliveries, index) ? progress.deliveries[index] : undefined));
-  if (delivered.some((seq) => seq === undefined)) return;
-  if (!delivered.some((seq) => (seq ?? 0) > progress.consumed)) return;
+  const bySource = new Map<string, number[]>();
   for (const index of target.incoming) {
-    const source = draft.workflow.edges[index]?.edge.from.node ?? '';
+    const source = draft.workflow.edges[index]?.edge.from.node;
+    if (source !== undefined) bySource.set(source, [...(bySource.get(source) ?? []), index]);
+  }
+  const seqOf = (index: number): number | undefined => (Object.hasOwn(progress.deliveries, index) ? progress.deliveries[index] : undefined);
+  let fresh = false;
+  for (const [source, edges] of bySource) {
+    const seqs = edges.map(seqOf).filter((seq): seq is number => seq !== undefined);
+    if (seqs.length === 0) return;
+    if (seqs.some((seq) => seq > progress.consumed)) fresh = true;
     const group = nodeProgress(draft.state, source).group;
     if (group !== undefined && !groupSettled(draft, group)) return;
   }
+  if (!fresh) return;
   const inputs: Record<string, HandoffItem[]> = {};
   for (const port of target.inputs) {
-    inputs[port.name] = target.incoming.filter((index) => draft.workflow.edges[index]?.edge.to.port === port.name).flatMap((index) => gatherEdge(draft, index));
+    inputs[port.name] = [...bySource].flatMap(([source, edges]) =>
+      gatherFrom(draft, source, edges.filter((index) => draft.workflow.edges[index]?.edge.to.port === port.name)),
+    );
   }
   activate(draft, target.id, MAIN, 'input', inputs);
 }
@@ -281,16 +309,15 @@ export interface CompletionExtra {
 }
 
 /** Finishes an execution with an output and routes it. */
-export function complete(
-  draft: WorkflowDraft,
-  nodeId: string,
-  run: number,
-  output: NodeRunOutput,
-  status: 'done' | 'failed',
-  extra: CompletionExtra = {},
-): void {
-  const node = draft.node(nodeId);
-  const exec = draft.exec(nodeId, run);
+interface PlannedRoutes {
+  readonly routes: { edge: number; to: string; items: number[] }[];
+  readonly stale: { edge: number; to: string; items: number[] }[];
+  /** Set when the port leads somewhere but nothing would travel: every edge of the port then carries an empty delivery. */
+  readonly empty: { edge: number; to: string }[];
+}
+
+/** Which items an output sends over which edges of its port (conditions applied, stale items held back). */
+function planRoutes(draft: WorkflowDraft, node: CompiledNode, exec: Execution, output: NodeRunOutput): PlannedRoutes {
   const routes: { edge: number; to: string; items: number[] }[] = [];
   const stale: { edge: number; to: string; items: number[] }[] = [];
   const portEdges = node.outgoing.get(output.port) ?? [];
@@ -309,12 +336,31 @@ export function complete(
     if (old.length > 0) stale.push({ edge: edgeIndex, to: edge.edge.to.node, items: old });
   }
   const empty =
-    output.items.length === 0
+    routes.length === 0 && stale.length === 0
       ? portEdges.flatMap((edgeIndex) => {
           const edge = draft.workflow.edges[edgeIndex];
           return edge === undefined ? [] : [{ edge: edgeIndex, to: edge.edge.to.node }];
         })
       : [];
+  return { routes, stale, empty };
+}
+
+/** True when the output's port leads somewhere but the output would deliver nothing (D-016). */
+export function deliversNothing(draft: WorkflowDraft, node: CompiledNode, exec: Execution, output: NodeRunOutput): boolean {
+  return planRoutes(draft, node, exec, output).empty.length > 0;
+}
+
+export function complete(
+  draft: WorkflowDraft,
+  nodeId: string,
+  run: number,
+  output: NodeRunOutput,
+  status: 'done' | 'failed',
+  extra: CompletionExtra = {},
+): void {
+  const node = draft.node(nodeId);
+  const exec = draft.exec(nodeId, run);
+  const { routes, stale, empty } = planRoutes(draft, node, exec, output);
   draft.emit({
     type: 'node.completed',
     data: {
@@ -384,20 +430,46 @@ function propagateEmpty(draft: WorkflowDraft, edgeIndex: number, seen: Set<strin
   activateWhole(draft, target, port.name, [], edge.back);
 }
 
-export function completeTicketIfDone(draft: WorkflowDraft): void {
-  const { state, workflow } = draft;
-  if (state.status !== 'open') return;
-  const endDone = workflow.ends.some((id) => nodeProgress(state, id).executions.some((exec) => exec.status === 'done'));
-  if (!endDone) return;
+/** Why an open ticket whose end node finished is not done yet. Empty = it can complete. */
+export interface WaitReason {
+  readonly nodeId: string;
+  readonly lane: string;
+  readonly run: number;
+  /** 'active': someone (executor or person) still has to act. 'failed': a failure no error edge took; retry it. */
+  readonly kind: 'active' | 'failed';
+  readonly status: string;
+}
+
+/**
+ * The ticket-end invariant: once an end node has finished, the ticket is either completed or one of these
+ * reasons holds. Failed lanes of an older fan-out group do not count: a newer group replaced their work.
+ */
+export function ticketWaitReasons(state: TicketWorkflow, workflow: CompiledWorkflow): WaitReason[] {
+  const reasons: WaitReason[] = [];
   for (const nodeId of workflow.nodes.keys()) {
     const progress = nodeProgress(state, nodeId);
-    if (progress.executions.some((exec) => ACTIVE_STATUSES.has(exec.status))) return;
-    // A lane that failed and whose failure went nowhere (no error edge took it) still needs a person: retry it.
+    for (const exec of progress.executions) {
+      if (ACTIVE_STATUSES.has(exec.status)) reasons.push({ nodeId, lane: exec.lane, run: exec.run, kind: 'active', status: exec.status });
+    }
     for (const lane of progress.laneOrder) {
       const exec = currentExecution(state, nodeId, lane);
-      if (exec?.status === 'failed' && Object.keys(exec.routes).length === 0) return;
+      if (exec?.status !== 'failed' || Object.keys(exec.routes).length > 0) continue;
+      const group = laneOf(state, nodeId, lane)?.group;
+      if (group !== undefined && group !== progress.group) continue;
+      reasons.push({ nodeId, lane, run: exec.run, kind: 'failed', status: exec.status });
     }
   }
+  return reasons;
+}
+
+export function endReached(state: TicketWorkflow, workflow: CompiledWorkflow): boolean {
+  return workflow.ends.some((id) => nodeProgress(state, id).executions.some((exec) => exec.status === 'done'));
+}
+
+export function completeTicketIfDone(draft: WorkflowDraft): void {
+  const { state, workflow } = draft;
+  if (state.status !== 'open' || !endReached(state, workflow)) return;
+  if (ticketWaitReasons(state, workflow).length > 0) return;
   draft.emit({ type: 'ticket.completed', data: { ticketId: draft.ticketId } });
 }
 
@@ -514,8 +586,9 @@ export function finishWithOutput(draft: WorkflowDraft, node: CompiledNode, exec:
   const status = output.port === 'error' ? 'failed' : 'done';
   // A person finishing a human node decides for themselves, including "nothing to pass on".
   const executor = node.completion !== 'human';
-  const empty = executor && status === 'done' && output.items.length === 0 && (node.outgoing.get(output.port)?.length ?? 0) > 0;
-  if (status === 'done' && executor && (node.review === 'human' || empty)) {
+  // D-016 applies to every port that leads somewhere, the error port included.
+  const empty = executor && deliversNothing(draft, node, exec, output);
+  if (executor && (empty || (status === 'done' && node.review === 'human'))) {
     draft.emit({
       type: 'node.reviewRequested',
       data: { ticketId: draft.ticketId, nodeId: node.id, lane: exec.lane, run: exec.run, output, ...(empty ? { reason: 'empty' as const } : {}) },

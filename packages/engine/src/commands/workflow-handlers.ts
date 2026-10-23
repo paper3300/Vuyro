@@ -375,7 +375,8 @@ export const nodeApprove: CommandHandler<'node.approve', TicketState> = {
     if (node.completion !== 'human') {
       // Review gate: release the held output.
       if (exec.output === undefined) return fail('invariant_violated', `lane '${exec.lane}' of node '${node.id}' holds no output`);
-      complete(draft, node.id, exec.run, exec.output, 'done');
+      // A held error output (an empty one, D-016) stays a failure; approving only lets it travel.
+      complete(draft, node.id, exec.run, exec.output, exec.output.port === 'error' ? 'failed' : 'done');
       return decided(ticket, draft);
     }
     if (!node.outputs.has('approve')) return fail('invariant_violated', `node '${node.id}' has no 'approve' port; finish it with 'node.done'`);

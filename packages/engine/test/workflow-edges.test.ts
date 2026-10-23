@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { CommandResponse, DefinitionEnvelope, TemplateDefinition, TemplateEdge, TemplateNode } from '@vuyro/contracts';
 import type { WorkspaceTarget } from '../src/workflow/engine.ts';
 import type { ScriptedBehavior } from '../src/workflow/scripted-agent.ts';
+import { endReached, ticketWaitReasons } from '../src/workflow/machine.ts';
 import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
 import { nextRequestId } from './helpers/engine-harness.ts';
 import { HUMAN, openWorkflowHarness, type WorkflowHarness } from './helpers/workflow-harness.ts';
@@ -85,6 +86,120 @@ describe('routing edge cases', () => {
     expect(state.status).toBe('done');
     events = await h.store.readAggregate(ticketId);
     expect(events.filter((event) => event.type === 'node.passedOver').map((event) => event.data.nodeId)).toEqual(['work']);
+  });
+
+  it('holds an empty output on a connected error port too; approving it lets the failure travel and closes the ticket', async () => {
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        expectOk(await s.vuyro('node.done', { ticketId: s.request.ticketId, nodeId: s.request.nodeId, port: 'error', items: [] }));
+        return undefined;
+      },
+    });
+    await save(h, template('myteam/error-empty', [agent('write'), { id: 'end', type: 'vuyro.end', version: 1 }], [edge('write', 'done', 'end'), edge('write', 'error', 'end')]));
+    const ticketId = await ticketFor(h, 'myteam/error-empty');
+    await h.drive();
+    expect(await h.status(ticketId, 'write')).toBe('review');
+    const held = (await h.store.readAggregate(ticketId)).find((event) => event.type === 'node.reviewRequested');
+    expect(held?.data).toMatchObject({ reason: 'empty', output: { port: 'error', items: [] } });
+    await h.ok('node.approve', { ticketId, nodeId: 'write' });
+    await h.drive();
+    const state = await h.ticket(ticketId);
+    expect(currentExecution(state, 'write', 'main')?.status).toBe('failed');
+    expect(await h.status(ticketId, 'end')).toBe('done');
+    expect(state.status).toBe('done');
+  });
+
+  it('lets an end node fed by both the done and the error port finish on either', async () => {
+    let fail = true;
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        if (fail) throw new Error('crashed');
+        expectOk(await s.vuyro('node.done', { ticketId: s.request.ticketId, nodeId: s.request.nodeId, port: 'done' }));
+        return undefined;
+      },
+    });
+    await save(h, template('myteam/either', [agent('write'), { id: 'end', type: 'vuyro.end', version: 1 }], [edge('write', 'done', 'end'), edge('write', 'error', 'end')]));
+    const failing = await ticketFor(h, 'myteam/either');
+    await h.drive();
+    expect(currentExecution(await h.ticket(failing), 'write', 'main')?.status).toBe('failed');
+    expect((await h.ticket(failing)).status).toBe('done');
+    fail = false;
+    const passing = await ticketFor(h, 'myteam/either');
+    await h.drive();
+    expect((await h.ticket(passing)).status).toBe('done');
+  });
+
+  it('holds an output whose items pass no edge condition, like an empty one', async () => {
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        expectOk(await s.vuyro('node.done', { ticketId: s.request.ticketId, nodeId: s.request.nodeId, port: 'done', items: [{ data: { size: 1 } }] }));
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/filtered',
+        [agent('write'), { id: 'end', type: 'vuyro.end', version: 1 }],
+        [{ ...edge('write', 'done', 'end'), when: { op: 'gt', left: { path: 'item.data.size' }, right: { value: 5 } } }],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/filtered');
+    await h.drive();
+    expect(await h.status(ticketId, 'write')).toBe('review');
+    await h.ok('node.approve', { ticketId, nodeId: 'write' });
+    await h.drive();
+    expect((await h.ticket(ticketId)).status).toBe('done');
+  });
+
+  it('does not let a failed lane of a replaced plan keep the ticket open', async () => {
+    let planRun = 0;
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId } = s.request;
+        if (nodeId === 'plan') {
+          planRun += 1;
+          const prefix = planRun === 1 ? 'T' : 'U';
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [1, 2].map((n) => ({ data: { taskId: `${prefix}${n}` } })) }));
+          return undefined;
+        }
+        const taskId = /task (\w+)/.exec(s.request.prompt)?.[1] ?? '?';
+        if (taskId === 'T2') throw new Error('crashed');
+        expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { taskId } }));
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/replan-fail',
+        [
+          { id: 'start', type: 'vuyro.human-task', version: 1 },
+          { id: 'replan', type: 'vuyro.human-task', version: 1 },
+          agent('plan'),
+          agent('dev', 'task {{ nodes.plan.item.data.taskId }}', { ports: { in: { mode: 'each' } } }),
+          { id: 'join', type: 'vuyro.join', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [edge('start', 'done', 'plan'), edge('replan', 'done', 'plan'), edge('plan', 'done', 'dev'), edge('dev', 'done', 'join'), edge('join', 'done', 'end')],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/replan-fail');
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.drive();
+    let state = await h.ticket(ticketId);
+    expect(currentExecution(state, 'dev', '2')?.status).toBe('failed');
+    expect(await h.status(ticketId, 'end')).toBe('done');
+    if (state.template === undefined) throw new Error('no template');
+    const workflow = await h.registry.workflow(state.template);
+    expect(endReached(state, workflow)).toBe(true);
+    expect(ticketWaitReasons(state, workflow).map((reason) => `${reason.kind}:${reason.nodeId}/${reason.lane}`).sort()).toEqual(['active:replan/main', 'failed:dev/2']);
+    // A new plan replaces the failed task; its old lane no longer holds the ticket open.
+    await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
+    await h.drive();
+    state = await h.ticket(ticketId);
+    expect(nodeProgress(state, 'join').executions.at(-1)?.output?.items.map((item) => item.data.taskId)).toEqual(['U1', 'U2']);
+    expect(state.status).toBe('done');
   });
 
   it('lets a person finish a human node with no items, which skips what it would feed', async () => {

@@ -12,6 +12,7 @@ import { installBuiltins } from '../../src/workflow/builtins.ts';
 import { DefinitionWriter } from '../../src/workflow/definition-writer.ts';
 import { DefinitionRegistry } from '../../src/workflow/definitions.ts';
 import { WorkflowEngine, type WorkflowEngineOptions } from '../../src/workflow/engine.ts';
+import { endReached, ticketWaitReasons } from '../../src/workflow/machine.ts';
 import { type ScriptedBehavior, ScriptedAgentAdapter } from '../../src/workflow/scripted-agent.ts';
 import { currentExecution, evolveTicket, EMPTY_TICKET, laneStatus, nodeProgress, type TicketWorkflow } from '../../src/workflow/state.ts';
 import { HUMAN, nextRequestId, SYSTEM, tempDir } from './engine-harness.ts';
@@ -42,8 +43,16 @@ export interface WorkflowHarness {
   setBehavior(behavior: ScriptedBehavior): void;
   exec(type: string, payload: unknown, transport?: TransportIdentity, extra?: Record<string, unknown>): Promise<CommandResponse>;
   ok(type: string, payload: unknown, transport?: TransportIdentity, extra?: Record<string, unknown>): Promise<CommandSuccess>;
-  /** Runs until nothing is left to do but wait for time that no timer will bring. */
+  /**
+   * Runs until nothing is left to do but wait for time that no timer will bring, then checks the
+   * ticket-end invariant on every ticket (see `checkTicketEnds`).
+   */
   drive(limit?: number): Promise<void>;
+  /**
+   * Ticket-end invariant: an open ticket always has a wait reason (active work or an unhandled failure).
+   * In particular a ticket whose end node finished is either completed or waits for something named.
+   */
+  checkTicketEnds(): Promise<void>;
   ticket(ticketId: string): Promise<TicketWorkflow>;
   status(ticketId: string, nodeId: string, lane?: string): Promise<string>;
   /** Closes and reopens everything on the same database and files (an engine restart). */
@@ -135,10 +144,30 @@ export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}):
       for (let step = 0; step < limit; step++) {
         await activity.idle();
         const next = clock.nextDueAt();
-        if (next === undefined) return;
+        if (next === undefined) {
+          await harness.checkTicketEnds();
+          return;
+        }
         await clock.advanceTo(next);
       }
       throw new Error('drive: too many steps');
+    },
+    async checkTicketEnds() {
+      const rows = await parts.store.query<{ ticket_id: string }>("SELECT ticket_id FROM p_tickets WHERE status = 'open' AND template_id IS NOT NULL");
+      for (const { ticket_id: ticketId } of rows) {
+        const state = await harness.ticket(ticketId);
+        if (state.template === undefined) continue;
+        let workflow;
+        try {
+          workflow = await parts.registry.workflow(state.template);
+        } catch {
+          continue; // Tests that tamper with definition files check that on their own.
+        }
+        if (ticketWaitReasons(state, workflow).length === 0) {
+          const where = endReached(state, workflow) ? 'an end node finished' : 'no end node finished';
+          throw new Error(`ticket ${ticketId}: ${where} and nothing is waiting, but the ticket is still open (stuck)`);
+        }
+      }
     },
     async ticket(ticketId) {
       let state = EMPTY_TICKET;

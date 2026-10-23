@@ -245,7 +245,11 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
         ...current,
         status: data.status,
         output: data.output,
-        routes: Object.fromEntries(data.routes.map((route) => [route.edge, route.items])),
+        // Empty deliveries count as routes with no items: the output did go somewhere.
+        routes: Object.fromEntries([
+          ...(data.empty ?? []).map((entry): [number, readonly number[]] => [entry.edge, []]),
+          ...data.routes.map((route): [number, readonly number[]] => [route.edge, route.items]),
+        ]),
         completedOrder: completions,
       }));
       // Record deliveries per target edge (empty ones too); targets read them to decide when to fire.

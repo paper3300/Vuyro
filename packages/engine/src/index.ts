@@ -68,5 +68,7 @@ export { ScriptedAgentAdapter } from './workflow/scripted-agent.ts';
 export type { ScriptedAgentOptions, ScriptedBehavior, ScriptedSession } from './workflow/scripted-agent.ts';
 export { ancestorsOf, executionContext } from './workflow/context.ts';
 export { currentExecution, EMPTY_TICKET, evolveTicket, laneStatus, nodeProgress } from './workflow/state.ts';
+export { endReached, ticketWaitReasons } from './workflow/machine.ts';
+export type { WaitReason } from './workflow/machine.ts';
 export type { Execution, Lane, NodeProgress, TicketWorkflow } from './workflow/state.ts';
 export { parseDuration } from './workflow/duration.ts';
