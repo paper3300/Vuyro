@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Vuyro 시안 11 그래프와 티켓 에이전트</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0;background:#0d0f13}
+a{color:#6aa6ff}a:hover{color:#9cc3ff}
+</style>
+</helmet>
+<div style="width: 100%; min-height: 900px; box-sizing: border-box; display: flex; flex-wrap: wrap; background: #0d0f13; color: #e7e9ee; font-family: 'IBM Plex Sans KR', system-ui, sans-serif; font-size: 14px">
+
+  <div style="flex: 999 1 1440px; min-width: 0; overflow: hidden">
+    <dc-import name="Main" hint-size="100%,900px"></dc-import>
+  </div>
+
+  <aside style="flex: 1 0 400px; max-width: 420px; box-sizing: border-box; min-height: 900px; background: #101217; border-left: 1px solid #2a303b; display: flex; flex-direction: column" aria-label="Vuyro 에이전트">
+    <div style="padding: 14px 16px; border-bottom: 1px solid #23282f; display: flex; flex-direction: column; gap: 10px">
+      <div style="display: flex; align-items: center; gap: 10px">
+        <span style="width: 28px; height: 28px; border-radius: 8px; background: #6aa6ff; color: #0d0f13; font-weight: 700; display: flex; align-items: center; justify-content: center">A</span>
+        <span style="font-weight: 700; font-size: 15px">Vuyro Agent</span>
+        <div style="flex: 1"></div>
+        <button style="height: 28px; padding: 0 10px; border-radius: 7px; border: 1px solid #2a303b; background: #1b2029; color: #e7e9ee; font: inherit; font-size: 12.5px">범위: T-0012 ▾</button>
+        <button aria-label="패널 닫기" style="width: 28px; height: 28px; border-radius: 7px; border: 1px solid #2a303b; background: transparent; color: #a0a9b8; font: inherit">×</button>
+      </div>
+      <div style="display: flex; gap: 6px; flex-wrap: wrap">
+        <sc-for list="{{ctx}}" as="c" hint-placeholder-count="3">
+          <span style="font-family: 'JetBrains Mono', monospace; font-size: 11.5px; padding: 3px 9px; border-radius: 12px; background: #1a2740; color: #cfe1ff; border: 1px solid #2c4470">{{c}}</span>
+        </sc-for>
+        <button style="height: 24px; padding: 0 9px; border-radius: 12px; border: 1px dashed #3a4250; background: transparent; color: #a0a9b8; font: inherit; font-size: 11.5px">+ 컨텍스트</button>
+      </div>
+    </div>
+
+    <div style="flex: 1; padding: 16px; display: flex; flex-direction: column; gap: 14px">
+      <sc-for list="{{msgs}}" as="m" hint-placeholder-count="5">
+        <sc-if value="{{m.isUser}}" hint-placeholder-val="{{false}}">
+          <div style="align-self: flex-end; max-width: 300px; background: #22304a; color: #e7e9ee; padding: 10px 13px; border-radius: 12px 12px 4px 12px; line-height: 1.55">{{m.text}}</div>
+        </sc-if>
+        <sc-if value="{{m.isTools}}" hint-placeholder-val="{{false}}">
+          <div style="border: 1px solid #23282f; border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 5px; background: #0c0e12">
+            <span style="font-size: 12px; color: #a0a9b8">{{m.title}}</span>
+            <sc-for list="{{m.items}}" as="t" hint-placeholder-count="3">
+              <span style="font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: #b9c2d0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">{{t}}</span>
+            </sc-for>
+          </div>
+        </sc-if>
+        <sc-if value="{{m.isAgent}}" hint-placeholder-val="{{true}}">
+          <div style="line-height: 1.6; color: #dfe3ea; white-space: pre-line">{{m.text}}</div>
+        </sc-if>
+        <sc-if value="{{m.isProposal}}" hint-placeholder-val="{{false}}">
+          <div style="border: 1px solid #2c4470; background: #131c2c; border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 8px">
+            <span style="font-size: 12px; font-weight: 700; color: #9cc3ff">실행할 작업 · 확인 필요</span>
+            <sc-for list="{{m.items}}" as="a" hint-placeholder-count="2">
+              <div style="display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 8px; background: #0f1520">
+                <span style="font-size: 13px">{{a.label}}</span>
+                <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #a0a9b8">{{a.cmd}}</span>
+              </div>
+            </sc-for>
+            <div style="display: flex; gap: 8px">
+              <button style="flex: 1; height: 34px; border-radius: 8px; border: none; background: #6aa6ff; color: #0d0f13; font: inherit; font-weight: 700">실행</button>
+              <button style="flex: 1; height: 34px; border-radius: 8px; border: 1px solid #2a303b; background: #1b2029; color: #e7e9ee; font: inherit">수정</button>
+            </div>
+          </div>
+        </sc-if>
+      </sc-for>
+    </div>
+
+    <div style="padding: 12px 16px 16px; border-top: 1px solid #23282f; display: flex; flex-direction: column; gap: 10px">
+      <label style="display: flex; flex-direction: column; gap: 0; background: #151920; border: 1px solid #2f3643; border-radius: 12px; padding: 10px 12px">
+        <span style="position: absolute; left: -9999px">에이전트에게 메시지</span>
+        <textarea rows="2" placeholder="무엇을 할까요?  @로 티켓 · 노드 · 산출물 지정" style="font: inherit; background: transparent; border: none; outline: none; color: #e7e9ee; resize: none"></textarea>
+      </label>
+      <div style="display: flex; align-items: center; gap: 8px">
+        <div style="display: flex; background: #151920; border: 1px solid #2a303b; border-radius: 8px; padding: 2px" role="group" aria-label="에이전트 권한">
+          <button style="height: 26px; padding: 0 9px; border-radius: 6px; border: none; background: transparent; color: #a0a9b8; font: inherit; font-size: 12px">질문만</button>
+          <button style="height: 26px; padding: 0 9px; border-radius: 6px; border: none; background: #2a3550; color: #e7e9ee; font: inherit; font-size: 12px; font-weight: 600">실행 전 확인</button>
+          <button style="height: 26px; padding: 0 9px; border-radius: 6px; border: none; background: transparent; color: #a0a9b8; font: inherit; font-size: 12px">자동</button>
+        </div>
+        <div style="flex: 1"></div>
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: #8a94a3">6.2k tok · $0.09</span>
+      </div>
+    </div>
+  </aside>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1840,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const base = { isUser: false, isAgent: false, isTools: false, isProposal: false };
+    const u = (text) => Object.assign({}, base, { isUser: true, text });
+    const ag = (text) => Object.assign({}, base, { isAgent: true, text });
+    const tools = (title, items) => Object.assign({}, base, { isTools: true, title, items });
+    const prop = (items) => Object.assign({}, base, { isProposal: true, items });
+    return {
+      ctx: ['@T-0012', '@Dev A', '@spec.md v3'],
+      msgs: [
+        u('@Dev A 왜 이렇게 오래 걸려? 지난번 비슷한 티켓보다 두 배야'),
+        tools('확인한 것 · 도구 4회', ['vuyro node logs T-0012/dev-a --tail 200', 'vuyro node metrics T-0012/dev-a', 'vuyro stats --template sdlc --node dev', 'vuyro artifact diff spec.md v2 v3']),
+        ag('원인은 두 가지입니다.\n1. 전체 빌드를 4번 돌렸습니다 (각 2분 10초, 전체의 70%).\n2. CR-3로 정렬 기준이 늘어 수정 범위가 Spec v2보다 커졌습니다.\n\n증분 빌드로 바꾸면 남은 작업은 약 5분이면 끝날 것 같습니다.'),
+        prop([
+          { label: 'Dev A 빌드 방식을 증분 빌드로 변경', cmd: 'vuyro node config T-0012/dev-a build=incremental' },
+          { label: 'Dev A에게 지시 추가: 빌드는 마지막에 1회만', cmd: 'vuyro node message T-0012/dev-a "…"' }
+        ])
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

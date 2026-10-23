@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Vuyro 시안 07 관제실</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;700&amp;display=swap">
+<style>
+body{margin:0;background:#07080a}
+a{color:#5ee0c0}a:hover{color:#a2f0dc}
+</style>
+</helmet>
+<div style="width: 100%; min-height: 900px; box-sizing: border-box; display: flex; flex-direction: column; gap: 16px; padding: 20px 24px; background: #07080a; color: #e4e7eb; font-family: 'IBM Plex Sans KR', system-ui, sans-serif; font-size: 14px">
+
+  <header style="display: flex; align-items: center; gap: 24px; flex-wrap: wrap">
+    <div style="display: flex; align-items: center; gap: 10px">
+      <span style="width: 10px; height: 10px; border-radius: 50%; background: #5ee0c0; box-shadow: 0 0 0 4px #5ee0c033"></span>
+      <h1 style="margin: 0; font-size: 18px; font-weight: 700; letter-spacing: 0.5px">VUYRO 관제실</h1>
+      <span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #9aa3ad">LIVE · 14:20:31</span>
+    </div>
+    <div style="flex: 1"></div>
+    <sc-for list="{{counters}}" as="c" hint-placeholder-count="5">
+      <div style="display: flex; flex-direction: column; align-items: flex-end">
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; color: {{c.color}}">{{c.value}}</span>
+        <span style="font-size: 11.5px; color: #9aa3ad">{{c.label}}</span>
+      </div>
+    </sc-for>
+  </header>
+
+  <div style="display: grid; grid-template-columns: repeat(3, minmax(320px, 1fr)); gap: 14px; flex: 1; overflow-x: auto">
+    <sc-for list="{{tiles}}" as="t" hint-placeholder-count="6">
+      <section style="{{t.box}}">
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px">
+          <span style="display: flex; gap: 8px; align-items: center">
+            <span style="{{t.agentBadge}}">{{t.agent}}</span>
+            <span style="font-weight: 600; font-size: 13.5px">{{t.where}}</span>
+          </span>
+          <span style="{{t.statusStyle}}">{{t.status}}</span>
+        </div>
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: #e4e7eb">{{t.action}}</span>
+        <div style="flex: 1; background: #050607; border: 1px solid #1c2026; border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: #9aa3ad; min-height: 96px">
+          <sc-for list="{{t.log}}" as="ln" hint-placeholder-count="4">
+            <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis">{{ln}}</span>
+          </sc-for>
+        </div>
+        <div style="display: flex; align-items: flex-end; gap: 2px; height: 24px" aria-hidden="true">
+          <sc-for list="{{t.spark}}" as="b" hint-placeholder-count="24">
+            <span style="{{b}}"></span>
+          </sc-for>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #c3c9d1">
+          <span>{{t.time}}</span><span>{{t.tok}}</span><span>{{t.cost}}</span><span>{{t.tools}}</span>
+        </div>
+        <sc-if value="{{t.hasAction}}" hint-placeholder-val="{{false}}">
+          <div style="display: flex; gap: 8px">
+            <button style="flex: 1; height: 34px; border-radius: 8px; border: 1px solid #3a2f17; background: #2a2210; color: #ffd27a; font: inherit; font-weight: 600">{{t.btn1}}</button>
+            <button style="flex: 1; height: 34px; border-radius: 8px; border: 1px solid #2a2f37; background: #12151a; color: #e4e7eb; font: inherit">{{t.btn2}}</button>
+          </div>
+        </sc-if>
+      </section>
+    </sc-for>
+  </div>
+
+  <footer style="display: flex; gap: 22px; align-items: center; border-top: 1px solid #1c2026; padding-top: 12px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #9aa3ad; overflow-x: auto; white-space: nowrap">
+    <span style="color: #5ee0c0; font-weight: 700">EVENTS</span>
+    <span>14:20:12  T-0012 Dev A  tool Edit InventorySort.cpp</span>
+    <span>14:19:40  T-0021  budget_exceeded → paused</span>
+    <span>14:18:02  T-0015  QA AgentD settled · 12/12 pass</span>
+    <span>14:17:55  T-0026  Plan  usage 3.1k tok</span>
+  </footer>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const badge = (c) => 'font-family: \'JetBrains Mono\', monospace; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 5px; color: #07080a; background: ' + c;
+    const status = (c) => 'font-size: 11.5px; font-weight: 700; padding: 2px 8px; border-radius: 10px; color: ' + c + '; background: ' + c + '1f; border: 1px solid ' + c + '55';
+    const spark = (vals, c) => vals.map((v) => 'flex: 1; border-radius: 1px; height: ' + v + '%; background: ' + c);
+    const tile = (o) => Object.assign({ hasAction: false, box: 'background: #0e1013; border: 1px solid ' + (o.border || '#1c2026') + '; border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 10px' }, o);
+    const CL = '#d9a77a', CX = '#8fb4ff';
+    const run = '#5ee0c0', warn = '#ffcf6b', bad = '#ff9a6b', idle = '#9aa3ad';
+    return {
+      counters: [
+        { label: '실행 중', value: '3', color: run }, { label: '사람 대기', value: '2', color: warn },
+        { label: '정지', value: '1', color: bad }, { label: '오늘 토큰', value: '1.21M', color: '#e4e7eb' }, { label: '오늘 비용', value: '$12.40', color: '#e4e7eb' }
+      ],
+      tiles: [
+        tile({ agent: 'CLAUDE', agentBadge: badge(CL), where: 'T-0012 · Dev A 코드', status: 'RUNNING', statusStyle: status(run), action: '▸ Edit Source/Inventory/InventorySort.cpp',
+          log: ['read  InventorySort.h (212 lines)', 'grep  "ESortType" → 6 hits', 'edit  +48 −12  InventorySort.cpp', 'bash  UnrealBuildTool … 2m 10s ok'],
+          spark: spark([20, 35, 30, 60, 45, 80, 70, 40, 55, 90, 65, 50, 30, 45, 70, 85, 60, 40, 35, 55, 75, 60, 50, 65], run), time: '12m30s', tok: '45.2k', cost: '$0.82', tools: '23 calls' }),
+        tile({ agent: 'CODEX', agentBadge: badge(CX), where: 'T-0026 · Plan', status: 'RUNNING', statusStyle: status(run), action: '▸ 생각 중 · plan.md 3단계 작성',
+          log: ['read  spec.md v2', 'read  Source/Friend/ (14 files)', 'write plan.md  §1–§2', 'thinking …'],
+          spark: spark([10, 20, 25, 30, 20, 40, 35, 30, 50, 45, 40, 30, 35, 40, 55, 50, 45, 40, 30, 35, 40, 45, 50, 40], run), time: '6m05s', tok: '18.9k', cost: '$0.31', tools: '9 calls' }),
+        tile({ agent: 'CLAUDE', agentBadge: badge(CL), where: 'T-0018 · Spec 보조', status: 'NO RESPONSE 3m', statusStyle: status(warn), border: '#4a3c16', action: '▸ Bash  python validate_quest.py  (멈춤)',
+          log: ['bash  python validate_quest.py', '… 출력 없음 3m 12s', '', ''],
+          spark: spark([40, 50, 45, 30, 20, 10, 5, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3], warn), time: '9m44s', tok: '11.0k', cost: '$0.19', tools: '7 calls',
+          hasAction: true, btn1: '턴 강제 종료', btn2: '로그 보기' }),
+        tile({ agent: 'CLAUDE', agentBadge: badge(CL), where: 'T-0015 · QA 최종', status: 'WAITING · 사람', statusStyle: status(warn), border: '#4a3c16', action: '▸ AgentD 통과 12/12 · 사람 확인 대기 3h 15m',
+          log: ['settled  outcome=pass', 'artifact  review.md', 'artifact  screenshots ×4', 'attention  QA 최종 확인'],
+          spark: spark([60, 70, 65, 50, 40, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], idle), time: '45m', tok: '33.4k', cost: '$0.61', tools: '31 calls',
+          hasAction: true, btn1: '확인하기', btn2: '리뷰 열기' }),
+        tile({ agent: 'CODEX', agentBadge: badge(CX), where: 'T-0021 · 재작업', status: 'PAUSED · 예산', statusStyle: status(bad), border: '#4a2a1c', action: '▸ budget_exceeded  $2.00 상한',
+          log: ['edit  LoginFlow.cpp  +9 −3', 'bash  run tests … 1 fail', 'edit  LoginFlow.cpp  +2 −1', 'paused  budget $2.00 / $2.00'],
+          spark: spark([30, 45, 60, 70, 80, 75, 85, 90, 70, 60, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bad), time: '1h05m', tok: '64.1k', cost: '$2.00', tools: '44 calls',
+          hasAction: true, btn1: '+$1.00 계속', btn2: '중단' }),
+        tile({ agent: 'CLAUDE', agentBadge: badge(CL), where: 'T-0012 · Dev C 데이터', status: 'STALE', statusStyle: status(idle), action: '▸ Spec v3 변경으로 재실행 대기',
+          log: ['settled  (Spec v2 기준)', 'artifact  DT_Item.csv', 'stale  spec.md v2 → v3', ''],
+          spark: spark([40, 50, 60, 55, 45, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], idle), time: '4m02s', tok: '12.4k', cost: '$0.21', tools: '9 calls',
+          hasAction: true, btn1: '재실행', btn2: '무시' })
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

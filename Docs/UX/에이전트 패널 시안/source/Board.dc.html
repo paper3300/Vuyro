@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Vuyro 시안 02 칸반 보드</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0;background:#f4f5f8}
+a{color:#1d5fd1}a:hover{color:#163f8c}
+</style>
+</helmet>
+<div style="width: 100%; min-height: 900px; box-sizing: border-box; display: flex; flex-direction: column; background: #f4f5f8; color: #1c2029; font-family: 'IBM Plex Sans KR', system-ui, sans-serif; font-size: 14px">
+
+  <header style="flex: none; display: flex; align-items: center; gap: 20px; padding: 14px 28px; background: #ffffff; border-bottom: 1px solid #e3e6eb; flex-wrap: wrap">
+    <div style="display: flex; align-items: center; gap: 10px">
+      <div style="width: 28px; height: 28px; border-radius: 8px; background: #1c2029; color: #ffffff; font-weight: 700; display: flex; align-items: center; justify-content: center">V</div>
+      <span style="font-weight: 700; font-size: 17px">SampleGame</span>
+      <span style="color: #5d6675">/ 티켓 보드</span>
+    </div>
+    <nav style="display: flex; gap: 4px; background: #eef0f4; padding: 4px; border-radius: 10px" aria-label="보기 전환">
+      <button style="height: 30px; padding: 0 14px; border-radius: 7px; border: none; background: #ffffff; color: #1c2029; font: inherit; font-weight: 600; box-shadow: 0 1px 2px #0000001a">보드</button>
+      <button style="height: 30px; padding: 0 14px; border-radius: 7px; border: none; background: transparent; color: #5d6675; font: inherit">그래프</button>
+      <button style="height: 30px; padding: 0 14px; border-radius: 7px; border: none; background: transparent; color: #5d6675; font: inherit">타임라인</button>
+    </nav>
+    <div style="flex: 1"></div>
+    <button style="height: 34px; padding: 0 12px; border-radius: 8px; border: 1px solid #d5d9e0; background: #ffffff; color: #1c2029; font: inherit">템플릿: 전체 ▾</button>
+    <button style="height: 34px; padding: 0 12px; border-radius: 8px; border: 1px solid #d5d9e0; background: #ffffff; color: #1c2029; font: inherit">담당: 나 ▾</button>
+    <button style="height: 34px; padding: 0 16px; border-radius: 8px; border: none; background: #1d5fd1; color: #ffffff; font: inherit; font-weight: 600">+ 새 티켓</button>
+  </header>
+
+  <div style="flex: none; display: flex; gap: 24px; padding: 14px 28px 0; flex-wrap: wrap; font-size: 13px; color: #5d6675">
+    <span><b style="color: #b45309">내 승인 2건</b> 대기 중</span>
+    <span>실행 중 에이전트 <b style="color: #1d5fd1">3</b></span>
+    <span>이번 주 비용 <b style="color: #1c2029; font-family: 'JetBrains Mono', monospace">$48.20</b></span>
+    <span>평균 리드타임 <b style="color: #1c2029; font-family: 'JetBrains Mono', monospace">1.8일</b></span>
+  </div>
+
+  <div style="flex: 1; overflow-x: auto; padding: 16px 28px 28px">
+    <div style="display: grid; grid-template-columns: repeat(6, minmax(210px, 1fr)); gap: 14px; min-width: 1320px; align-items: start">
+      <sc-for list="{{cols}}" as="col" hint-placeholder-count="6">
+        <section style="background: #eaecf1; border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 10px; min-height: 640px">
+          <div style="display: flex; justify-content: space-between; align-items: center; padding: 2px 4px">
+            <span style="font-weight: 700">{{col.name}}</span>
+            <span style="font-size: 12px; color: #5d6675">{{col.count}}</span>
+          </div>
+          <span style="{{col.gateStyle}}">{{col.gate}}</span>
+          <sc-for list="{{col.cards}}" as="c" hint-placeholder-count="2">
+            <article style="{{c.cardStyle}}">
+              <div style="display: flex; justify-content: space-between; align-items: center">
+                <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #5d6675">{{c.id}}</span>
+                <span style="font-size: 11px; color: #5d6675">{{c.tpl}}</span>
+              </div>
+              <span style="font-weight: 600; line-height: 1.35">{{c.title}}</span>
+              <div style="display: flex; gap: 3px" aria-label="노드 진행">
+                <sc-for list="{{c.segs}}" as="s" hint-placeholder-count="8">
+                  <span style="{{s}}"></span>
+                </sc-for>
+              </div>
+              <div style="display: flex; gap: 6px; flex-wrap: wrap">
+                <sc-for list="{{c.chips}}" as="ch" hint-placeholder-count="2">
+                  <span style="{{ch.style}}">{{ch.label}}</span>
+                </sc-for>
+              </div>
+              <sc-if value="{{c.hasBadge}}" hint-placeholder-val="{{false}}">
+                <span style="{{c.badgeStyle}}">{{c.badge}}</span>
+              </sc-if>
+              <div style="display: flex; justify-content: space-between; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: #5d6675; border-top: 1px solid #eef0f4; padding-top: 8px">
+                <span>{{c.time}}</span><span>{{c.cost}}</span>
+              </div>
+            </article>
+          </sc-for>
+        </section>
+      </sc-for>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const C = { human: '#b45309', agent: '#1d5fd1', done: '#18794e', rej: '#c2410c', stale: '#5b6472', wait: '#c9ced6' };
+    const seg = (c) => 'flex: 1; height: 6px; border-radius: 3px; background: ' + c;
+    const segs = (s) => s.split('').map((k) => seg({ d: C.done, r: C.agent, h: C.human, x: C.rej, s: '#9aa1ad', w: C.wait }[k]));
+    const chip = (label, c) => ({ label, style: 'font-size: 11.5px; font-weight: 600; padding: 2px 8px; border-radius: 10px; color: ' + c + '; background: ' + c + '14; border: 1px solid ' + c + '40' });
+    const badge = (t, c) => ({ hasBadge: true, badge: t, badgeStyle: 'align-self: flex-start; font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 6px; color: #ffffff; background: ' + c });
+    const card = (o) => Object.assign({ hasBadge: false, cardStyle: 'background: #ffffff; border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px; border: 1px solid ' + (o.hl || '#e3e6eb') + '; box-shadow: 0 1px 2px #0000000d' }, o);
+    const gate = (t, c) => 'align-self: flex-start; font-size: 11.5px; padding: 2px 8px; border-radius: 6px; color: ' + c + '; background: #ffffff; border: 1px solid ' + c + '40';
+    return {
+      cols: [
+        { name: 'BrainStorming', count: '2', gate: '사람 완료 처리', gateStyle: gate('', C.human), cards: [
+          card({ id: 'T-0024', tpl: 'SDLC', title: 'PvP 매칭 개선', segs: segs('rwwwwwww'), chips: [chip('AgentA 정리 중', C.agent), chip('기획 2명', C.human)], time: '35m', cost: '$0.40' }),
+          card({ id: 'T-0027', tpl: 'SDLC', title: '업적 시스템 개편', segs: segs('hwwwwwww'), chips: [chip('작성 중', C.human)], time: '1d', cost: '$0.00' })
+        ] },
+        { name: 'Spec', count: '1', gate: '사람 승인', gateStyle: gate('', C.human), cards: [
+          card(Object.assign({ id: 'T-0018', tpl: 'SDLC', title: '퀘스트 데이터 테이블 정리', segs: segs('dhwwwwww'), chips: [chip('spec.md v1', C.human)], time: '4h 20m', cost: '$0.92', hl: '#e7b98a' }, badge('내 승인 필요', C.human)))
+        ] },
+        { name: 'Plan', count: '1', gate: '사람 승인', gateStyle: gate('', C.human), cards: [
+          card({ id: 'T-0026', tpl: 'SDLC', title: '친구 추천 로직', segs: segs('ddrwwwww'), chips: [chip('AgentA plan 작성', C.agent)], time: '52m', cost: '$0.61' })
+        ] },
+        { name: 'Dev', count: '2', gate: '자동 · 병렬', gateStyle: gate('', C.agent), cards: [
+          card(Object.assign({ id: 'T-0012', tpl: 'SDLC', title: '인벤토리 정렬 기능', segs: segs('dddrdsww'), chips: [chip('A 실행', C.agent), chip('B 완료', C.done), chip('C Stale', C.stale)], time: '2h 14m', cost: '$3.41' }, badge('CR-3 반영 중', C.rej))),
+          card(Object.assign({ id: 'T-0021', tpl: '버그 수정', title: '로그인 크래시 수정', segs: segs('ddxwww'), chips: [chip('A 재작업', C.agent)], time: '1h 05m', cost: '$1.18' }, badge('QA 반려 1회', C.rej)))
+        ] },
+        { name: 'QA', count: '1', gate: 'AI + 사람 최종', gateStyle: gate('', C.done), cards: [
+          card(Object.assign({ id: 'T-0015', tpl: 'SDLC', title: '길드 출석 보상 UI', segs: segs('ddddddhw'), chips: [chip('AgentD 통과', C.done), chip('사람 확인', C.human)], time: '6h 48m', cost: '$5.07', hl: '#e7b98a' }, badge('내 승인 필요', C.human)))
+        ] },
+        { name: 'Done', count: '1', gate: '자동', gateStyle: gate('', C.done), cards: [
+          card({ id: 'T-0009', tpl: '작은 작업', title: '상점 할인 배너', segs: segs('dddd'), chips: [chip('완료', C.done)], time: '3h 40m', cost: '$4.12' })
+        ] }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

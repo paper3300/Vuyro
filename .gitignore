@@ -1,0 +1,17 @@
+# Obsidian: per-user state and third-party plugin builds
+Docs/.obsidian/workspace*.json
+Docs/.obsidian/plugins/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Node / build output (for upcoming code)
+node_modules/
+dist/
+out/
+*.log
+.env
+.env.*
