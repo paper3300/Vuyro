@@ -285,7 +285,9 @@ function mayStillDeliver(draft: WorkflowDraft, source: string, join: string): bo
 
 /**
  * Fires a join (dead path elimination, as in BPMN): it needs something new from at least one source, and
- * every other source must be settled: its runs are over and nothing still active can reach it. A source
+ * every source must be settled. A source that delivered something new is settled once it has no active run
+ * (a rework or re-run of it would bring a newer result). A source that delivered nothing new is settled once
+ * nothing still active can reach it. A source
  * whose latest run took another port, or that can no longer run at all, is a dead path and contributes
  * nothing. A later loop can revive it; freshness is counted from the join's last activation.
  */
@@ -302,7 +304,9 @@ function tryJoin(draft: WorkflowDraft, target: CompiledNode): void {
     const isFresh = edges.some((index) => (seqOf(index) ?? 0) > progress.consumed);
     const group = nodeProgress(draft.state, source).group;
     if (isFresh) {
+      // A newer result is on its way (the source is re-running or waits to): use that one, not this.
       if (group !== undefined && !groupSettled(draft, group)) return;
+      if (nodeProgress(draft.state, source).executions.some((exec) => ACTIVE_STATUSES.has(exec.status))) return;
       fresh = true;
     } else if (mayStillDeliver(draft, source, target.id)) {
       return;

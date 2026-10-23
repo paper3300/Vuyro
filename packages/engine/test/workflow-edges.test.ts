@@ -213,6 +213,68 @@ describe('routing edge cases', () => {
     expect(nodeProgress(state, 'join').executions.map((exec) => exec.output?.items.map((item) => item.data.from))).toEqual([['a1'], ['c1']]);
   });
 
+  it('waits for a source that is sent back for rework while the join waits for its other source', async () => {
+    // start -> a, start -> b; a -> join and a -> qa; qa rejects a once; b is slow. The join must use a's second result.
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId, run } = s.request;
+        if (nodeId === 'a') {
+          if (run === 2) await s.sleep(60 * MINUTE);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { from: `a${run}` } }));
+        } else if (nodeId === 'b') {
+          await s.sleep(30 * MINUTE);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { from: 'b' } }));
+        } else if (run === 1) {
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'reject', data: { feedback: 'again' } }));
+        } else {
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'approve' }));
+        }
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/race',
+        [
+          { id: 'start', type: 'vuyro.human-task', version: 1 },
+          agent('a'),
+          agent('b'),
+          { id: 'qa', type: 'vuyro.review-agent', version: 1, params: { instructions: 'check' } },
+          { id: 'join', type: 'vuyro.join', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+          { id: 'reviewed', type: 'vuyro.end', version: 1 },
+        ],
+        [
+          edge('start', 'done', 'a'),
+          edge('start', 'done', 'b'),
+          edge('a', 'done', 'join'),
+          edge('a', 'done', 'qa'),
+          edge('qa', 'reject', 'a'),
+          edge('qa', 'approve', 'reviewed'),
+          edge('b', 'done', 'join'),
+          edge('join', 'done', 'end'),
+        ],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/race');
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.activity.idle();
+    // At 30 minutes b is done while a's rework (60 minutes) is still running: the join must wait.
+    await h.clock.advance(31 * MINUTE);
+    await h.activity.idle();
+    let state = await h.ticket(ticketId);
+    expect(currentExecution(state, 'b', 'main')?.status).toBe('done');
+    expect(currentExecution(state, 'a', 'main')?.status).toBe('running');
+    expect(nodeProgress(state, 'join').executions).toHaveLength(0);
+    await h.drive();
+    state = await h.ticket(ticketId);
+    const joins = nodeProgress(state, 'join').executions;
+    expect(joins).toHaveLength(1);
+    expect(joins[0]?.output?.items.map((item) => item.data.from).sort()).toEqual(['a2', 'b']);
+    expect(state.status).toBe('done');
+  });
+
   it('does not let a failed lane of a replaced plan keep the ticket open', async () => {
     let planRun = 0;
     h = await openWorkflowHarness({
