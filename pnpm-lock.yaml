@@ -51,9 +51,15 @@ importers:
 
   packages/cli:
     dependencies:
+      '@vuyro/agent-adapters':
+        specifier: workspace:*
+        version: link:../agent-adapters
       '@vuyro/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@vuyro/engine':
+        specifier: workspace:*
+        version: link:../engine
 
   packages/contracts:
     dependencies:

@@ -10,21 +10,21 @@ function capture(): CliIo & { stdout: string[]; stderr: string[] } {
 }
 
 describe('vuyro cli', () => {
-  it('prints versions', () => {
+  it('prints versions', async () => {
     const io = capture();
-    expect(runCli(['--version'], io)).toBe(0);
+    expect(await runCli(['--version'], io)).toBe(0);
     expect(io.stdout).toEqual(['vuyro 0.0.0 (protocol 1)']);
   });
 
-  it('prints usage without a command', () => {
+  it('prints usage without a command', async () => {
     const io = capture();
-    expect(runCli([], io)).toBe(0);
+    expect(await runCli([], io)).toBe(0);
     expect(io.stdout[0]).toMatch(/^Usage: vuyro/);
   });
 
-  it('fails with exit code 2 on an unknown command', () => {
+  it('fails with exit code 2 on an unknown command', async () => {
     const io = capture();
-    expect(runCli(['nope'], io)).toBe(2);
+    expect(await runCli(['nope'], io)).toBe(2);
     expect(io.stderr[0]).toMatch(/unknown command 'nope'/);
   });
 

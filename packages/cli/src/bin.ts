@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { runCli } from './index.ts';
 
-process.exitCode = runCli(process.argv.slice(2), {
+process.exitCode = await runCli(process.argv.slice(2), {
   out: (line) => {
     process.stdout.write(`${line}\n`);
   },

@@ -22,6 +22,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@vuyro/contracts": "workspace:*"
+    "@vuyro/agent-adapters": "workspace:*",
+    "@vuyro/contracts": "workspace:*",
+    "@vuyro/engine": "workspace:*"
   }
 }
