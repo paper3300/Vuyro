@@ -290,6 +290,13 @@ describe('node type declarations (M4/M5 fields)', () => {
     };
     expect(validator.validate(SharedNodeSpecSchema, build)).toEqual([]);
     expect(validator.validate(SharedNodeSpecSchema, { ...build, batchTrigger: {} })).not.toEqual([]);
+    // Every condition switched off, or only the expedite modifier: nothing would ever start a batch.
+    for (const batchTrigger of [{ manual: false }, { manual: false, afterPrevious: false }, { expediteOnPriority: true }]) {
+      expect(validator.validate(SharedNodeSpecSchema, { ...build, batchTrigger }), JSON.stringify(batchTrigger)).not.toEqual([]);
+    }
+    for (const batchTrigger of [{ count: 3 }, { window: '20m' }, { schedule: '0 12 * * *' }, { afterPrevious: true }, { manual: true, afterPrevious: false }]) {
+      expect(validator.validate(SharedNodeSpecSchema, { ...build, batchTrigger }), JSON.stringify(batchTrigger)).toEqual([]);
+    }
     expect(validator.validate(SharedNodeSpecSchema, { ...build, onBatchFailure: 'retry' })).not.toEqual([]);
   });
 });

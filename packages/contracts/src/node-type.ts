@@ -134,6 +134,15 @@ export const NodeTypeSpecSchema = Type.Object(
 
 export const BATCH_FAILURE_POLICIES = ['blame', 'ask', 'allFail', 'bisect', 'agent'] as const;
 
+/** One branch per trigger that can start a batch: present (count, window, schedule) or set to true (flags). */
+const BATCH_TRIGGER_ENABLED = [
+  { type: 'object', required: ['count'], properties: { count: { type: 'integer' } } },
+  { type: 'object', required: ['window'], properties: { window: { type: 'string' } } },
+  { type: 'object', required: ['schedule'], properties: { schedule: { type: 'string' } } },
+  { type: 'object', required: ['afterPrevious'], properties: { afterPrevious: { const: true } } },
+  { type: 'object', required: ['manual'], properties: { manual: { const: true } } },
+];
+
 export const SharedNodeSpecSchema = Type.Object(
   {
     /** Stable name that request nodes reference (their `sharedNode` param). */
@@ -160,9 +169,11 @@ export const SharedNodeSpecSchema = Type.Object(
         manual: Type.Optional(Type.Boolean()),
         /** Cron expression. After MVP. */
         schedule: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+        /** Modifier, not a trigger: does not count as an enabled condition. */
         expediteOnPriority: Type.Optional(Type.Boolean()),
       },
-      { additionalProperties: false, minProperties: 1 },
+      // At least one condition must actually be on: false flags do not count.
+      { additionalProperties: false, anyOf: BATCH_TRIGGER_ENABLED },
     ),
     maxConcurrent: Type.Integer({ minimum: 1 }),
     /** Claims held while a batch runs (§4.3), normally shared claims on the sources. */
