@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { listenSecurePipe } from '../src/ipc/secure-pipe-server.ts';
 import {
   ERROR_ACCESS_DENIED,
@@ -73,15 +73,43 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Echo handler that also records everything it receives. */
-function recordInto(received: string[]) {
+/** Echo handler that also records everything it receives and how often it was called. */
+function recordInto(received: string[], seen: { connections: number } = { connections: 0 }) {
   return (socket: net.Socket): void => {
+    seen.connections += 1;
     socket.on('data', (chunk) => {
       received.push(chunk.toString());
       socket.write(chunk);
     });
     socket.on('error', () => undefined);
   };
+}
+
+/**
+ * Keeps writing `text` until the server closes the connection or `timeoutMs` passes.
+ * (A Windows pipe client only notices a server-side disconnect on its next write.)
+ */
+function talkUntilClosed(path: string, text: string, timeoutMs = 3000): Promise<{ closed: boolean; received: string }> {
+  return new Promise((resolve) => {
+    let received = '';
+    const socket = net.connect(path);
+    const timer = setInterval(() => socket.write(text), 50);
+    const done = (closed: boolean): void => {
+      clearInterval(timer);
+      clearTimeout(deadline);
+      socket.destroy();
+      resolve({ closed, received });
+    };
+    const deadline = setTimeout(() => {
+      done(false);
+    }, timeoutMs);
+    socket.on('connect', () => socket.write(text));
+    socket.on('data', (chunk) => (received += chunk.toString()));
+    socket.on('error', () => undefined);
+    socket.on('close', () => {
+      done(true);
+    });
+  });
 }
 
 /** Blocks this thread (no event loop turns) until `path` exists. */
@@ -261,7 +289,8 @@ describe.runIf(isWindows)('named pipe security (Windows)', () => {
     const marker = join(mkdtempSync(join(tmpdir(), 'vuyro-pipe-')), 'connected');
     const child = startClientProcess(path, marker);
     const received: string[] = [];
-    const secure = await listenSecurePipe(path, recordInto(received), {
+    const seen = { connections: 0 };
+    const secure = await listenSecurePipe(path, recordInto(received, seen), {
       // Keeps this thread blocked, so Node dispatches nothing before the pipe is secured.
       afterListen: () => {
         waitForFileSync(marker, 10_000);
@@ -275,15 +304,18 @@ describe.runIf(isWindows)('named pipe security (Windows)', () => {
     expect(await child.output).toBe('closed:'); // never got a reply
     await sleep(50);
     expect(received).toEqual([]); // and its early write was discarded
+    expect(seen.connections).toBe(0); // the rejected socket never reached the handler
     expect(await roundTrip(path, 'still serving')).toBe('still serving');
     expect(received).toEqual(['still serving']);
+    expect(seen.connections).toBe(1);
   }, 20_000);
 
   it('checks the client on every connection after securing', async () => {
     const path = pipePath();
     const received: string[] = [];
+    const seen = { connections: 0 };
     let rejectedPid = -1;
-    const secure = await listenSecurePipe(path, recordInto(received), {
+    const secure = await listenSecurePipe(path, recordInto(received, seen), {
       acceptClient: (client) => client.pid !== rejectedPid,
     });
     cleanup.push(() => secure.close());
@@ -296,7 +328,39 @@ describe.runIf(isWindows)('named pipe security (Windows)', () => {
     expect(secure.rejectedClients).toBe(1);
     await sleep(50);
     expect(received).toEqual([]);
+    expect(seen.connections).toBe(0); // rejected sockets are not handed to the handler
   }, 20_000);
+
+  it('rejects a client whose process cannot be identified (fail closed)', async () => {
+    const path = pipePath();
+    const received: string[] = [];
+    const seen = { connections: 0 };
+    const secure = await listenSecurePipe(path, recordInto(received, seen));
+    cleanup.push(() => secure.close());
+
+    const lookup = vi.spyOn(win32(), 'GetNamedPipeClientProcessId').mockReturnValue(0);
+    const result = await talkUntilClosed(path, 'hello');
+    lookup.mockRestore();
+
+    expect(result).toEqual({ closed: true, received: '' });
+    expect(secure.rejectedClients).toBe(1);
+    expect(seen.connections).toBe(0);
+    expect(received).toEqual([]);
+    expect(await roundTrip(path, 'after')).toBe('after');
+  });
+
+  it('does not hand off a connection that closes before sending anything', async () => {
+    const path = pipePath();
+    const seen = { connections: 0 };
+    const secure = await listenSecurePipe(path, recordInto([], seen));
+    cleanup.push(() => secure.close());
+
+    const socket = await connect(path);
+    socket.destroy();
+    await sleep(100);
+    expect(seen.connections).toBe(0);
+    expect(secure.closedBeforeData).toBe(1);
+  });
 
   it('destroys connections that Node dispatches before the pipe is secured', async () => {
     const path = pipePath();

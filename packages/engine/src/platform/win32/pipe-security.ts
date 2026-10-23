@@ -167,7 +167,9 @@ export function getProcessUserSid(pid: number): string {
 
 export interface PipeServerInstance {
   readonly handle: Handle;
-  /** Process id of the connected client, if a client is connected to this instance. */
+  /** A client is connected to this instance. */
+  readonly connected: boolean;
+  /** Process id of the connected client; undefined when none is connected or the lookup failed. */
   readonly clientPid: number | undefined;
   /** Whether the instance was created with PIPE_REJECT_REMOTE_CLIENTS. */
   readonly rejectsRemoteClients: boolean;
@@ -195,13 +197,15 @@ export function findOwnPipeServerInstances(pipePath: string): PipeServerInstance
     if (!w.GetNamedPipeInfo(entry.handle, flags, null, null, null) || ((flags[0] ?? 0) & PIPE_SERVER_END) === 0) continue;
     if (fileName(entry.handle)?.toLowerCase() !== expectedName) continue;
     const local = pipeLocalInformation(entry.handle);
+    const connected = local.state === FILE_PIPE_CONNECTED_STATE;
     let clientPid: number | undefined;
-    if (local.state === FILE_PIPE_CONNECTED_STATE) {
+    if (connected) {
       const pid: OutSlot<number> = [0];
-      if (w.GetNamedPipeClientProcessId(entry.handle, pid)) clientPid = pid[0] ?? undefined;
+      if (w.GetNamedPipeClientProcessId(entry.handle, pid) && (pid[0] ?? 0) !== 0) clientPid = pid[0] ?? undefined;
     }
     instances.push({
       handle: entry.handle,
+      connected,
       clientPid,
       rejectsRemoteClients: (local.type & FILE_PIPE_REJECT_REMOTE_CLIENTS) !== 0,
     });

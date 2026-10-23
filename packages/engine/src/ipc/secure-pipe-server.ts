@@ -23,8 +23,15 @@ import {
  * 2. Client check: after the DACL is applied and again whenever a connection
  *    arrives, every connected instance's client process is looked up
  *    (GetNamedPipeClientProcessId → process token user SID). Instances whose client
- *    is not accepted are disconnected at the OS level, which discards unread data.
- *    Sockets start paused, so nothing is read before the check has run.
+ *    is not accepted, or whose client cannot be identified, are disconnected at the
+ *    OS level, which discards unread data. Sockets start paused, so nothing is read
+ *    before the check has run.
+ * 3. Hand-off on first data: Node does not expose which OS instance a socket uses,
+ *    so a socket is only passed to `onConnection` once it delivers data. A
+ *    disconnected (rejected) instance can never deliver data, its read fails, and
+ *    the socket is dropped without reaching the handler. Clients speak first in
+ *    the engine protocol, so a connection that closes before sending anything is
+ *    dropped as well.
  *
  * Connections that Node dispatches before the server is secured are destroyed.
  */
@@ -51,15 +58,18 @@ export interface SecurePipeServer {
   readonly security: PipeSecurity;
   /** Connections destroyed because Node dispatched them before the pipe was secured. */
   readonly droppedBeforeSecure: number;
-  /** Client connections disconnected by the client check. */
+  /** Client connections disconnected by the client check (not accepted or not identifiable). */
   readonly rejectedClients: number;
+  /** Sockets that closed before delivering data and were never handed to `onConnection`. */
+  readonly closedBeforeData: number;
   close(): Promise<void>;
 }
 
 /**
- * `onConnection` receives a paused socket. The socket is resumed once the
- * handler returns, or once its returned promise settles, so a handler may set
- * up its listeners asynchronously without losing the first request.
+ * `onConnection` receives a paused socket whose first data is already buffered.
+ * The socket is resumed once the handler returns, or once its returned promise
+ * settles, so a handler may set up its listeners asynchronously without losing
+ * the first request.
  */
 export async function listenSecurePipe(
   pipePath: string,
@@ -77,14 +87,41 @@ export async function listenSecurePipe(
   let secured = false;
   let droppedBeforeSecure = 0;
   let rejectedClients = 0;
+  let closedBeforeData = 0;
 
   const checkClients = (): void => {
     for (const instance of findOwnPipeServerInstances(pipePath)) {
-      if (instance.clientPid === undefined) continue;
-      if (acceptClient({ pid: instance.clientPid, userSid: tryProcessUserSid(instance.clientPid) })) continue;
+      if (!instance.connected) continue;
+      const pid = instance.clientPid;
+      // Fail closed: a client whose process cannot be identified is not served.
+      if (pid !== undefined && acceptClient({ pid, userSid: tryProcessUserSid(pid) })) continue;
       disconnectPipeInstance(instance.handle);
       rejectedClients += 1;
     }
+  };
+
+  /** Waits for the first data before handing off; see measure 3 above. */
+  const awaitFirstData = (socket: net.Socket): void => {
+    const onReadable = (): void => {
+      const chunk = socket.read() as Buffer | null;
+      if (chunk === null) return;
+      stop();
+      socket.unshift(chunk);
+      void handOff(socket, onConnection);
+    };
+    const onGone = (): void => {
+      stop();
+      closedBeforeData += 1;
+      socket.destroy();
+    };
+    const stop = (): void => {
+      socket.off('readable', onReadable);
+      socket.off('end', onGone);
+      socket.off('close', onGone);
+    };
+    socket.on('readable', onReadable);
+    socket.once('end', onGone);
+    socket.once('close', onGone);
   };
 
   server.on('connection', (socket) => {
@@ -95,14 +132,14 @@ export async function listenSecurePipe(
       return;
     }
     try {
-      // This socket's own instance is among those checked; a rejected one ends right after resume.
+      // This socket's own instance is among those checked.
       checkClients();
     } catch {
       // Fail closed: without a completed check the connection is not served.
       socket.destroy();
       return;
     }
-    void handOff(socket, onConnection);
+    awaitFirstData(socket);
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -139,6 +176,9 @@ export async function listenSecurePipe(
     },
     get rejectedClients() {
       return rejectedClients;
+    },
+    get closedBeforeData() {
+      return closedBeforeData;
     },
     close: () =>
       new Promise((resolve) => {
