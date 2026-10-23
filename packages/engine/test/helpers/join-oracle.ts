@@ -20,9 +20,12 @@ interface Exec {
   readonly run: number;
   readonly lane: string;
   readonly cause: string;
+  readonly inputs: readonly HandoffItem[];
   status: string;
   routes: Map<number, number[]>;
   items: readonly HandoffItem[];
+  /** The output had items for edges, all stale, so nothing travelled (D-021). */
+  onlyStale: boolean;
   completedAt?: number;
 }
 
@@ -36,7 +39,7 @@ interface Group {
 export interface OracleReason {
   readonly nodeId: string;
   readonly lane: string;
-  readonly kind: 'active' | 'failed';
+  readonly kind: 'active' | 'failed' | 'stale';
 }
 
 export interface OracleCounts {
@@ -44,6 +47,8 @@ export interface OracleCounts {
   replans: number;
   /** Active executions ended because their generation was replaced. */
   retired: number;
+  /** Of those, executions outside fan-out lanes that only consumed outdated results (a review of the old join). */
+  retiredDownstream: number;
   /** Replans that happened while the replaced generation still had active work (the e864a07 counterexample shape). */
   replansOverActive: number;
   joinRuns: number;
@@ -60,7 +65,7 @@ const itemKeys = (items: readonly HandoffItem[]): string[] => items.map((item) =
 
 export class JoinOracle {
   readonly violations: string[] = [];
-  readonly counts: OracleCounts = { replans: 0, retired: 0, replansOverActive: 0, joinRuns: 0, multiSourceJoinRuns: 0, fanInRuns: 0, extendedGroups: 0, chainedGroups: 0 };
+  readonly counts: OracleCounts = { replans: 0, retired: 0, retiredDownstream: 0, replansOverActive: 0, joinRuns: 0, multiSourceJoinRuns: 0, fanInRuns: 0, extendedGroups: 0, chainedGroups: 0 };
   /** Item 1: the step counter. */
   private step = 0;
   private readonly execs = new Map<string, Exec[]>();
@@ -115,9 +120,11 @@ export class JoinOracle {
         break;
       case 'node.superseded': {
         const { nodeId, lane, run } = event.data;
-        if (this.laneLive(nodeId, lane)) this.violate(`${nodeId}/${lane} run ${run} was superseded as replaced, but its lane is live`);
+        const exec = this.exec(nodeId, run);
+        if (exec === undefined || this.execLive(exec)) this.violate(`${nodeId}/${lane} run ${run} was superseded as replaced, but it belongs to the current generation`);
         this.setStatus(nodeId, run, 'superseded');
         this.counts.retired += 1;
+        if (!this.laneGroup.has(`${nodeId}#${lane}`)) this.counts.retiredDownstream += 1;
         break;
       }
       case 'node.completed':
@@ -178,7 +185,7 @@ export class JoinOracle {
     this.step += 1;
     if (data.supersedes !== undefined) this.setStatus(nodeId, data.supersedes, 'superseded');
     const list = this.execs.get(nodeId) ?? [];
-    list.push({ node: nodeId, run, lane, cause: data.cause, status: data.status, routes: new Map(), items: [] });
+    list.push({ node: nodeId, run, lane, cause: data.cause, inputs: Object.values(data.inputs).flat(), status: data.status, routes: new Map(), items: [], onlyStale: false });
     this.execs.set(nodeId, list);
     const lanes = this.lanes.get(nodeId) ?? new Map<string, number[]>();
     if (group !== undefined && data.cause === 'input' && this.reworked.has(nodeId) && this.groups.has(group) && !lanes.has(lane)) this.counts.extendedGroups += 1;
@@ -212,7 +219,7 @@ export class JoinOracle {
       this.violate(`completion of unknown execution ${data.nodeId} run ${data.run}`);
       return;
     }
-    if (!this.laneLive(data.nodeId, data.lane)) this.violate(`${data.nodeId}/${data.lane} run ${data.run} completed in a replaced generation`);
+    if (!this.execLive(exec)) this.violate(`${data.nodeId}/${data.lane} run ${data.run} completed in a replaced generation`);
     const source = this.node(data.nodeId);
     // D-020: a delivery from a lane-less source that reworks live lanes must not open a new generation.
     this.reworked = new Set();
@@ -242,6 +249,7 @@ export class JoinOracle {
     exec.items = data.output.items;
     exec.completedAt = this.step;
     exec.routes = new Map([...(data.empty ?? []).map((entry): [number, number[]] => [entry.edge, []]), ...data.routes.map((route): [number, number[]] => [route.edge, route.items])]);
+    exec.onlyStale = exec.routes.size === 0 && (data.stale ?? []).length > 0;
     // Remember what has to be taken: items for fan-out targets, deliveries for whole inputs of non-fan-out sources.
     for (const [edge, indexes] of exec.routes) {
       const target = this.targetOf(edge);
@@ -256,8 +264,8 @@ export class JoinOracle {
         this.pendingDirect.set(target.id, [...(this.pendingDirect.get(target.id) ?? []), { edge, port, keys }]);
       }
     }
-    // Item 13.
-    if (data.status === 'done' && (this.workflow.ends.includes(data.nodeId) || exec.routes.size === 0)) this.ended = true;
+    // Item 13: an output that went nowhere only because all its items were stale is no end (D-021).
+    if (data.status === 'done' && (this.workflow.ends.includes(data.nodeId) || (exec.routes.size === 0 && !exec.onlyStale))) this.ended = true;
   }
 
   private onPassedOver(data: Extract<DomainEvent, { type: 'node.passedOver' }>['data']): void {
@@ -298,6 +306,34 @@ export class JoinOracle {
   private laneLive(nodeId: string, lane: string): boolean {
     const group = this.laneGroup.get(`${nodeId}#${lane}`);
     return group === undefined || this.groupLive(group);
+  }
+
+  /** Item 3: walking lineage, the first fan-out lane output on every path is of a replaced lane (at least one). */
+  private outdated(item: HandoffItem): boolean {
+    let reached = false;
+    const seen = new Set<string>();
+    const queue = [...(item.lineage ?? [])];
+    while (queue.length > 0) {
+      const ref = queue.shift() as ItemRef;
+      const key = refKey(ref);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const exec = this.exec(ref.nodeId, ref.run);
+      if (exec === undefined) continue;
+      if (this.laneGroup.has(`${ref.nodeId}#${exec.lane}`)) {
+        if (this.laneLive(ref.nodeId, exec.lane)) return false;
+        reached = true;
+        continue;
+      }
+      queue.push(...(exec.items[ref.item]?.lineage ?? []));
+    }
+    return reached;
+  }
+
+  /** Item 3: an execution of the current generation. */
+  private execLive(exec: Exec): boolean {
+    if (this.laneGroup.has(`${exec.node}#${exec.lane}`)) return this.laneLive(exec.node, exec.lane);
+    return exec.inputs.length === 0 || !exec.inputs.every((item) => this.outdated(item));
   }
 
   private currentExec(nodeId: string, lane: string): Exec | undefined {
@@ -353,7 +389,7 @@ export class JoinOracle {
       for (const exec of this.execs.get(source) ?? []) {
         if (SETTLED.has(exec.status) && (latest === undefined || (exec.completedAt ?? 0) > (latest.completedAt ?? 0))) latest = exec;
       }
-      candidates = latest === undefined ? [] : [latest];
+      candidates = latest === undefined || !this.execLive(latest) ? [] : [latest];
     }
     const execs = candidates.filter((exec) => edges.some((edge) => exec.routes.has(edge)));
     return { execs, fresh: fresh || execs.some((exec) => (exec.completedAt ?? 0) > since) };
@@ -498,15 +534,17 @@ export class JoinOracle {
       for (const exec of list) if (ACTIVE.has(exec.status)) reasons.push({ nodeId, lane: exec.lane, kind: 'active' });
       for (const lane of this.lanes.get(nodeId)?.keys() ?? []) {
         const exec = this.currentExec(nodeId, lane);
-        if (exec?.status === 'failed' && exec.routes.size === 0 && this.laneLive(nodeId, lane)) reasons.push({ nodeId, lane, kind: 'failed' });
+        if (exec === undefined || exec.routes.size > 0 || !this.execLive(exec)) continue;
+        if (exec.status === 'failed') reasons.push({ nodeId, lane, kind: 'failed' });
+        else if (exec.status === 'done' && exec.onlyStale) reasons.push({ nodeId, lane, kind: 'stale' });
       }
     }
     return reasons;
   }
 
-  /** Lanes that wait for a person (review) or a retry (unhandled failure): what the test may act on. */
+  /** Lanes that wait for a person (review) or a retry (unhandled failure, stale output): what the test may act on. */
   actionable(): OracleReason[] {
-    return this.waitReasons().filter((reason) => reason.kind === 'failed' || this.currentExec(reason.nodeId, reason.lane)?.status === 'review');
+    return this.waitReasons().filter((reason) => reason.kind !== 'active' || this.currentExec(reason.nodeId, reason.lane)?.status === 'review');
   }
 
   /** Progress, for a moment when the engine has nothing left to do. */
@@ -526,7 +564,8 @@ export class JoinOracle {
     }
     for (const [nodeId, lanes] of this.lanes) {
       for (const lane of lanes.keys()) {
-        if (ACTIVE.has(this.currentExec(nodeId, lane)?.status ?? '') && !this.laneLive(nodeId, lane)) problems.push(`${nodeId}/${lane} is active in a replaced generation`);
+        const exec = this.currentExec(nodeId, lane);
+        if (exec !== undefined && ACTIVE.has(exec.status) && !this.execLive(exec)) problems.push(`${nodeId}/${lane} run ${exec.run} is active but belongs to a replaced generation`);
       }
     }
     const reasons = this.waitReasons();

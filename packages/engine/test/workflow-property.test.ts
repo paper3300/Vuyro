@@ -29,7 +29,7 @@ const CASES = Number(process.env.PROPERTY_CASES ?? 300);
 const BASE_SEED = Number(process.env.PROPERTY_SEED ?? 20261024);
 const MAX_STEPS = 40;
 
-type Kind = 'agent' | 'each' | 'gated' | 'review' | 'join' | 'human';
+type Kind = 'agent' | 'each' | 'gated' | 'gate' | 'review' | 'join' | 'human';
 
 interface Graph {
   readonly nodes: readonly { readonly id: string; readonly kind: Kind | 'end' }[];
@@ -60,7 +60,7 @@ function generate(seed: number): Graph {
   const random = prng(seed);
   const pick = <T>(list: readonly T[]): T => list[Math.floor(random() * list.length)] as T;
   const middle = 2 + Math.floor(random() * 5);
-  const kinds: Kind[] = ['agent', ...Array.from({ length: middle }, () => pick<Kind>(['agent', 'agent', 'each', 'gated', 'review', 'review', 'join', 'join', 'human']))];
+  const kinds: Kind[] = ['agent', ...Array.from({ length: middle }, () => pick<Kind>(['agent', 'agent', 'each', 'gated', 'gate', 'review', 'review', 'join', 'join', 'human']))];
   const nodes: { id: string; kind: Kind | 'end' }[] = [...kinds.map((kind, index) => ({ id: `n${index}`, kind })), { id: 'end', kind: 'end' as const }];
   const edges: { from: string; port: string; to: string }[] = [];
   const keys = new Set<string>();
@@ -104,7 +104,7 @@ function generate(seed: number): Graph {
   }
   // Re-planning: a planner feeds a fan-out node and can run again while the old lanes are still busy, either
   // because a review sends it back or because a person asks for a new plan (an extra entry).
-  if (random() < 0.7) {
+  if (random() < 0.9) {
     const fanOuts = indexesOf((kind, index) => isLanes(kind) && index >= 1);
     const fanOut = fanOuts.length === 0 ? undefined : pick(fanOuts);
     const planners = fanOut === undefined ? [] : indexesOf((kind, index) => kind === 'agent' && index < fanOut);
@@ -117,6 +117,15 @@ function generate(seed: number): Graph {
         const check = pick(checks);
         add(fanOut, 'done', check);
         add(check, 'reject', fanOut);
+      }
+      // The planned lanes' join feeds a node that waits for a person (a review gate or a human task): a new plan
+      // must take that pending review with it.
+      if (random() < 0.8) {
+        const reviewer = { id: 'rqa', kind: random() < 0.5 ? ('gate' as const) : ('human' as const) };
+        nodes.push({ id: 'rjoin', kind: 'join' }, reviewer);
+        addById(nodes[fanOut]?.id ?? '', 'done', 'rjoin');
+        addById('rjoin', 'done', 'rqa');
+        addById('rqa', 'done', 'end');
       }
       // A chained fan-out under the planned lanes.
       const chained = indexesOf((kind, index) => isLanes(kind) && index > fanOut);
@@ -152,6 +161,8 @@ function toTemplate(graph: Graph, id: string): TemplateDefinition {
         return { id: nodeId, type: 'vuyro.agent', version: 1, params: { instructions: nodeId }, ports: { in: { mode: 'each' } } };
       case 'gated':
         return { id: nodeId, type: 'vuyro.agent', version: 1, params: { instructions: nodeId }, ports: { in: { mode: 'each' } }, review: 'human' };
+      case 'gate':
+        return { id: nodeId, type: 'vuyro.agent', version: 1, params: { instructions: nodeId }, review: 'human' };
       case 'review':
         return { id: nodeId, type: 'vuyro.review-agent', version: 1, params: { instructions: nodeId } };
       case 'join':
@@ -184,6 +195,7 @@ interface Coverage extends OracleCounts {
 const emptyCoverage = (): Coverage => ({
   replans: 0,
   retired: 0,
+  retiredDownstream: 0,
   replansOverActive: 0,
   joinRuns: 0,
   multiSourceJoinRuns: 0,
@@ -347,7 +359,7 @@ describe('routing properties', () => {
         return finish(); // Waiting on something the test does not drive (fine: a reason exists).
       }
       let response;
-      if (choice.kind === 'failed') {
+      if (choice.kind !== 'active') {
         if (decide() < 0.3) {
           stats.open += 1;
           return finish(); // Leave the failure: the ticket stays open with a reason.
@@ -431,6 +443,7 @@ describe('routing properties', () => {
     expect(coverage.replans).toBeGreaterThanOrEqual(CASES / 6);
     expect(coverage.replansOverActive).toBeGreaterThanOrEqual(CASES / 20);
     expect(coverage.retired).toBeGreaterThanOrEqual(CASES / 20);
+    expect(coverage.retiredDownstream).toBeGreaterThanOrEqual(CASES / 50);
     expect(coverage.extendedGroups).toBeGreaterThanOrEqual(CASES / 60);
     expect(coverage.chainedGroups).toBeGreaterThanOrEqual(CASES / 20);
     expect(stats.done).toBeGreaterThan(CASES / 3);

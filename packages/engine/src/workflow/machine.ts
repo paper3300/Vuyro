@@ -17,6 +17,7 @@ import {
   evolveTicket,
   type Execution,
   execution,
+  executionLive,
   type Group,
   groupLive,
   laneLive,
@@ -138,7 +139,8 @@ function contribution(draft: WorkflowDraft, source: string, edges: readonly numb
     const latest = nodeProgress(state, source)
       .executions.filter(settled)
       .sort((a, b) => (b.completedOrder ?? 0) - (a.completedOrder ?? 0))[0];
-    execs = latest === undefined ? [] : [latest];
+    // A result that only rests on a replaced generation is no contribution (item 7).
+    execs = latest === undefined || !executionLive(state, latest) ? [] : [latest];
   }
   execs = execs.filter(routedOver);
   return { execs, fresh: fresh || execs.some((exec) => (exec.completedOrder ?? 0) > since) };
@@ -213,7 +215,7 @@ function latestOver(draft: WorkflowDraft, edgeIndex: number): HandoffItem[] {
   const latest = nodeProgress(draft.state, source)
     .executions.filter((exec) => exec.completedOrder !== undefined && Object.hasOwn(exec.routes, edgeIndex))
     .sort((a, b) => (b.completedOrder ?? 0) - (a.completedOrder ?? 0))[0];
-  return latest === undefined ? [] : routedItems(edgeIndex, latest);
+  return latest === undefined || !executionLive(draft.state, latest) ? [] : routedItems(edgeIndex, latest);
 }
 
 export interface ActivationExtra {
@@ -291,12 +293,15 @@ function liveChild(state: TicketWorkflow, nodeId: string, parent: string): strin
   return Object.entries(state.groups).find(([id, group]) => group.node === nodeId && group.parent === parent && groupLive(state, id))?.[0];
 }
 
-/** Item 6: every active execution outside the current generation ends as superseded (D-019). */
+/**
+ * Item 6: every active execution outside the current generation ends as superseded (D-019): lanes of replaced
+ * groups, and executions downstream that only consume outdated results (a QA reviewing the old plan's join).
+ */
 function retireReplaced(draft: WorkflowDraft): void {
   for (const nodeId of draft.workflow.nodes.keys()) {
     for (const lane of nodeProgress(draft.state, nodeId).laneOrder) {
       const exec = currentExecution(draft.state, nodeId, lane);
-      if (exec === undefined || !ACTIVE_STATUSES.has(exec.status) || laneLive(draft.state, nodeId, lane)) continue;
+      if (exec === undefined || !ACTIVE_STATUSES.has(exec.status) || executionLive(draft.state, exec)) continue;
       draft.emit({ type: 'node.superseded', data: { ticketId: draft.ticketId, nodeId, lane, run: exec.run, reason: 'replaced' } });
     }
   }
@@ -535,8 +540,11 @@ export interface WaitReason {
   readonly nodeId: string;
   readonly lane: string;
   readonly run: number;
-  /** 'active': someone (executor or person) still has to act. 'failed': a failure no edge took; retry it. */
-  readonly kind: 'active' | 'failed';
+  /**
+   * 'active': someone (executor or person) still has to act. 'failed': a failure no edge took; retry it.
+   * 'stale': a success whose items all answered replaced work, so it went nowhere (D-021); retry it.
+   */
+  readonly kind: 'active' | 'failed' | 'stale';
   readonly status: string;
 }
 
@@ -553,8 +561,9 @@ export function ticketWaitReasons(state: TicketWorkflow, workflow: CompiledWorkf
     }
     for (const lane of progress.laneOrder) {
       const exec = currentExecution(state, nodeId, lane);
-      if (exec?.status !== 'failed' || Object.keys(exec.routes).length > 0 || !laneLive(state, nodeId, lane)) continue;
-      reasons.push({ nodeId, lane, run: exec.run, kind: 'failed', status: exec.status });
+      if (exec === undefined || Object.keys(exec.routes).length > 0 || !executionLive(state, exec)) continue;
+      if (exec.status === 'failed') reasons.push({ nodeId, lane, run: exec.run, kind: 'failed', status: exec.status });
+      else if (exec.status === 'done' && exec.onlyStale === true) reasons.push({ nodeId, lane, run: exec.run, kind: 'stale', status: exec.status });
     }
   }
   return reasons;
@@ -562,7 +571,7 @@ export function ticketWaitReasons(state: TicketWorkflow, workflow: CompiledWorkf
 
 /**
  * Item 13: a path ended. An end node finished, or (implicit end, as in BPMN) an execution finished successfully
- * without any edge taking anything, not even an empty delivery.
+ * through a port without edges. Not an output whose items were all stale.
  */
 export function endReached(state: TicketWorkflow, workflow: CompiledWorkflow): boolean {
   // An empty delivery that passed over a fan-out node with no further edges ended its path there too.
@@ -571,7 +580,8 @@ export function endReached(state: TicketWorkflow, workflow: CompiledWorkflow): b
   for (const nodeId of workflow.nodes.keys()) {
     for (const exec of nodeProgress(state, nodeId).executions) {
       if (exec.status !== 'done') continue;
-      if (ends.has(nodeId) || Object.keys(exec.routes).length === 0) return true;
+      // An output whose items were all stale went nowhere, but it says nothing about the current work (D-021).
+      if (ends.has(nodeId) || (Object.keys(exec.routes).length === 0 && exec.onlyStale !== true)) return true;
     }
   }
   return false;
@@ -587,7 +597,7 @@ export function completeTicketIfDone(draft: WorkflowDraft): void {
 
 /** Activates a lane again with the inputs of its current execution (retry, review rejection). Live lanes only. */
 export function rerun(draft: WorkflowDraft, exec: Execution, cause: 'retry' | 'review', feedback?: { run: number; comment?: string }): void {
-  if (!laneLive(draft.state, exec.nodeId, exec.lane)) throw new Error(`lane '${exec.lane}' of node '${exec.nodeId}' belongs to a replaced group`);
+  if (!executionLive(draft.state, exec)) throw new Error(`run ${exec.run} of node '${exec.nodeId}' belongs to a replaced generation`);
   const group = laneOf(draft.state, exec.nodeId, exec.lane)?.group;
   activate(draft, exec.nodeId, exec.lane, cause, exec.inputs, {
     ...(group === undefined ? {} : { group }),

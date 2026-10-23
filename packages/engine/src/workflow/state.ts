@@ -41,6 +41,8 @@ export interface Execution {
   readonly resumeFromRunId?: string;
   readonly pauseRequested: boolean;
   readonly resumeTo?: 'queued' | 'review' | 'rejected';
+  /** Set when the output had items for edges but every one was stale, so nothing travelled (not a path end, D-021). */
+  readonly onlyStale?: boolean;
   /** Ticket step at which the execution finished (for "latest run", and "after the last activation"). */
   readonly completedOrder?: number;
 }
@@ -146,6 +148,42 @@ export function groupLive(state: TicketWorkflow, groupId: string): boolean {
 export function laneLive(state: TicketWorkflow, nodeId: string, lane: string): boolean {
   const group = laneOf(state, nodeId, lane)?.group;
   return group === undefined || groupLive(state, group);
+}
+
+/**
+ * §10.6 item 3: an output item is outdated when, walking its lineage, the first fan-out lane output on every
+ * path is one of a replaced lane (and there is at least one). Items that never passed a fan-out are not.
+ */
+export function itemOutdated(state: TicketWorkflow, item: HandoffItem): boolean {
+  let reached = false;
+  const seen = new Set<string>();
+  const queue = [...(item.lineage ?? [])];
+  for (let steps = 0; queue.length > 0 && steps < 100_000; steps++) {
+    const ref = queue.shift();
+    if (ref === undefined) break;
+    const key = `${ref.nodeId}#${ref.run}#${ref.item}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const exec = execution(state, ref.nodeId, ref.run);
+    if (exec === undefined) continue;
+    if (laneOf(state, ref.nodeId, exec.lane)?.group !== undefined) {
+      if (laneLive(state, ref.nodeId, exec.lane)) return false;
+      reached = true;
+      continue;
+    }
+    queue.push(...(exec.output?.items[ref.item]?.lineage ?? []));
+  }
+  return reached;
+}
+
+/**
+ * §10.6 item 3: whether an execution belongs to the current generation. A fan-out lane's execution follows its
+ * lane; any other execution is of a replaced generation when it has inputs and all of them are outdated.
+ */
+export function executionLive(state: TicketWorkflow, exec: Execution): boolean {
+  if (laneOf(state, exec.nodeId, exec.lane)?.group !== undefined) return laneLive(state, exec.nodeId, exec.lane);
+  const items = Object.values(exec.inputs).flat();
+  return items.length === 0 || !items.every((item) => itemOutdated(state, item));
 }
 
 /** Lane-visible status: the current execution's status; a node with no lanes is waiting. */
@@ -278,6 +316,7 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
           ...data.routes.map((route): [number, readonly number[]] => [route.edge, route.items]),
         ]),
         completedOrder: step,
+        ...(data.routes.length === 0 && (data.empty ?? []).length === 0 && (data.stale ?? []).length > 0 ? { onlyStale: true } : {}),
       }));
     }
     case 'node.passedOver': {

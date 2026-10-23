@@ -3,7 +3,7 @@ import type { CommandResponse, DefinitionEnvelope, TemplateDefinition, TemplateE
 import type { WorkspaceTarget } from '../src/workflow/engine.ts';
 import type { ScriptedBehavior } from '../src/workflow/scripted-agent.ts';
 import { endReached, ticketWaitReasons } from '../src/workflow/machine.ts';
-import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
+import { currentExecution, itemOutdated, nodeProgress } from '../src/workflow/state.ts';
 import { nextRequestId } from './helpers/engine-harness.ts';
 import { HUMAN, openWorkflowHarness, type WorkflowHarness } from './helpers/workflow-harness.ts';
 
@@ -345,7 +345,7 @@ describe('routing edge cases', () => {
     expect((await h.ticket(ticketId)).status).toBe('done');
   });
 
-  it('drops a rejection that answers lanes of an older plan, keeping the new plan lanes and their join', async () => {
+  it('supersedes a QA review of the old plan when a new plan arrives; its rejection never applies', async () => {
     let planRun = 0;
     const behavior: ScriptedBehavior = async (s) => {
       const { ticketId, nodeId, run } = s.request;
@@ -409,12 +409,10 @@ describe('routing edge cases', () => {
     expect(nodeProgress(state, 'dev').laneOrder).toEqual(['1', '2', '3', '4']);
     expect(currentExecution(state, 'dev', '3')?.status).toBe('running');
 
-    // The old rejection arrives now. Its lanes belong to the old plan: it is recorded as stale and goes nowhere.
-    await h.ok('node.approve', { ticketId, nodeId: 'qa' });
-    state = await h.ticket(ticketId);
+    // The held rejection only judged the old plan's join: it went with the old plan (D-019) and cannot be approved.
+    expect(currentExecution(state, 'qa', 'main')?.status).toBe('superseded');
+    expect((await h.exec('node.approve', { ticketId, nodeId: 'qa' })).ok).toBe(false);
     expect(nodeProgress(state, 'dev').laneOrder).toEqual(['1', '2', '3', '4']);
-    const qaDone = (await h.store.readAggregate(ticketId)).filter((event) => event.type === 'node.completed' && event.data.nodeId === 'qa').at(-1);
-    expect(qaDone?.type === 'node.completed' ? qaDone.data : undefined).toMatchObject({ output: { port: 'reject' }, routes: [], stale: [{ to: 'dev', items: [0] }] });
 
     await h.drive();
     state = await h.ticket(ticketId);
@@ -624,6 +622,12 @@ describe('routing edge cases', () => {
     await h.drive();
     let state = await h.ticket(ticketId);
     expect(nodeProgress(state, 'dev').laneOrder).toEqual(['1', '2']);
+    // §10.6 item 3: an item is outdated only when every fan-out lane it rests on was replaced.
+    const ref = (run: number) => ({ nodeId: 'dev', run, item: 0 });
+    expect(itemOutdated(state, { data: {}, lineage: [ref(1)] })).toBe(true);
+    expect(itemOutdated(state, { data: {}, lineage: [ref(1), ref(2)] })).toBe(false);
+    expect(itemOutdated(state, { data: {}, lineage: [ref(2)] })).toBe(false);
+    expect(itemOutdated(state, { data: {}, lineage: [] })).toBe(false);
     // The reviewer's item descends from the old lane 1 and the new lane 2: only lane 2 runs again.
     const lineage = [1, 2].map((run) => ({ nodeId: 'dev', run, item: 0 }));
     await h.ok('node.reject', { ticketId, nodeId: 'qa', items: [{ data: { feedback: 'redo' }, lineage }] });
@@ -692,6 +696,122 @@ describe('routing edge cases', () => {
     expect(currentExecution(state, 'd', '2')?.status).toBe('failed');
     expect(nodeProgress(state, 'a').executions).toHaveLength(0);
     // The failure went to 'log', which ends its path: the ticket is done without the old plan's work.
+    expect(state.status).toBe('done');
+  });
+
+  it('supersedes a downstream review fed only by the old plan, so the new plan path can close the ticket', async () => {
+    // Review counterexample (8a3349f): plan 1 -> dev -> join -> QA waits in Review; the new plan's dev fails into the
+    // fallback end. The old QA stayed in Review and held the ticket open (active:qa/main).
+    let planRun = 0;
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId } = s.request;
+        if (nodeId === 'plan') {
+          planRun += 1;
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { task: planRun === 1 ? 'T1' : 'U1' } }] }));
+        } else if (nodeId === 'dev' && planRun > 1) expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'error', data: { reason: 'no' } }));
+        else expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: nodeId === 'qa' ? 'approve' : 'done', data: { ok: true } }));
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/replan-downstream',
+        [
+          { id: 'start', type: 'vuyro.human-task', version: 1 },
+          { id: 'replan', type: 'vuyro.human-task', version: 1 },
+          agent('plan'),
+          agent('dev', 'task {{ input.data.task }}', { ports: { in: { mode: 'each' } } }),
+          { id: 'join', type: 'vuyro.join', version: 1 },
+          { id: 'qa', type: 'vuyro.review-agent', version: 1, review: 'human', params: { instructions: 'check' } },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+          { id: 'fallback', type: 'vuyro.end', version: 1 },
+        ],
+        [
+          edge('start', 'done', 'plan'),
+          edge('replan', 'done', 'plan'),
+          edge('plan', 'done', 'dev'),
+          edge('dev', 'done', 'join'),
+          edge('dev', 'error', 'fallback'),
+          edge('join', 'done', 'qa'),
+          edge('qa', 'approve', 'end'),
+          edge('qa', 'reject', 'dev'),
+        ],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/replan-downstream');
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.drive();
+    expect(await h.status(ticketId, 'qa')).toBe('review');
+    await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
+    await h.drive();
+    const state = await h.ticket(ticketId);
+    expect(currentExecution(state, 'qa', 'main')?.status).toBe('superseded');
+    expect(currentExecution(state, 'dev', '2')?.status).toBe('failed');
+    expect(await h.status(ticketId, 'fallback')).toBe('done');
+    expect(await h.status(ticketId, 'end')).toBe('wait');
+    expect(state.status).toBe('done');
+    const superseded = (await h.store.readAggregate(ticketId)).flatMap((event) => (event.type === 'node.superseded' ? [`${event.data.nodeId}/${event.data.lane}`] : []));
+    expect(superseded).toEqual(['qa/main']);
+  });
+
+  it('does not count an output whose items were all stale as the end of a path (D-021)', async () => {
+    let planRun = 0;
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId } = s.request;
+        if (nodeId === 'plan') {
+          planRun += 1;
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { task: planRun === 1 ? 'T1' : 'U1' } }] }));
+        } else expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { done: true } }));
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/stale-only',
+        [
+          { id: 'start', type: 'vuyro.human-task', version: 1 },
+          { id: 'replan', type: 'vuyro.human-task', version: 1 },
+          agent('plan'),
+          agent('dev', 'task {{ input.data.task }}', { ports: { in: { mode: 'each' } } }),
+          { id: 'join', type: 'vuyro.join', version: 1 },
+          { id: 'qa', type: 'vuyro.approval', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [
+          edge('start', 'done', 'plan'),
+          edge('replan', 'done', 'plan'),
+          edge('plan', 'done', 'dev'),
+          edge('dev', 'done', 'join'),
+          edge('join', 'done', 'qa'),
+          edge('qa', 'approve', 'end'),
+          edge('qa', 'reject', 'dev'),
+        ],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/stale-only');
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.drive();
+    await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
+    await h.drive();
+    // QA now reviews the new plan, but sends back only the old plan's task: nothing travels.
+    await h.ok('node.reject', { ticketId, nodeId: 'qa', items: [{ data: { feedback: 'redo T1' }, lineage: [{ nodeId: 'dev', run: 1, item: 0 }] }] });
+    let state = await h.ticket(ticketId);
+    const qaDone = (await h.store.readAggregate(ticketId)).filter((event) => event.type === 'node.completed' && event.data.nodeId === 'qa').at(-1);
+    expect(qaDone?.type === 'node.completed' ? qaDone.data : undefined).toMatchObject({ output: { port: 'reject' }, routes: [], stale: [{ to: 'dev', items: [0] }] });
+    if (state.template === undefined) throw new Error('no template');
+    const workflow = await h.registry.workflow(state.template);
+    // Not an end: the ticket stays open, waiting for someone to run QA again.
+    expect(endReached(state, workflow)).toBe(false);
+    expect(state.status).toBe('open');
+    expect(ticketWaitReasons(state, workflow).map((reason) => `${reason.kind}:${reason.nodeId}/${reason.lane}`)).toEqual(['stale:qa/main']);
+    await h.ok('node.retry', { ticketId, nodeId: 'qa' });
+    expect(await h.status(ticketId, 'qa')).toBe('review');
+    await h.ok('node.approve', { ticketId, nodeId: 'qa' });
+    state = await h.ticket(ticketId);
     expect(state.status).toBe('done');
   });
 
