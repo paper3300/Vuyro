@@ -40,18 +40,26 @@ export const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 export const PIPE_SERVER_END = 0x1;
 /** FILE_PIPE_LOCAL_INFORMATION.NamedPipeType bit set by PIPE_REJECT_REMOTE_CLIENTS. */
 export const FILE_PIPE_REJECT_REMOTE_CLIENTS = 0x2;
+/** FILE_PIPE_LOCAL_INFORMATION.NamedPipeState values. */
+export const FILE_PIPE_DISCONNECTED_STATE = 1;
+export const FILE_PIPE_LISTENING_STATE = 2;
 export const FILE_PIPE_CONNECTED_STATE = 3;
+export const FILE_PIPE_CLOSING_STATE = 4;
+export const FILE_TYPE_UNKNOWN = 0;
+export const FILE_TYPE_PIPE = 3;
 export const FILE_NAME_INFO_CLASS = 2;
 export const FILE_PIPE_LOCAL_INFORMATION_CLASS = 24;
 export const PROCESS_HANDLE_INFORMATION_CLASS = 51;
 export const STATUS_INFO_LENGTH_MISMATCH = 0xc0000004;
 
+export const NO_ERROR = 0;
 export const ERROR_FILE_NOT_FOUND = 2;
 export const ERROR_ACCESS_DENIED = 5;
 export const ERROR_INSUFFICIENT_BUFFER = 122;
 export const ERROR_PIPE_BUSY = 231;
 export const ERROR_NO_DATA = 232;
 export const ERROR_PIPE_NOT_CONNECTED = 233;
+export const ERROR_MORE_DATA = 234;
 
 export interface Win32 {
   CreateFileW(
@@ -74,6 +82,7 @@ export interface Win32 {
   GetNamedPipeInfo(pipe: Handle, flags: OutSlot<number>, outSize: null, inSize: null, maxInstances: null): number;
   DisconnectNamedPipe(pipe: Handle): number;
   GetFileInformationByHandleEx(handle: Handle, cls: number, buffer: Buffer, length: number): number;
+  GetFileType(handle: Handle): number;
   /** Returns an NTSTATUS. */
   NtQueryInformationProcess(process: Handle, cls: number, buffer: Buffer, length: number, returned: OutSlot<number>): number;
   /** Returns an NTSTATUS. `ioStatus` is a 16-byte IO_STATUS_BLOCK. */
@@ -172,6 +181,7 @@ function bind(): Win32 {
     GetNamedPipeInfo: k('int GetNamedPipeInfo(intptr_t pipe, _Out_ uint32_t *flags, void *outSize, void *inSize, void *maxInstances)'),
     DisconnectNamedPipe: k('int DisconnectNamedPipe(intptr_t pipe)'),
     GetFileInformationByHandleEx: k('int GetFileInformationByHandleEx(intptr_t handle, int cls, void *buffer, uint32_t length)'),
+    GetFileType: k('uint32_t GetFileType(intptr_t handle)'),
     NtQueryInformationProcess: n(
       'int32_t NtQueryInformationProcess(intptr_t process, int cls, void *buffer, uint32_t length, _Out_ uint32_t *returned)',
     ),

@@ -1,16 +1,23 @@
 import {
   DACL_SECURITY_INFORMATION,
   ERROR_INSUFFICIENT_BUFFER,
+  ERROR_MORE_DATA,
   FILE_NAME_INFO_CLASS,
+  FILE_PIPE_CLOSING_STATE,
   FILE_PIPE_CONNECTED_STATE,
+  FILE_PIPE_DISCONNECTED_STATE,
+  FILE_PIPE_LISTENING_STATE,
   FILE_PIPE_LOCAL_INFORMATION_CLASS,
   FILE_PIPE_REJECT_REMOTE_CLIENTS,
   FILE_READ_ATTRIBUTES,
   FILE_SHARE_ALL,
+  FILE_TYPE_PIPE,
+  FILE_TYPE_UNKNOWN,
   GROUP_SECURITY_INFORMATION,
   type Handle,
   INVALID_HANDLE_VALUE,
   type NativePointer,
+  NO_ERROR,
   OPEN_EXISTING,
   type OutSlot,
   OWNER_SECURITY_INFORMATION,
@@ -165,11 +172,17 @@ export function getProcessUserSid(pid: number): string {
   }
 }
 
+export type PipeInstanceState = 'listening' | 'disconnected' | 'connected' | 'closing' | 'unknown';
+
 export interface PipeServerInstance {
   readonly handle: Handle;
-  /** A client is connected to this instance. */
-  readonly connected: boolean;
-  /** Process id of the connected client; undefined when none is connected or the lookup failed. */
+  readonly state: PipeInstanceState;
+  /**
+   * The instance has or had a client whose data may still be readable
+   * (every state except listening and disconnected, including unknown ones).
+   */
+  readonly occupied: boolean;
+  /** Process id of the client; undefined when not occupied or the lookup failed. */
   readonly clientPid: number | undefined;
   /** Whether the instance was created with PIPE_REJECT_REMOTE_CLIENTS. */
   readonly rejectsRemoteClients: boolean;
@@ -177,13 +190,21 @@ export interface PipeServerInstance {
 
 const LOCAL_PIPE_PREFIX = String.raw`\\.\pipe` + '\\';
 
+const PIPE_STATES: Record<number, PipeInstanceState> = {
+  [FILE_PIPE_LISTENING_STATE]: 'listening',
+  [FILE_PIPE_DISCONNECTED_STATE]: 'disconnected',
+  [FILE_PIPE_CONNECTED_STATE]: 'connected',
+  [FILE_PIPE_CLOSING_STATE]: 'closing',
+};
+
 /**
  * Server-end instances of `pipePath` held by this process: the listening
  * instances and the accepted connections that libuv created.
  *
- * Only handles of type File that were granted WRITE_DAC are queried (libuv
- * requests it for every server instance). Those are overlapped handles, so the
- * pipe queries below cannot block on a pending synchronous read.
+ * Candidates are this process's File handles that were granted WRITE_DAC
+ * (libuv requests it for every server instance). A candidate is skipped only
+ * when it is positively not one of ours: not a pipe, a different name, or a
+ * client end. Anything that cannot be determined throws, so callers fail closed.
  */
 export function findOwnPipeServerInstances(pipePath: string): PipeServerInstance[] {
   if (!pipePath.toLowerCase().startsWith(LOCAL_PIPE_PREFIX)) throw new Error(`Not a local pipe path: ${pipePath}`);
@@ -193,19 +214,28 @@ export function findOwnPipeServerInstances(pipePath: string): PipeServerInstance
   const instances: PipeServerInstance[] = [];
   for (const entry of ownHandles()) {
     if (entry.objectType !== fileType || (entry.grantedAccess & WRITE_DAC) === 0) continue;
+    const type = w.GetFileType(entry.handle);
+    if (type === FILE_TYPE_UNKNOWN) {
+      const error = w.GetLastError();
+      if (error !== NO_ERROR) throw new Win32Error('GetFileType', error);
+    }
+    if (type !== FILE_TYPE_PIPE) continue;
+    if (fileName(entry.handle).toLowerCase() !== expectedName) continue;
     const flags: OutSlot<number> = [0];
-    if (!w.GetNamedPipeInfo(entry.handle, flags, null, null, null) || ((flags[0] ?? 0) & PIPE_SERVER_END) === 0) continue;
-    if (fileName(entry.handle)?.toLowerCase() !== expectedName) continue;
+    if (!w.GetNamedPipeInfo(entry.handle, flags, null, null, null)) throw new Win32Error('GetNamedPipeInfo', w.GetLastError());
+    if (((flags[0] ?? 0) & PIPE_SERVER_END) === 0) continue; // a client end held by this process
     const local = pipeLocalInformation(entry.handle);
-    const connected = local.state === FILE_PIPE_CONNECTED_STATE;
+    const state = PIPE_STATES[local.state] ?? 'unknown';
+    const occupied = state !== 'listening' && state !== 'disconnected';
     let clientPid: number | undefined;
-    if (connected) {
+    if (occupied) {
       const pid: OutSlot<number> = [0];
       if (w.GetNamedPipeClientProcessId(entry.handle, pid) && (pid[0] ?? 0) !== 0) clientPid = pid[0] ?? undefined;
     }
     instances.push({
       handle: entry.handle,
-      connected,
+      state,
+      occupied,
       clientPid,
       rejectsRemoteClients: (local.type & FILE_PIPE_REJECT_REMOTE_CLIENTS) !== 0,
     });
@@ -273,11 +303,20 @@ function fileObjectTypeIndex(): number {
   }
 }
 
-/** FILE_NAME_INFO { DWORD FileNameLength; WCHAR FileName[]; }; for a pipe this is `\<name>`. */
-function fileName(handle: Handle): string | undefined {
-  const buffer = Buffer.alloc(1024);
-  if (!win32().GetFileInformationByHandleEx(handle, FILE_NAME_INFO_CLASS, buffer, buffer.length)) return undefined;
-  return buffer.toString('utf16le', 4, 4 + buffer.readUInt32LE(0));
+/** FILE_NAME_INFO { DWORD FileNameLength; WCHAR FileName[]; }; for a pipe this is `\<name>`. Throws on failure. */
+function fileName(handle: Handle): string {
+  const w = win32();
+  for (let size = 1024; size <= 128 * 1024; size *= 4) {
+    const buffer = Buffer.alloc(size);
+    if (w.GetFileInformationByHandleEx(handle, FILE_NAME_INFO_CLASS, buffer, buffer.length)) {
+      const length = buffer.readUInt32LE(0);
+      if (4 + length > buffer.length) throw new Error('FILE_NAME_INFO length exceeds the buffer');
+      return buffer.toString('utf16le', 4, 4 + length);
+    }
+    const error = w.GetLastError();
+    if (error !== ERROR_MORE_DATA) throw new Win32Error('GetFileInformationByHandleEx(FileNameInfo)', error);
+  }
+  throw new Error('FILE_NAME_INFO does not fit in 128 KiB');
 }
 
 /** FILE_PIPE_LOCAL_INFORMATION: ten ULONGs; NamedPipeType at 0, NamedPipeState at 32. */

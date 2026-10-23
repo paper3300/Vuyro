@@ -7,6 +7,7 @@ import {
   getCurrentUserSid,
   getProcessUserSid,
   type PipeSecurity,
+  type PipeServerInstance,
   setPipeDaclOnHandle,
 } from '../platform/win32/pipe-security.ts';
 
@@ -15,38 +16,52 @@ import {
  *
  * Node creates the pipe with the default descriptor, which also grants read
  * access to Everyone and Anonymous, and offers no way to pass another one.
- * Two independent measures close that gap without relying on accept order:
+ * Three measures close that gap without relying on accept order:
  *
- * 1. Right after `listen`, the DACL is replaced through one of our own server
- *    instance handles (found in this process's handle table). The descriptor is
- *    shared by all instances, so from then on the OS refuses other users at open time.
+ * 1. DACL: right after `listen`, the DACL is replaced through one of our own server
+ *    instance handles (found in this process's handle table) and read back. The
+ *    descriptor is shared by all instances, so from then on the OS refuses other
+ *    users at open time.
  * 2. Client check: after the DACL is applied and again whenever a connection
- *    arrives, every connected instance's client process is looked up
- *    (GetNamedPipeClientProcessId → process token user SID). Instances whose client
- *    is not accepted, or whose client cannot be identified, are disconnected at the
- *    OS level, which discards unread data. Sockets start paused, so nothing is read
- *    before the check has run.
+ *    arrives, every occupied instance's client process is identified
+ *    (GetNamedPipeClientProcessId → process token user SID). Instances that are not
+ *    positively accepted are disconnected at the OS level, which discards unread
+ *    data. Sockets start paused, so nothing is read before the check has run.
  * 3. Hand-off on first data: Node does not expose which OS instance a socket uses,
  *    so a socket is only passed to `onConnection` once it delivers data. A
  *    disconnected (rejected) instance can never deliver data, its read fails, and
- *    the socket is dropped without reaching the handler. Clients speak first in
- *    the engine protocol, so a connection that closes before sending anything is
- *    dropped as well.
+ *    the socket is dropped without reaching the handler.
  *
- * Connections that Node dispatches before the server is secured are destroyed.
+ * Everything fails closed: a step that cannot be completed or verified rejects
+ * instead of letting a connection through.
+ * - Startup: any failure (no instance found, DACL not applied or not as expected,
+ *   initial check incomplete) closes the server and rejects.
+ * - Per connection: if the check is incomplete (discovery error, fewer instances
+ *   found than open sockets, a disconnect that failed), the arriving socket is
+ *   destroyed (`failedChecks`).
+ * - Per instance: unknown pipe state, missing client pid, SID lookup failure,
+ *   `acceptClient` returning anything but `true` or throwing → rejected.
+ * - Sockets that close, error or stay silent past `firstDataTimeoutMs` before
+ *   their first data are dropped; a handler that throws gets its socket destroyed.
+ * - Connections that Node dispatches before the server is secured are destroyed.
  */
 
 export interface PipeClient {
   readonly pid: number;
-  /** undefined when the client process could not be opened. */
-  readonly userSid: string | undefined;
+  readonly userSid: string;
 }
 
 export interface SecurePipeServerOptions {
   /** DACL to apply. Defaults to the current user only, remote logons denied. */
   readonly sddl?: string;
-  /** Which clients to serve. Defaults to processes running as the current user. */
+  /**
+   * Which identified clients to serve. Defaults to processes running as the
+   * current user. Only a returned `true` accepts; clients that cannot be
+   * identified are rejected before this is called.
+   */
   readonly acceptClient?: (client: PipeClient) => boolean;
+  /** A socket that sends nothing for this long is dropped. Default 30000 ms. */
+  readonly firstDataTimeoutMs?: number;
   /** Test seam: runs after `listen` and before the pipe is secured. */
   readonly afterListen?: () => Promise<void> | void;
 }
@@ -58,9 +73,11 @@ export interface SecurePipeServer {
   readonly security: PipeSecurity;
   /** Connections destroyed because Node dispatched them before the pipe was secured. */
   readonly droppedBeforeSecure: number;
-  /** Client connections disconnected by the client check (not accepted or not identifiable). */
+  /** Client instances disconnected by the client check (not accepted or not identifiable). */
   readonly rejectedClients: number;
-  /** Sockets that closed before delivering data and were never handed to `onConnection`. */
+  /** Arriving sockets destroyed because the client check could not be completed. */
+  readonly failedChecks: number;
+  /** Sockets dropped before delivering data (closed, errored or timed out). */
   readonly closedBeforeData: number;
   close(): Promise<void>;
 }
@@ -82,22 +99,58 @@ export async function listenSecurePipe(
   const userSid = getCurrentUserSid();
   const sddl = options.sddl ?? currentUserOnlySddl(userSid);
   const acceptClient = options.acceptClient ?? ((client: PipeClient) => client.userSid === userSid);
+  const firstDataTimeoutMs = options.firstDataTimeoutMs ?? 30_000;
   const server = net.createServer({ pauseOnConnect: true });
 
   let secured = false;
+  /** Sockets Node has dispatched and not yet closed; each one owns a server instance handle. */
+  let openSockets = 0;
   let droppedBeforeSecure = 0;
   let rejectedClients = 0;
+  let failedChecks = 0;
   let closedBeforeData = 0;
 
-  const checkClients = (): void => {
-    for (const instance of findOwnPipeServerInstances(pipePath)) {
-      if (!instance.connected) continue;
-      const pid = instance.clientPid;
-      // Fail closed: a client whose process cannot be identified is not served.
-      if (pid !== undefined && acceptClient({ pid, userSid: tryProcessUserSid(pid) })) continue;
-      disconnectPipeInstance(instance.handle);
-      rejectedClients += 1;
+  /** True only if the instance's client is identified and explicitly accepted. */
+  const isAccepted = (instance: PipeServerInstance): boolean => {
+    if (instance.state !== 'connected' || instance.clientPid === undefined) return false;
+    let clientSid: string;
+    try {
+      clientSid = getProcessUserSid(instance.clientPid);
+    } catch {
+      return false;
     }
+    try {
+      // Only a literal `true` accepts, whatever a JS caller's predicate returns.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-boolean-literal-compare
+      return acceptClient({ pid: instance.clientPid, userSid: clientSid }) === true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * Disconnects every occupied instance that is not accepted.
+   * Returns false when the check could not be completed for all instances.
+   */
+  const checkClients = (): boolean => {
+    let instances: PipeServerInstance[];
+    try {
+      instances = findOwnPipeServerInstances(pipePath);
+    } catch {
+      return false;
+    }
+    // Every open socket owns one instance that is no longer listening; seeing fewer means some were missed.
+    let complete = instances.filter((instance) => instance.state !== 'listening').length >= openSockets;
+    for (const instance of instances) {
+      if (!instance.occupied || isAccepted(instance)) continue;
+      try {
+        disconnectPipeInstance(instance.handle);
+        rejectedClients += 1;
+      } catch {
+        complete = false;
+      }
+    }
+    return complete;
   };
 
   /** Waits for the first data before handing off; see measure 3 above. */
@@ -109,33 +162,39 @@ export async function listenSecurePipe(
       socket.unshift(chunk);
       void handOff(socket, onConnection);
     };
-    const onGone = (): void => {
+    const drop = (): void => {
       stop();
       closedBeforeData += 1;
       socket.destroy();
     };
+    const timer = setTimeout(drop, firstDataTimeoutMs);
     const stop = (): void => {
+      clearTimeout(timer);
       socket.off('readable', onReadable);
-      socket.off('end', onGone);
-      socket.off('close', onGone);
+      socket.off('end', drop);
+      socket.off('close', drop);
+      socket.off('error', drop);
     };
     socket.on('readable', onReadable);
-    socket.once('end', onGone);
-    socket.once('close', onGone);
+    socket.once('end', drop);
+    socket.once('close', drop);
+    socket.once('error', drop);
   };
 
   server.on('connection', (socket) => {
+    openSockets += 1;
+    socket.once('close', () => {
+      openSockets -= 1;
+    });
     socket.on('error', () => undefined);
     if (!secured) {
       droppedBeforeSecure += 1;
       socket.destroy();
       return;
     }
-    try {
-      // This socket's own instance is among those checked.
-      checkClients();
-    } catch {
-      // Fail closed: without a completed check the connection is not served.
+    // This socket's own instance is among those checked.
+    if (!checkClients()) {
+      failedChecks += 1;
       socket.destroy();
       return;
     }
@@ -160,7 +219,7 @@ export async function listenSecurePipe(
     if (options.sddl === undefined && (trustees.length !== 1 || trustees[0] !== userSid)) {
       throw new Error(`Pipe DACL was not restricted to the current user: ${security.sddl}`);
     }
-    checkClients();
+    if (!checkClients()) throw new Error('Initial client check could not be completed');
     secured = true;
   } catch (error) {
     await new Promise<void>((resolve) => server.close(() => { resolve(); }));
@@ -176,6 +235,9 @@ export async function listenSecurePipe(
     },
     get rejectedClients() {
       return rejectedClients;
+    },
+    get failedChecks() {
+      return failedChecks;
     },
     get closedBeforeData() {
       return closedBeforeData;
@@ -198,12 +260,4 @@ async function handOff(socket: net.Socket, onConnection: (socket: net.Socket) =>
   }
   // Respect handlers that consume the stream themselves ('readable', pipe(), resume()).
   if (!socket.destroyed && socket.readableFlowing !== true && socket.listenerCount('readable') === 0) socket.resume();
-}
-
-function tryProcessUserSid(pid: number): string | undefined {
-  try {
-    return getProcessUserSid(pid);
-  } catch {
-    return undefined;
-  }
 }

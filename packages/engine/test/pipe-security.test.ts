@@ -5,9 +5,10 @@ import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { listenSecurePipe } from '../src/ipc/secure-pipe-server.ts';
+import { listenSecurePipe, type PipeClient, type SecurePipeServerOptions } from '../src/ipc/secure-pipe-server.ts';
 import {
   ERROR_ACCESS_DENIED,
+  FILE_TYPE_UNKNOWN,
   GENERIC_READ,
   GENERIC_WRITE,
   INVALID_HANDLE_VALUE,
@@ -409,5 +410,258 @@ describe.runIf(isWindows)('named pipe security (Windows)', () => {
     cleanup.push(() => secure.close());
 
     expect(getPipeServerUserSid(path)).toBe(getCurrentUserSid());
+  });
+});
+
+/**
+ * Failure injection: every step that could not verify a client must reject.
+ * Win32 calls are replaced on the shared binding object returned by win32().
+ */
+describe.runIf(isWindows)('named pipe security fails closed', () => {
+  const cleanup: Array<() => Promise<void> | void> = [];
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    for (const fn of cleanup.splice(0).reverse()) await fn();
+  });
+
+  async function serve(options: SecurePipeServerOptions = {}) {
+    const path = pipePath();
+    const received: string[] = [];
+    const seen = { connections: 0 };
+    const secure = await listenSecurePipe(path, recordInto(received, seen), options);
+    cleanup.push(() => secure.close());
+    return { path, secure, received, seen };
+  }
+
+  /** The client is cut off without a reply and the handler never runs. */
+  async function expectRejected(served: Awaited<ReturnType<typeof serve>>): Promise<void> {
+    expect(await talkUntilClosed(served.path, 'hello')).toEqual({ closed: true, received: '' });
+    expect(served.seen.connections).toBe(0);
+    expect(served.received).toEqual([]);
+  }
+
+  /** Once the injected failure is gone, the server serves again. */
+  async function expectRecovers(served: Awaited<ReturnType<typeof serve>>): Promise<void> {
+    vi.restoreAllMocks();
+    expect(await roundTrip(served.path, 'after')).toBe('after');
+  }
+
+  const w = isWindows ? win32() : undefined;
+  const real = w === undefined ? undefined : { ...w };
+  function binding() {
+    if (w === undefined || real === undefined) throw new Error('Windows only');
+    return { w, real };
+  }
+
+  /** True for a server instance that has a client: the one we want a check to miss. */
+  function hasClient(handle: number): boolean {
+    return binding().real.GetNamedPipeClientProcessId(handle, [0]) !== 0;
+  }
+
+  // --- discovery of our own server instances -----------------------------------------
+
+  it('handle snapshot fails (NtQueryInformationProcess)', async () => {
+    const served = await serve();
+    vi.spyOn(binding().w, 'NtQueryInformationProcess').mockReturnValue(0xc0000022 | 0); // STATUS_ACCESS_DENIED
+    await expectRejected(served);
+    expect(served.secure.failedChecks).toBe(1);
+    await expectRecovers(served);
+  });
+
+  it('file type cannot be read (GetFileType)', async () => {
+    const served = await serve();
+    const { w } = binding();
+    const { real } = binding();
+    // Fails only for the instance with the client, so the other instances still look complete.
+    vi.spyOn(w, 'GetFileType').mockImplementation((handle) => (hasClient(handle) ? FILE_TYPE_UNKNOWN : real.GetFileType(handle)));
+    vi.spyOn(w, 'GetLastError').mockReturnValue(ERROR_ACCESS_DENIED);
+    await expectRejected(served);
+    expect(served.secure.failedChecks).toBe(1);
+    await expectRecovers(served);
+  });
+
+  it('pipe name cannot be read (GetFileInformationByHandleEx)', async () => {
+    const served = await serve();
+    const { w } = binding();
+    const { real } = binding();
+    vi.spyOn(w, 'GetFileInformationByHandleEx').mockImplementation((handle, ...rest) =>
+      hasClient(handle) ? 0 : real.GetFileInformationByHandleEx(handle, ...rest),
+    );
+    vi.spyOn(w, 'GetLastError').mockReturnValue(ERROR_ACCESS_DENIED);
+    await expectRejected(served);
+    expect(served.secure.failedChecks).toBe(1);
+    await expectRecovers(served);
+  });
+
+  it('pipe end cannot be read (GetNamedPipeInfo)', async () => {
+    const served = await serve();
+    const { w, real } = binding();
+    vi.spyOn(w, 'GetNamedPipeInfo').mockImplementation((handle, ...rest) => (hasClient(handle) ? 0 : real.GetNamedPipeInfo(handle, ...rest)));
+    await expectRejected(served);
+    expect(served.secure.failedChecks).toBe(1);
+    await expectRecovers(served);
+  });
+
+  it('pipe state cannot be read (NtQueryInformationFile)', async () => {
+    const served = await serve();
+    const { w, real } = binding();
+    vi.spyOn(w, 'NtQueryInformationFile').mockImplementation((handle, ...rest) =>
+      hasClient(handle) ? 0xc0000001 | 0 : real.NtQueryInformationFile(handle, ...rest), // STATUS_UNSUCCESSFUL
+    );
+    await expectRejected(served);
+    expect(served.secure.failedChecks).toBe(1);
+    await expectRecovers(served);
+  });
+
+  it('our instances are not found at all (fewer instances than open sockets)', async () => {
+    const served = await serve();
+    const { w, real } = binding();
+    // Every handle now reports another name, so discovery returns nothing.
+    vi.spyOn(w, 'GetFileInformationByHandleEx').mockImplementation((handle, cls, buffer, length) => {
+      const ok = real.GetFileInformationByHandleEx(handle, cls, buffer, length);
+      const other = Buffer.from('\\someone-else', 'utf16le');
+      buffer.writeUInt32LE(other.length, 0);
+      other.copy(buffer, 4);
+      return ok;
+    });
+    await expectRejected(served);
+    expect(served.secure.failedChecks).toBe(1);
+    await expectRecovers(served);
+  });
+
+  it.each([
+    ['closing', 4],
+    ['an unknown', 9],
+  ])('an instance in %s state is not served', async (_label, state) => {
+    const served = await serve();
+    const { w, real } = binding();
+    vi.spyOn(w, 'NtQueryInformationFile').mockImplementation((handle, io, buffer, length, cls) => {
+      const status = real.NtQueryInformationFile(handle, io, buffer, length, cls);
+      buffer.writeUInt32LE(state, 32); // NamedPipeState
+      return status;
+    });
+    await expectRejected(served);
+    vi.restoreAllMocks();
+  });
+
+  // --- identifying the client ------------------------------------------------------
+
+  it('client process id cannot be read (GetNamedPipeClientProcessId)', async () => {
+    const served = await serve({ acceptClient: () => true });
+    vi.spyOn(binding().w, 'GetNamedPipeClientProcessId').mockReturnValue(0);
+    await expectRejected(served);
+    expect(served.secure.rejectedClients).toBe(1);
+    await expectRecovers(served);
+  });
+
+  it('client process cannot be opened (OpenProcess), even if acceptClient accepts everything', async () => {
+    const served = await serve({ acceptClient: () => true });
+    vi.spyOn(binding().w, 'OpenProcess').mockReturnValue(0);
+    await expectRejected(served);
+    expect(served.secure.rejectedClients).toBe(1);
+    await expectRecovers(served);
+  });
+
+  it('client token cannot be read (OpenProcessToken)', async () => {
+    const served = await serve({ acceptClient: () => true });
+    vi.spyOn(binding().w, 'OpenProcessToken').mockReturnValue(0);
+    await expectRejected(served);
+    expect(served.secure.rejectedClients).toBe(1);
+    await expectRecovers(served);
+  });
+
+  it('acceptClient throws', async () => {
+    const served = await serve({
+      acceptClient: () => {
+        throw new Error('policy unavailable');
+      },
+    });
+    await expectRejected(served);
+    expect(served.secure.rejectedClients).toBe(1);
+  });
+
+  it('acceptClient returns something other than true', async () => {
+    const served = await serve({ acceptClient: (() => 1) as unknown as (client: PipeClient) => boolean });
+    await expectRejected(served);
+    expect(served.secure.rejectedClients).toBe(1);
+  });
+
+  // --- acting on a rejection -----------------------------------------------------
+
+  it('disconnecting a rejected client fails (DisconnectNamedPipe)', async () => {
+    const served = await serve({ acceptClient: () => false });
+    vi.spyOn(binding().w, 'DisconnectNamedPipe').mockReturnValue(0);
+    await expectRejected(served);
+    expect(served.secure.failedChecks).toBe(1);
+    vi.restoreAllMocks();
+  });
+
+  // --- after the check ---------------------------------------------------------
+
+  it('a client that stays silent is dropped after firstDataTimeoutMs', async () => {
+    const served = await serve({ firstDataTimeoutMs: 100 });
+    const socket = await connect(served.path);
+    const closed = new Promise<void>((resolve) => socket.once('close', () => { resolve(); }));
+    await closed;
+    expect(served.seen.connections).toBe(0);
+    expect(served.secure.closedBeforeData).toBe(1);
+  });
+
+  it('a handler that throws gets its socket destroyed', async () => {
+    const path = pipePath();
+    const secure = await listenSecurePipe(path, () => {
+      throw new Error('handler failed');
+    });
+    cleanup.push(() => secure.close());
+    expect(await talkUntilClosed(path, 'hello')).toEqual({ closed: true, received: '' });
+  });
+
+  // --- startup --------------------------------------------------------------------
+
+  async function expectStartupFails(options: SecurePipeServerOptions = {}): Promise<void> {
+    const path = pipePath();
+    await expect(listenSecurePipe(path, echo, options)).rejects.toThrow();
+    vi.restoreAllMocks();
+    expect((await connectError(path)).code).toBe('ENOENT'); // the server was closed
+  }
+
+  it('startup: no instance handle found', async () => {
+    const { w } = binding();
+    vi.spyOn(w, 'GetFileInformationByHandleEx').mockImplementation((_handle, _cls, buffer) => {
+      const other = Buffer.from('\\someone-else', 'utf16le');
+      buffer.writeUInt32LE(other.length, 0);
+      other.copy(buffer, 4);
+      return 1;
+    });
+    await expectStartupFails();
+  });
+
+  it('startup: the DACL cannot be applied (SetSecurityInfo)', async () => {
+    vi.spyOn(binding().w, 'SetSecurityInfo').mockReturnValue(ERROR_ACCESS_DENIED);
+    await expectStartupFails();
+  });
+
+  it('startup: the DACL silently stays the default (read-back check)', async () => {
+    vi.spyOn(binding().w, 'SetSecurityInfo').mockReturnValue(0); // "success" without applying
+    await expectStartupFails();
+  });
+
+  it('startup: the DACL cannot be read back (GetSecurityInfo)', async () => {
+    vi.spyOn(binding().w, 'GetSecurityInfo').mockReturnValue(ERROR_ACCESS_DENIED);
+    await expectStartupFails();
+  });
+
+  it('startup: the initial client check cannot be completed', async () => {
+    const { w, real } = binding();
+    let applied = false;
+    vi.spyOn(w, 'SetSecurityInfo').mockImplementation((...args) => {
+      applied = true;
+      return real.SetSecurityInfo(...args);
+    });
+    // Snapshots work until the DACL is in place, then the initial check's snapshot fails.
+    vi.spyOn(w, 'NtQueryInformationProcess').mockImplementation((...args) =>
+      applied ? 0xc0000022 | 0 : real.NtQueryInformationProcess(...args),
+    );
+    await expectStartupFails();
   });
 });

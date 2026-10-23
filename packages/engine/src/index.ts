@@ -23,4 +23,4 @@ export {
   setPipeDaclOnHandle,
   Win32Error,
 } from './platform/win32/pipe-security.ts';
-export type { CurrentUserOnlyOptions, PipeSecurity, PipeServerInstance } from './platform/win32/pipe-security.ts';
+export type { CurrentUserOnlyOptions, PipeInstanceState, PipeSecurity, PipeServerInstance } from './platform/win32/pipe-security.ts';
