@@ -1,4 +1,5 @@
-import type { AgentProvider, RunObservation, RunOutcome } from '@vuyro/contracts';
+import type { AgentProvider, RunObservation } from '@vuyro/contracts';
+import type { AgentSettlement } from './settle.ts';
 
 /**
  * An adapter runs one agent CLI and turns its structured output (Claude `stream-json`,
@@ -6,7 +7,7 @@ import type { AgentProvider, RunObservation, RunOutcome } from '@vuyro/contracts
  * it records every observation with `run.observe`, settles the run with `run.settle`, and then
  * finishes the node from what the agent reported through `vuyro node done`.
  *
- * M2 fixes this interface; M3 implements the Claude and Codex adapters behind it.
+ * M2 fixed this interface; M3 implements the Claude and Codex adapters behind it (`CliAgentAdapter`).
  */
 
 /** What the engine hands an adapter to start one run. */
@@ -30,15 +31,8 @@ export interface AgentStartRequest {
   readonly env: Readonly<Record<string, string>>;
   /** Continue this provider session (after a pause or an engine restart). */
   readonly resume?: { readonly runId: string; readonly providerSessionId: string };
-}
-
-/** How a run ended, as the adapter saw it. */
-export interface AgentSettlement {
-  readonly outcome: RunOutcome;
-  readonly exitCode?: number | null;
-  readonly signal?: string | null;
-  readonly terminalReason?: string;
-  readonly error?: string;
+  /** Stop the run after this long (settles as failed, `timeout`). */
+  readonly timeoutMs?: number;
 }
 
 export interface AgentRunHandle {
@@ -59,11 +53,26 @@ export function describeAdapter(adapter: Pick<AgentAdapter, 'provider'>): string
   return `agent-adapter:${adapter.provider}`;
 }
 
-/** Environment variable names the engine sets for node agents. */
+/** Environment variable names the engine sets for node agents (and the `vuyro` CLI reads). */
 export const AGENT_ENV = {
   runToken: 'VUYRO_RUN_TOKEN',
   ticket: 'VUYRO_TICKET',
   node: 'VUYRO_NODE',
   lane: 'VUYRO_LANE',
   runId: 'VUYRO_RUN_ID',
+  /** Where the engine listens and keeps its token, so the agent's `vuyro` calls reach the same engine. */
+  pipe: 'VUYRO_PIPE',
+  dataDir: 'VUYRO_DATA_DIR',
 } as const;
+
+export type { AgentSettlement, ProviderTerminal, SettleInput, StreamNormalizer } from './settle.ts';
+export { settleRun } from './settle.ts';
+export type { Clock, TimerHandle } from './clock.ts';
+export { AsyncQueue, FakeProcessRunner, nodeProcessRunner, readLines } from './process.ts';
+export type { FakeProcessContext, FakeScript, FakeSpawn, FakeStep, ManagedProcess, ProcessExit, ProcessRunner, SpawnSpec } from './process.ts';
+export { ClaudeStreamNormalizer, claudeArgs } from './claude.ts';
+export { CodexStreamNormalizer, codexArgs } from './codex.ts';
+export { CliAgentAdapter, DEFAULT_CLAUDE_ARGS, DEFAULT_CODEX_ARGS } from './cli-adapter.ts';
+export type { CliAgentAdapterOptions } from './cli-adapter.ts';
+export { agentEnvironment, envValue, ExecutableNotFoundError, resolveExecutable } from './environment.ts';
+export { clip, fitValue, LIMITS } from './limits.ts';

@@ -41,6 +41,13 @@ export interface WorkflowEngineOptions {
    * Undefined = the process default.
    */
   readonly workspace?: (target: WorkspaceTarget) => string | undefined;
+  /** Time limit of one agent run (the adapter stops it and it settles as failed, `timeout`). Default none. */
+  readonly agentTimeoutMs?: number;
+  /**
+   * Extra environment for agents, e.g. where the engine listens (`VUYRO_PIPE`, `VUYRO_DATA_DIR`) so the agent's
+   * `vuyro` calls reach this engine. The run variables (token, ticket, node, lane, run id) always win.
+   */
+  readonly agentEnv?: Readonly<Record<string, string>>;
   readonly reportError?: (error: Error, context: string) => void;
 }
 
@@ -317,6 +324,7 @@ export class WorkflowEngine {
         run: exec.run,
         prompt,
         env: {
+          ...this.options.agentEnv,
           [AGENT_ENV.runToken]: runToken,
           [AGENT_ENV.ticket]: ticketId,
           [AGENT_ENV.node]: node.id,
@@ -325,6 +333,7 @@ export class WorkflowEngine {
         },
         ...(typeof model === 'string' && model !== '' ? { model } : {}),
         ...(cwd === undefined ? {} : { cwd }),
+        ...(this.options.agentTimeoutMs === undefined ? {} : { timeoutMs: this.options.agentTimeoutMs }),
         ...(resume === undefined ? {} : { resume }),
       });
     } catch (error) {

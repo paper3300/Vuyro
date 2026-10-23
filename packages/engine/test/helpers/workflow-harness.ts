@@ -26,6 +26,10 @@ export interface WorkflowHarnessOptions {
   /** Do not start the workflow engine (scheduler). */
   readonly noEngine?: boolean;
   readonly workspace?: WorkflowEngineOptions['workspace'];
+  /** Real adapters instead of the scripted one (e.g. CliAgentAdapter on the fake process runner). */
+  readonly adapters?: (parts: { clock: VirtualClock; processes: FakeProcessRunner; bus: CommandBus }) => WorkflowEngineOptions['adapters'];
+  readonly agentTimeoutMs?: number;
+  readonly agentEnv?: Readonly<Record<string, string>>;
 }
 
 export interface WorkflowHarness {
@@ -87,13 +91,15 @@ export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}):
           store,
           definitions: registry,
           clock,
-          adapters: { claude: adapter },
+          adapters: options.adapters?.({ clock, processes, bus }) ?? { claude: adapter },
           processRunner: processes,
           activity,
           scriptEnv: { PATH: '/bin' },
           reportError,
           ...(options.maxConcurrent === undefined ? {} : { maxConcurrent: options.maxConcurrent }),
           ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
+          ...(options.agentTimeoutMs === undefined ? {} : { agentTimeoutMs: options.agentTimeoutMs }),
+          ...(options.agentEnv === undefined ? {} : { agentEnv: options.agentEnv }),
         })
       : undefined;
     return { store, registry, bus, writer, adapter, engine };

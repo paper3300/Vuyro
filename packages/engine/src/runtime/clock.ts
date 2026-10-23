@@ -1,19 +1,10 @@
-/**
- * Time source for the engine. Everything that reads the time or waits goes through a Clock,
- * so tests can drive time with `VirtualClock` instead of sleeping.
- */
-export interface TimerHandle {
-  readonly timerId: number;
-}
+import type { Clock, TimerHandle } from '@vuyro/agent-adapters';
 
-export interface Clock {
-  /** Epoch milliseconds (UTC). */
-  now(): number;
-  setTimeout(callback: () => void, delayMs: number): TimerHandle;
-  clearTimeout(handle: TimerHandle): void;
-  /** Resolves after `delayMs` on this clock. */
-  sleep(delayMs: number): Promise<void>;
-}
+/**
+ * Time source for the engine. Everything that reads the time or waits goes through a Clock
+ * (interface shared with the adapters), so tests can drive time with `VirtualClock` instead of sleeping.
+ */
+export type { Clock, TimerHandle };
 
 class SystemClock implements Clock {
   private readonly timers = new Map<number, NodeJS.Timeout>();
