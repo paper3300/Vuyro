@@ -23,7 +23,7 @@ import {
   withLateArtifacts,
   WorkflowDraft,
 } from '../workflow/machine.ts';
-import { ACTIVE_STATUSES, currentExecution, EMPTY_TICKET, type Execution, execution, laneOf, nodeProgress } from '../workflow/state.ts';
+import { ACTIVE_STATUSES, currentExecution, EMPTY_TICKET, type Execution, execution, laneLive, laneOf, nodeProgress } from '../workflow/state.ts';
 import { type DefinitionState, definitionAggregate, runAggregate, type TicketState, ticketAggregate } from './aggregates.ts';
 import type { CommandTarget } from './authorize.ts';
 import type { CommandHandler, Decision, HandlerContext, Loaded } from './handlers.ts';
@@ -428,7 +428,11 @@ export const nodeRetry: CommandHandler<'node.retry', TicketState> = {
     if (isFailure(workflow)) return workflow;
     const node = nodeOf(workflow, payload.nodeId);
     if (isFailure(node)) return node;
-    const exec = pickLane(ticket.state, node.id, payload.lane, (candidate) => candidate.status === 'failed', 'failed');
+    // A failed lane of a replaced generation stays as it is: a newer group replaced its work (D-019).
+    if (payload.lane !== undefined && laneOf(ticket.state, node.id, payload.lane) !== undefined && !laneLive(ticket.state, node.id, payload.lane)) {
+      return fail('invariant_violated', `lane '${payload.lane}' of node '${node.id}' belongs to a replaced group; it cannot be retried`);
+    }
+    const exec = pickLane(ticket.state, node.id, payload.lane, (candidate) => candidate.status === 'failed' && laneLive(ticket.state, node.id, candidate.lane), 'failed');
     if (isFailure(exec)) return exec;
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);
     rerun(draft, exec, 'retry');

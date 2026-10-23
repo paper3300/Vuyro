@@ -425,6 +425,276 @@ describe('routing edge cases', () => {
     expect((await h.ticket(ticketId)).status).toBe('done');
   });
 
+  it('supersedes the lanes of a replaced plan, so they cannot hold up the join of the new plan', async () => {
+    // Review counterexample (e864a07): old-plan lanes waiting in Review blocked the new plan's join and end forever.
+    let planRun = 0;
+    let oldCancelled = false;
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId } = s.request;
+        if (nodeId === 'plan') {
+          planRun += 1;
+          const prefix = planRun === 1 ? 'T' : 'U';
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [1, 2].map((n) => ({ data: { taskId: `${prefix}${n}` } })) }));
+          return undefined;
+        }
+        const taskId = /task (\w+)/.exec(s.request.prompt)?.[1] ?? '?';
+        if (taskId === 'T2') {
+          await s.sleep(60 * MINUTE);
+          oldCancelled = s.cancelled;
+          return undefined;
+        }
+        expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { taskId } }));
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/replan-review',
+        [
+          { id: 'start', type: 'vuyro.human-task', version: 1 },
+          { id: 'replan', type: 'vuyro.human-task', version: 1 },
+          agent('plan'),
+          agent('dev', 'task {{ nodes.plan.item.data.taskId }}', { ports: { in: { mode: 'each' } }, review: 'human' }),
+          { id: 'join', type: 'vuyro.join', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [edge('start', 'done', 'plan'), edge('replan', 'done', 'plan'), edge('plan', 'done', 'dev'), edge('dev', 'done', 'join'), edge('join', 'done', 'end')],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/replan-review');
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.activity.idle();
+    // Old plan: T1 waits in Review, T2 is still running.
+    expect(await h.status(ticketId, 'dev', '1')).toBe('review');
+    expect(await h.status(ticketId, 'dev', '2')).toBe('running');
+
+    await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
+    await h.activity.idle();
+    let state = await h.ticket(ticketId);
+    expect(nodeProgress(state, 'dev').laneOrder).toEqual(['1', '2', '3', '4']);
+    expect(['1', '2'].map((lane) => currentExecution(state, 'dev', lane)?.status)).toEqual(['superseded', 'superseded']);
+    const superseded = (await h.store.readAggregate(ticketId)).flatMap((event) => (event.type === 'node.superseded' ? [`${event.data.lane}:${event.data.reason}`] : []));
+    expect(superseded).toEqual(['1:replaced', '2:replaced']);
+    expect(oldCancelled).toBe(true);
+    // The replaced review is gone: a person can no longer approve it, nor retry an old lane.
+    expect((await h.exec('node.approve', { ticketId, nodeId: 'dev', lane: '1' })).ok).toBe(false);
+    expect((await h.exec('node.retry', { ticketId, nodeId: 'dev', lane: '2' })).ok).toBe(false);
+
+    // Finishing every lane of the new plan runs the join and the end.
+    expect(['3', '4'].map((lane) => currentExecution(state, 'dev', lane)?.status)).toEqual(['review', 'review']);
+    await h.ok('node.approve', { ticketId, nodeId: 'dev', lane: '3' });
+    expect(nodeProgress(await h.ticket(ticketId), 'join').executions).toHaveLength(0);
+    await h.ok('node.approve', { ticketId, nodeId: 'dev', lane: '4' });
+    await h.drive();
+    state = await h.ticket(ticketId);
+    const joins = nodeProgress(state, 'join').executions;
+    expect(joins).toHaveLength(1);
+    expect(joins[0]?.output?.items.map((item) => item.data.taskId)).toEqual(['U1', 'U2']);
+    expect(await h.status(ticketId, 'end')).toBe('done');
+    // Both entries finished and nothing else is active: the ticket is done.
+    expect(state.status).toBe('done');
+    const lanes = await h.store.query("SELECT lane, status FROM p_node_lanes WHERE node_id = 'dev' ORDER BY lane");
+    expect(lanes).toEqual([
+      { lane: '1', status: 'wait' },
+      { lane: '2', status: 'wait' },
+      { lane: '3', status: 'done' },
+      { lane: '4', status: 'done' },
+    ]);
+  });
+
+  it('settles every join and fan-in of a command before deciding the ticket is done', async () => {
+    // Oracle counterexample against e864a07: the join fired while the finishing lane's edges were still being
+    // routed, reached the end and completed the ticket before the fan-in 'summary' was activated.
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId } = s.request;
+        const items = nodeId === 'plan' ? [1, 2].map((n) => ({ data: { n } })) : [{ data: { from: nodeId } }];
+        expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items }));
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/join-and-fan-in',
+        [
+          agent('plan'),
+          agent('dev', 'dev', { ports: { in: { mode: 'each' } } }),
+          { id: 'join', type: 'vuyro.join', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+          // Listed after the end on purpose: the sweep reaches the end first.
+          agent('summary'),
+        ],
+        [edge('plan', 'done', 'dev'), edge('dev', 'done', 'join'), edge('join', 'done', 'end'), edge('dev', 'done', 'summary')],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/join-and-fan-in');
+    await h.drive();
+    const state = await h.ticket(ticketId);
+    const events = await h.store.readAggregate(ticketId);
+    const completedAt = events.findIndex((event) => event.type === 'ticket.completed');
+    const summaryAt = events.findIndex((event) => event.type === 'node.activated' && event.data.nodeId === 'summary');
+    expect(summaryAt).toBeGreaterThan(-1);
+    expect(completedAt).toBeGreaterThan(summaryAt);
+    expect(currentExecution(state, 'summary', 'main')?.status).toBe('done');
+    expect(state.status).toBe('done');
+  });
+
+  it('takes every fan-out that becomes ready in the same command into one fan-in', async () => {
+    // d lane 1 feeds both chained fan-outs e1 and e2; d lane 2 fails late. Only then are e1 and e2 settled, together.
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId } = s.request;
+        if (nodeId === 'plan') expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [1, 2].map((n) => ({ data: { n } })) }));
+        else if (nodeId === 'd' && s.request.prompt.includes('item 2')) {
+          await s.sleep(60 * MINUTE);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'error', data: { reason: 'late failure' } }));
+        } else expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { from: nodeId } }));
+        return undefined;
+      },
+    });
+    const each = { ports: { in: { mode: 'each' as const } } };
+    await save(
+      h,
+      template(
+        'myteam/double-fan-in',
+        [
+          agent('plan'),
+          agent('d', 'item {{ input.data.n }}', each),
+          agent('e1', 'e1', each),
+          agent('e2', 'e2', each),
+          agent('a', 'summarize {{ inputs.in.length }}'),
+          agent('log'),
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [edge('plan', 'done', 'd'), edge('d', 'done', 'e1'), edge('d', 'done', 'e2'), edge('d', 'error', 'log'), edge('e1', 'done', 'a'), edge('e2', 'done', 'a'), edge('a', 'done', 'end')],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/double-fan-in');
+    await h.drive();
+    const state = await h.ticket(ticketId);
+    const runs = nodeProgress(state, 'a').executions;
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.inputs.in?.map((item) => item.data.from)).toEqual(['e1', 'e2']);
+    expect(state.status).toBe('done');
+  });
+
+  it('reworks only the live lanes a rejection points at, even when it also names a replaced lane', async () => {
+    let planRun = 0;
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId } = s.request;
+        if (nodeId === 'plan') {
+          planRun += 1;
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { task: planRun === 1 ? 'T1' : 'U1' } }] }));
+        } else expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { done: true } }));
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/reject-across-plans',
+        [
+          { id: 'start', type: 'vuyro.human-task', version: 1 },
+          { id: 'replan', type: 'vuyro.human-task', version: 1 },
+          agent('plan'),
+          agent('dev', 'task {{ input.data.task }}', { ports: { in: { mode: 'each' } } }),
+          { id: 'join', type: 'vuyro.join', version: 1 },
+          { id: 'qa', type: 'vuyro.approval', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [
+          edge('start', 'done', 'plan'),
+          edge('replan', 'done', 'plan'),
+          edge('plan', 'done', 'dev'),
+          edge('dev', 'done', 'join'),
+          edge('join', 'done', 'qa'),
+          edge('qa', 'approve', 'end'),
+          edge('qa', 'reject', 'dev'),
+        ],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/reject-across-plans');
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.drive();
+    await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
+    await h.drive();
+    let state = await h.ticket(ticketId);
+    expect(nodeProgress(state, 'dev').laneOrder).toEqual(['1', '2']);
+    // The reviewer's item descends from the old lane 1 and the new lane 2: only lane 2 runs again.
+    const lineage = [1, 2].map((run) => ({ nodeId: 'dev', run, item: 0 }));
+    await h.ok('node.reject', { ticketId, nodeId: 'qa', items: [{ data: { feedback: 'redo' }, lineage }] });
+    await h.drive();
+    state = await h.ticket(ticketId);
+    expect(nodeProgress(state, 'dev').lanes['1']?.runs).toEqual([1]);
+    expect(nodeProgress(state, 'dev').lanes['2']?.runs).toEqual([2, 3]);
+    expect(await h.status(ticketId, 'qa')).toBe('review');
+  });
+
+  it('takes nothing from a chained fan-out whose upstream group was replaced', async () => {
+    // plan -> d (each) -> e (each, chained under d's group) -> a (fan-in). A new plan replaces d's group while
+    // e's group still has a running lane; the new d lane then fails. e's old group must not feed 'a'.
+    let planRun = 0;
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId, prompt } = s.request;
+        if (nodeId === 'plan') {
+          planRun += 1;
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { task: planRun === 1 ? 'T1' : 'U1' } }] }));
+        } else if (nodeId === 'd') {
+          if (prompt.includes('U1')) expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'error', data: { reason: 'no' } }));
+          else expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [1, 2].map((part) => ({ data: { part } })) }));
+        } else {
+          if (prompt.includes('part 2')) await s.sleep(60 * MINUTE);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { from: nodeId } }));
+        }
+        return undefined;
+      },
+    });
+    const each = { ports: { in: { mode: 'each' as const } } };
+    await save(
+      h,
+      template(
+        'myteam/chained-replan',
+        [
+          { id: 'start', type: 'vuyro.human-task', version: 1 },
+          { id: 'replan', type: 'vuyro.human-task', version: 1 },
+          agent('plan'),
+          agent('d', 'task {{ input.data.task }}', each),
+          agent('e', 'part {{ input.data.part }}', each),
+          agent('a'),
+          agent('log'),
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [
+          edge('start', 'done', 'plan'),
+          edge('replan', 'done', 'plan'),
+          edge('plan', 'done', 'd'),
+          edge('d', 'done', 'e'),
+          edge('d', 'error', 'log'),
+          edge('e', 'done', 'a'),
+          edge('a', 'done', 'end'),
+        ],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/chained-replan');
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.activity.idle();
+    expect(await h.status(ticketId, 'e', '1')).toBe('done');
+    expect(await h.status(ticketId, 'e', '2')).toBe('running');
+    await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
+    await h.drive();
+    const state = await h.ticket(ticketId);
+    expect(currentExecution(state, 'e', '2')?.status).toBe('superseded');
+    expect(currentExecution(state, 'd', '2')?.status).toBe('failed');
+    expect(nodeProgress(state, 'a').executions).toHaveLength(0);
+    // The failure went to 'log', which ends its path: the ticket is done without the old plan's work.
+    expect(state.status).toBe('done');
+  });
+
   it('tells the workspace resolver which execution it serves', async () => {
     const targets: WorkspaceTarget[] = [];
     h = await openWorkflowHarness({

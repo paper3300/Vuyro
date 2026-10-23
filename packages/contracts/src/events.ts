@@ -311,13 +311,33 @@ export const EVENT_CATALOG = {
     ),
   },
   /**
-   * A fan-out node received an empty delivery: it opens an empty group (no lanes) and passes the empty
-   * delivery on along its non-error outgoing edges, so whatever gathers its lanes runs with no items.
+   * A fan-out node received an empty delivery: it opens an empty group (no lanes), or reuses the live group
+   * under the same upstream group, and passes the empty delivery on along its non-error outgoing edges, so
+   * whatever gathers its lanes runs with no items.
    */
   'node.passedOver': {
     aggregateType: 'ticket',
     version: 1,
-    schema: Type.Object({ ticketId: TicketId, nodeId: NodeIdSchema, group: GroupId, edges: Type.Array(EdgeTarget) }, strict),
+    schema: Type.Object(
+      {
+        ticketId: TicketId,
+        nodeId: NodeIdSchema,
+        group: GroupId,
+        /** Set when the group is new and hangs under an upstream fan-out group. */
+        groupParent: Type.Optional(GroupId),
+        edges: Type.Array(EdgeTarget),
+      },
+      strict,
+    ),
+  },
+  /**
+   * An active execution of a lane whose fan-out group was replaced (a new plan opened a newer group).
+   * It ends without a result; the engine cancels its agent.
+   */
+  'node.superseded': {
+    aggregateType: 'ticket',
+    version: 1,
+    schema: Type.Object({ ...EXECUTION_FIELDS, reason: Type.Literal('replaced') }, strict),
   },
   /** The executor stopped without a result for a reason worth another attempt (engine restart). */
   'node.requeued': {

@@ -41,7 +41,7 @@ export interface Execution {
   readonly resumeFromRunId?: string;
   readonly pauseRequested: boolean;
   readonly resumeTo?: 'queued' | 'review' | 'rejected';
-  /** Order in which executions finished within the ticket (for "latest run"). */
+  /** Ticket step at which the execution finished (for "latest run", and "after the last activation"). */
   readonly completedOrder?: number;
 }
 
@@ -56,12 +56,18 @@ export interface NodeProgress {
   readonly executions: readonly Execution[];
   readonly lanes: Readonly<Record<string, Lane>>;
   readonly laneOrder: readonly string[];
-  /** Current fan-out group (each-mode nodes). */
+  /** Current fan-out group (each-mode nodes): the group the node opened last. */
   readonly group?: string;
-  /** Delivery sequence of the latest route into this node, per incoming edge index. */
-  readonly deliveries: Readonly<Record<number, number>>;
-  /** Delivery sequence when the node was last activated. */
-  readonly consumed: number;
+  /** Ticket step of the node's last activation (0: never activated). */
+  readonly activated: number;
+}
+
+export interface Group {
+  readonly node: string;
+  /** The upstream fan-out group it hangs under (chained fan-out). */
+  readonly parent?: string;
+  /** The last empty delivery the group passed on: over which edges, at which ticket step. */
+  readonly passed?: { readonly edges: readonly number[]; readonly step: number };
 }
 
 export interface TicketWorkflow {
@@ -72,10 +78,13 @@ export interface TicketWorkflow {
   readonly status: 'open' | 'done';
   readonly template?: PinnedTemplate;
   readonly nodes: Readonly<Record<string, NodeProgress>>;
-  /** Group id → parent group (chained fan-out). */
-  readonly groups: Readonly<Record<string, { readonly node: string; readonly parent?: string }>>;
-  readonly deliverySeq: number;
-  readonly completions: number;
+  /** Fan-out groups by id. */
+  readonly groups: Readonly<Record<string, Group>>;
+  /**
+   * Counts activations, completions and pass-overs in order ([[명령·이벤트 계약]] §10.6 item 1): "after X" compares
+   * these steps.
+   */
+  readonly step: number;
   /** Empty deliveries that ended at a passed-over fan-out node with nowhere further to go (implicit ends). */
   readonly pathEnds: number;
   /** Agent run id → execution. */
@@ -89,13 +98,12 @@ export const EMPTY_TICKET: TicketWorkflow = {
   status: 'open',
   nodes: {},
   groups: {},
-  deliverySeq: 0,
-  completions: 0,
+  step: 0,
   pathEnds: 0,
   runIndex: {},
 };
 
-const EMPTY_NODE: NodeProgress = { executions: [], lanes: {}, laneOrder: [], deliveries: {}, consumed: 0 };
+const EMPTY_NODE: NodeProgress = { executions: [], lanes: {}, laneOrder: [], activated: 0 };
 
 /** Statuses of executions that still need someone (executor, person). */
 export const ACTIVE_STATUSES: ReadonlySet<ExecutionStatus> = new Set(['queued', 'running', 'review', 'rejected', 'paused']);
@@ -119,6 +127,25 @@ export function laneOf(state: TicketWorkflow, nodeId: string, lane: string): Lan
 export function currentExecution(state: TicketWorkflow, nodeId: string, lane: string): Execution | undefined {
   const run = laneOf(state, nodeId, lane)?.runs.at(-1);
   return run === undefined ? undefined : execution(state, nodeId, run);
+}
+
+/** A group is live while it is its node's current group and the group it hangs under is live (§10.6 item 3). */
+export function groupLive(state: TicketWorkflow, groupId: string): boolean {
+  const seen = new Set<string>();
+  for (let current: string | undefined = groupId; current !== undefined; ) {
+    if (seen.has(current)) return false;
+    seen.add(current);
+    const group: Group | undefined = Object.hasOwn(state.groups, current) ? state.groups[current] : undefined;
+    if (group === undefined || nodeProgress(state, group.node).group !== current) return false;
+    current = group.parent;
+  }
+  return true;
+}
+
+/** A lane is live when it has no group (lane 'main') or its group is live: it belongs to the current generation. */
+export function laneLive(state: TicketWorkflow, nodeId: string, lane: string): boolean {
+  const group = laneOf(state, nodeId, lane)?.group;
+  return group === undefined || groupLive(state, group);
 }
 
 /** Lane-visible status: the current execution's status; a node with no lanes is waiting. */
@@ -181,12 +208,10 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
     }
     case 'node.activated': {
       const { data } = event;
-      let next = state;
+      const step = state.step + 1;
+      let next: TicketWorkflow = { ...state, step };
       if (data.group !== undefined && !Object.hasOwn(state.groups, data.group)) {
-        next = {
-          ...next,
-          groups: { ...next.groups, [data.group]: withoutUndefined<{ node: string; parent?: string }>({ node: data.nodeId, parent: data.groupParent }) },
-        };
+        next = { ...next, groups: { ...next.groups, [data.group]: withoutUndefined<Group>({ node: data.nodeId, parent: data.groupParent }) } };
       }
       if (data.supersedes !== undefined) {
         next = setExecution(next, data.nodeId, data.supersedes, (current) => ({ ...current, status: 'superseded' }));
@@ -215,7 +240,7 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
           lanes: { ...node.lanes, [data.lane]: lane },
           laneOrder: existing === undefined ? [...node.laneOrder, data.lane] : node.laneOrder,
           group: data.group ?? node.group,
-          consumed: state.deliverySeq,
+          activated: step,
         });
       });
     }
@@ -242,9 +267,8 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
       return setExecution(state, event.data.nodeId, event.data.run, (current) => ({ ...current, status: 'discarded' }));
     case 'node.completed': {
       const { data } = event;
-      const completions = state.completions + 1;
-      let next: TicketWorkflow = { ...state, completions };
-      next = setExecution(next, data.nodeId, data.run, (current) => ({
+      const step = state.step + 1;
+      return setExecution({ ...state, step }, data.nodeId, data.run, (current) => ({
         ...current,
         status: data.status,
         output: data.output,
@@ -253,21 +277,28 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
           ...(data.empty ?? []).map((entry): [number, readonly number[]] => [entry.edge, []]),
           ...data.routes.map((route): [number, readonly number[]] => [route.edge, route.items]),
         ]),
-        completedOrder: completions,
+        completedOrder: step,
       }));
-      // Record deliveries per target edge (empty ones too); targets read them to decide when to fire.
-      return deliver(next, [...data.routes, ...(data.empty ?? [])]);
     }
     case 'node.passedOver': {
       const { data } = event;
-      let next: TicketWorkflow = {
+      const step = state.step + 1;
+      const existing = Object.hasOwn(state.groups, data.group) ? state.groups[data.group] : undefined;
+      const group = withoutUndefined<Group>({
+        node: data.nodeId,
+        parent: existing === undefined ? data.groupParent : existing.parent,
+        passed: { edges: data.edges.map((entry) => entry.edge), step },
+      });
+      const next: TicketWorkflow = {
         ...state,
-        groups: { ...state.groups, [data.group]: { node: data.nodeId } },
+        step,
+        groups: { ...state.groups, [data.group]: group },
         pathEnds: state.pathEnds + (data.edges.length === 0 ? 1 : 0),
       };
-      next = setNode(next, data.nodeId, (node) => ({ ...node, group: data.group }));
-      return deliver(next, data.edges);
+      return setNode(next, data.nodeId, (node) => ({ ...node, group: data.group }));
     }
+    case 'node.superseded':
+      return setExecution(state, event.data.nodeId, event.data.run, (current) => ({ ...current, status: 'superseded', pauseRequested: false }));
     case 'node.requeued':
       return setExecution(state, event.data.nodeId, event.data.run, (current) =>
         withoutUndefined<Execution>({
@@ -303,17 +334,6 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
     default:
       return state;
   }
-}
-
-function deliver(state: TicketWorkflow, edges: readonly { edge: number; to: string }[]): TicketWorkflow {
-  let next = state;
-  let seq = state.deliverySeq;
-  for (const { edge, to } of edges) {
-    seq += 1;
-    const at = seq;
-    next = setNode(next, to, (node) => ({ ...node, deliveries: { ...node.deliveries, [edge]: at } }));
-  }
-  return { ...next, deliverySeq: seq };
 }
 
 /** Which execution an artifact registration belongs to: the run's execution, else the named or only active lane. */

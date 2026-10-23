@@ -168,7 +168,7 @@ type LaneKey = { readonly ticketId: string; readonly nodeId: string; readonly la
  */
 const nodes: Projector = {
   name: 'nodes',
-  version: 1,
+  version: 2,
   tables: ['p_node_lanes', 'p_node_runs'],
   ddl: [
     `CREATE TABLE p_node_lanes (
@@ -248,6 +248,9 @@ const nodes: Projector = {
         ];
       case 'node.returned':
         return [run("status = 'discarded', finished_at = ?", [event.timestamp], event.data)];
+      case 'node.superseded':
+        // The lane belongs to a replaced group: nothing will come of it (a lane shows 'wait' then, as laneStatus does).
+        return [lane("status = 'wait'", [], event.data), run("status = 'superseded', finished_at = ?", [event.timestamp], event.data)];
       case 'node.completed':
         return [
           lane('status = ?', [event.data.status], event.data),
