@@ -141,6 +141,20 @@ const GroupId = Type.String({ minLength: 1, maxLength: 160 });
 /** An edge (template index) and the node at its far end. */
 const EdgeTarget = Type.Object({ edge: Type.Integer({ minimum: 0 }), to: NodeIdSchema }, strict);
 
+/**
+ * The generation record of an execution or a delivery ([[명령·이벤트 계약]] §10.6 item 3): the fan-out groups the
+ * work rests on, and `free` when it also rests on something that never passed a fan-out. Optional on every event
+ * that carries it (events written before it existed have none and count as free).
+ */
+export const BasisSchema = Type.Object(
+  {
+    groups: Type.Array(GroupId, { maxItems: 4096 }),
+    free: Type.Optional(Type.Literal(true)),
+  },
+  strict,
+);
+export type Basis = Static<typeof BasisSchema>;
+
 const DefinitionKey = {
   kind: Type.Union(DEFINITION_KINDS.map((kind) => Type.Literal(kind))),
   id: Type.String({ pattern: DEFINITION_ID_PATTERN }),
@@ -235,6 +249,10 @@ export const EVENT_CATALOG = {
         supersedes: Type.Optional(RunNumber),
         /** Reviewer feedback for a `review` re-activation. */
         feedback: Type.Optional(Type.Object({ run: RunNumber, comment: Type.Optional(Type.String({ maxLength: 65536 })) }, strict)),
+        /** Generation record: the union of what the activation consumed (empty deliveries included). */
+        basis: Type.Optional(BasisSchema),
+        /** On the activation that opens a new group: the execution whose delivery opened it. */
+        openedBy: Type.Optional(Type.Object({ nodeId: NodeIdSchema, run: RunNumber }, strict)),
       },
       strict,
     ),
@@ -306,6 +324,8 @@ export const EVENT_CATALOG = {
          * (the work they answer was replaced, e.g. by a new plan).
          */
         stale: Type.Optional(Type.Array(Type.Object({ ...EdgeTarget.properties, items: Type.Array(Type.Integer({ minimum: 0 }), { minItems: 1 }) }, strict))),
+        /** Generation record of what this completion delivers (routes and empty deliveries alike). */
+        basis: Type.Optional(BasisSchema),
       },
       strict,
     ),
@@ -326,6 +346,10 @@ export const EVENT_CATALOG = {
         /** Set when the group is new and hangs under an upstream fan-out group. */
         groupParent: Type.Optional(GroupId),
         edges: Type.Array(EdgeTarget),
+        /** Generation record of the empty deliveries it passes on: the passed-over group. */
+        basis: Type.Optional(BasisSchema),
+        /** When the group is new: the execution whose empty delivery opened it. */
+        openedBy: Type.Optional(Type.Object({ nodeId: NodeIdSchema, run: RunNumber }, strict)),
       },
       strict,
     ),

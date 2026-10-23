@@ -126,6 +126,8 @@ function generate(seed: number): Graph {
         nodes.push({ id: 'rjoin', kind: 'join' }, { id: 'rsum', kind: 'agent' }, reviewer);
         addById(nodes[fanOut]?.id ?? '', 'done', 'rjoin');
         addById('rjoin', 'done', 'rsum');
+        // Sometimes the join also takes something that never passed the fan-out: its work stays current then.
+        if (random() < 0.4) addById('n0', 'done', 'rjoin');
         addById('rsum', 'done', 'rqa');
         addById('rqa', 'done', 'end');
       }
@@ -206,6 +208,7 @@ const emptyCoverage = (): Coverage => ({
   chainedGroups: 0,
   replansAfterEnd: 0,
   mixedAtReplan: 0,
+  retiredEmpty: 0,
   fanOutLanes: 0,
   reworkRuns: 0,
   rejectLoops: 0,
@@ -239,6 +242,8 @@ function tally(events: readonly DomainEvent[], workflow: CompiledWorkflow, oracl
 interface CaseRun {
   readonly seed: number;
   readonly kinds: ReadonlyMap<string, Kind | 'end'>;
+  /** Nodes that feed a fan-out node: their empty outputs (a skipped plan) matter most. */
+  readonly planners: ReadonlySet<string>;
 }
 
 describe('routing properties', () => {
@@ -250,7 +255,7 @@ describe('routing properties', () => {
 
   /**
    * An explicit lineage that cites one finished fan-out lane output and one finished output of an entry run (a root
-   * that never passed a fan-out), so that only some of the item's lineage paths can belong to a replaced generation.
+   * that never passed a fan-out). Generations ignore lineage, so this probes that, and stale/rework targeting.
    * Undefined when either is missing.
    */
   function mixedLineage(config: CaseRun, state: TicketWorkflow, self: string, random: () => number): { nodeId: string; run: number; item: number }[] | undefined {
@@ -299,7 +304,9 @@ describe('routing properties', () => {
     }
     if (runs > 6 || roll < 0.75) {
       const shape = random();
-      const count = runs > 6 ? 1 : shape < 0.1 ? 0 : shape < 0.6 ? 1 : shape < 0.85 ? 2 : 3;
+      // A planner now and then plans nothing: a person approves the skip (an empty delivery) or sends it back.
+      const none = config.planners.has(nodeId) ? 0.3 : 0.1;
+      const count = runs > 6 ? 1 : shape < none ? 0 : shape < 0.6 ? 1 : shape < 0.85 ? 2 : 3;
       const lineage = kind === 'agent' && random() < (nodeId === 'rsum' ? 0.7 : 0.3) ? mixedLineage(config, state, nodeId, random) : undefined;
       await done('done', { items: Array.from({ length: count }, (_, index) => ({ data: { index }, ...(lineage === undefined ? {} : { lineage }) })) });
     } else if (roll < 0.87) {
@@ -334,7 +341,9 @@ describe('routing properties', () => {
     const ticket = await h.exec('ticket.create', { projectId: (project.result as { projectId: string }).projectId, title: `case ${seed}`, template: { id } });
     if (!ticket.ok) return `ticket.create failed: ${ticket.error.message}`;
     const ticketId = (ticket.result as { ticketId: string }).ticketId;
-    cases.set(ticketId, { seed, kinds: new Map(graph.nodes.map((node) => [node.id, node.kind])) });
+    const kinds = new Map(graph.nodes.map((node) => [node.id, node.kind]));
+    const planners = new Set(graph.edges.filter((edge) => isLanes(kinds.get(edge.to))).map((edge) => edge.from));
+    cases.set(ticketId, { seed, kinds, planners });
     const errorsBefore = h.errors.length;
     const decide = prng(hash(seed, 'human'));
     const fail = async (message: string): Promise<string> => `${message}\n${await describeTicket(ticketId)}`;
@@ -479,6 +488,7 @@ describe('routing properties', () => {
     expect(coverage.chainedGroups).toBeGreaterThanOrEqual(CASES / 20);
     expect(coverage.replansAfterEnd).toBeGreaterThanOrEqual(CASES / 100);
     expect(coverage.mixedAtReplan).toBeGreaterThanOrEqual(CASES / 300);
+    expect(coverage.retiredEmpty).toBeGreaterThanOrEqual(CASES / 300);
     expect(stats.done).toBeGreaterThan(CASES / 3);
     expect(stats.runs).toBeGreaterThan(CASES * 2);
     // The generator must reach the interesting shapes, or the test proves little.

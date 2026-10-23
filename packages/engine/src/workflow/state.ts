@@ -1,6 +1,7 @@
 import type {
   ActivationCause,
   ArtifactRef,
+  Basis,
   ExecutionStatus,
   HandoffItem,
   NodeRunOutput,
@@ -23,6 +24,10 @@ export interface Execution {
   readonly cause: ActivationCause;
   readonly status: ExecutionStatus;
   readonly inputs: Readonly<Record<string, readonly HandoffItem[]>>;
+  /** Generation record of what the activation consumed (§10.6 item 3). Absent on old events: free. */
+  readonly basis?: Basis;
+  /** Groups this execution's deliveries opened (a new generation it started; §10.6 item 3). */
+  readonly opened?: readonly string[];
   readonly feedback?: { readonly run: number; readonly comment?: string };
   readonly attempts: number;
   /** Automatic restarts so far (engine restart, cancelled without a pause). Bounded by MAX_AUTOMATIC_ATTEMPTS. */
@@ -214,6 +219,7 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
       let next: TicketWorkflow = { ...state, step };
       if (data.group !== undefined && !Object.hasOwn(state.groups, data.group)) {
         next = { ...next, groups: { ...next.groups, [data.group]: withoutUndefined<Group>({ node: data.nodeId, parent: data.groupParent }) } };
+        if (data.openedBy !== undefined) next = recordOpened(next, data.openedBy, data.group);
       }
       if (data.supersedes !== undefined) {
         next = setExecution(next, data.nodeId, data.supersedes, (current) => ({ ...current, status: 'superseded' }));
@@ -225,6 +231,7 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
         cause: data.cause,
         status: data.status,
         inputs: data.inputs,
+        basis: data.basis,
         feedback: data.feedback,
         attempts: 0,
         requeues: 0,
@@ -292,8 +299,9 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
         parent: existing === undefined ? data.groupParent : existing.parent,
         passed: { edges: data.edges.map((entry) => entry.edge), step },
       });
+      const opener = existing === undefined && data.openedBy !== undefined ? recordOpened(state, data.openedBy, data.group) : state;
       const next: TicketWorkflow = {
-        ...state,
+        ...opener,
         step,
         groups: { ...state.groups, [data.group]: group },
         endGroups: data.edges.length === 0 ? [...state.endGroups, data.group] : state.endGroups,
@@ -337,6 +345,10 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
     default:
       return state;
   }
+}
+
+function recordOpened(state: TicketWorkflow, by: { nodeId: string; run: number }, group: string): TicketWorkflow {
+  return setExecution(state, by.nodeId, by.run, (current) => ({ ...current, opened: [...(current.opened ?? []), group] }));
 }
 
 /** Which execution an artifact registration belongs to: the run's execution, else the named or only active lane. */

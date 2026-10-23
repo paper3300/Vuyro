@@ -1,5 +1,6 @@
 import {
   type ActivationCause,
+  type Basis,
   type DraftItem,
   evaluateCondition,
   type HandoffItem,
@@ -96,63 +97,37 @@ function routedItems(edgeIndex: number, exec: Execution): HandoffItem[] {
   });
 }
 
-const MAX_LINEAGE_STATES = 100_000;
+const FREE: Basis = { groups: [], free: true };
 
-/**
- * §10.6 item 3: an item is outdated when every lineage path from it is old: the first fan-out lane output on it
- * is a replaced lane's. A path that reaches a root without a fan-out lane output is current, and any current path
- * makes the item current.
- */
-export function itemOutdated(state: TicketWorkflow, item: HandoffItem): boolean {
-  return pathsOld(state, item.lineage ?? []);
+/** The union of generation records (§10.6 item 3). */
+function mergeBasis(bases: readonly Basis[]): Basis {
+  const groups = [...new Set(bases.flatMap((basis) => basis.groups))].sort();
+  return bases.length === 0 || bases.some((basis) => basis.free === true) ? { groups, free: true } : { groups };
+}
+
+/** A record is of the current generation when it is free or one of its groups is live. */
+function basisLive(state: TicketWorkflow, basis: Basis): boolean {
+  return basis.free === true || basis.groups.length === 0 || basis.groups.some((group) => groupLive(state, group));
 }
 
 /**
- * Whether an output item about to be routed is outdated, judged like the copy its target would receive (whose
- * lineage starts at this output). An output of a fan-out lane is of that lane's generation, which is live.
+ * The generation record of what an execution sends: a fan-out lane's is its group; any other's is its own record
+ * plus the groups its deliveries opened (it started that generation, e.g. a review whose rejection made a new plan).
  */
-function outputOutdated(draft: WorkflowDraft, exec: Execution, item: HandoffItem): boolean {
-  if (laneOf(draft.state, exec.nodeId, exec.lane)?.group !== undefined) return false;
-  return pathsOld(draft.state, item.lineage ?? []);
-}
-
-/**
- * True when there is at least one lineage path from `start` and every one is old (see itemOutdated). Every path
- * through a reference has the same verdict from there on, so each reference is visited once.
- */
-function pathsOld(state: TicketWorkflow, start: readonly ItemRef[]): boolean {
-  const queue = [...start];
-  if (queue.length === 0) return false;
-  const seen = new Set<string>();
-  while (queue.length > 0) {
-    if (seen.size > MAX_LINEAGE_STATES) return false;
-    const ref = queue.shift();
-    if (ref === undefined) break;
-    const key = `${ref.nodeId}#${ref.run}#${ref.item}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const exec = execution(state, ref.nodeId, ref.run);
-    if (exec === undefined) return false;
-    if (laneOf(state, ref.nodeId, exec.lane)?.group !== undefined) {
-      // The first fan-out lane output on this path decides it.
-      if (laneLive(state, ref.nodeId, exec.lane)) return false;
-      continue;
-    }
-    const parents = exec.output?.items[ref.item]?.lineage ?? [];
-    if (parents.length === 0) return false;
-    queue.push(...parents);
-  }
-  return true;
+export function outgoingBasis(state: TicketWorkflow, exec: Execution): Basis {
+  const group = laneOf(state, exec.nodeId, exec.lane)?.group;
+  if (group !== undefined) return { groups: [group] };
+  const opened = exec.opened ?? [];
+  return opened.length === 0 ? (exec.basis ?? FREE) : mergeBasis([exec.basis ?? FREE, { groups: [...opened] }]);
 }
 
 /**
  * §10.6 item 3: whether an execution belongs to the current generation. A fan-out lane's execution follows its
- * lane; any other execution is of a replaced generation when it has inputs and all of them are outdated.
+ * lane; any other follows its generation record, whatever items it got (empty deliveries carry a record too).
  */
-export function executionLive(state: TicketWorkflow, workflow: CompiledWorkflow, exec: Execution): boolean {
+export function executionLive(state: TicketWorkflow, exec: Execution): boolean {
   if (laneOf(state, exec.nodeId, exec.lane)?.group !== undefined) return laneLive(state, exec.nodeId, exec.lane);
-  const items = Object.values(exec.inputs).flat();
-  return items.length === 0 || !items.every((item) => itemOutdated(state, item));
+  return basisLive(state, outgoingBasis(state, exec));
 }
 
 /** A fan-out node: it has an each input, so it runs in lanes grouped by delivery. */
@@ -172,41 +147,40 @@ function hasActive(state: TicketWorkflow, nodeId: string): boolean {
   return nodeProgress(state, nodeId).executions.some((exec) => ACTIVE_STATUSES.has(exec.status));
 }
 
-/** Item 7: the settled executions a source contributes, and item 8: whether that is new since `since`. */
+/** Item 7: the settled executions a source contributes, item 8: whether that is new since `since`, and its record. */
 interface Contribution {
   readonly execs: readonly Execution[];
   readonly fresh: boolean;
+  /** Set when the source contributes anything (items or an empty delivery). */
+  readonly basis?: Basis;
 }
 
 function contribution(draft: WorkflowDraft, source: string, edges: readonly number[], since: number): Contribution {
   const { state } = draft;
   const routedOver = (exec: Execution): boolean => edges.some((index) => Object.hasOwn(exec.routes, index));
-  let execs: Execution[];
-  let fresh = false;
   if (isFanOut(draft.node(source))) {
     const progress = nodeProgress(state, source);
     const group = progress.group;
     if (group === undefined || !groupLive(state, group)) return { execs: [], fresh: false };
-    execs = progress.laneOrder
+    const execs = progress.laneOrder
       .filter((lane) => laneOf(state, source, lane)?.group === group)
       .map((lane) => currentExecution(state, source, lane))
-      .filter(settled);
+      .filter((exec): exec is Execution => settled(exec) && routedOver(exec));
     const passed = groupOf(state, group)?.passed;
-    fresh = passed !== undefined && passed.step > since && passed.edges.some((index) => edges.includes(index));
-  } else {
-    const latest = nodeProgress(state, source)
-      .executions.filter(settled)
-      .sort((a, b) => (b.completedOrder ?? 0) - (a.completedOrder ?? 0))[0];
-    // A result that only rests on a replaced generation is no contribution (item 7).
-    execs = latest === undefined || !executionLive(state, draft.workflow, latest) ? [] : [latest];
+    const passedHere = passed !== undefined && passed.edges.some((index) => edges.includes(index));
+    if (execs.length === 0 && !passedHere) return { execs, fresh: false };
+    return { execs, fresh: (passedHere && passed.step > since) || execs.some((exec) => (exec.completedOrder ?? 0) > since), basis: { groups: [group] } };
   }
-  execs = execs.filter(routedOver);
-  return { execs, fresh: fresh || execs.some((exec) => (exec.completedOrder ?? 0) > since) };
+  const latest = nodeProgress(state, source)
+    .executions.filter(settled)
+    .sort((a, b) => (b.completedOrder ?? 0) - (a.completedOrder ?? 0))[0];
+  // A result of a replaced generation is no contribution at all, not one with its items removed (item 7).
+  if (latest === undefined || !routedOver(latest) || !executionLive(state, latest)) return { execs: [], fresh: false };
+  return { execs: [latest], fresh: (latest.completedOrder ?? 0) > since, basis: outgoingBasis(state, latest) };
 }
 
-/** The contributed items, without those that became outdated since they were sent (item 7). */
-function contributedItems(draft: WorkflowDraft, contributed: Contribution, edges: readonly number[]): HandoffItem[] {
-  return contributed.execs.flatMap((exec) => edges.flatMap((index) => routedItems(index, exec))).filter((item) => !itemOutdated(draft.state, item));
+function contributedItems(contributed: Contribution, edges: readonly number[]): HandoffItem[] {
+  return contributed.execs.flatMap((exec) => edges.flatMap((index) => routedItems(index, exec)));
 }
 
 /** Item 9, first part: the source, or a lane of a group its current group hangs under, is still active. */
@@ -266,19 +240,32 @@ function toPort(draft: WorkflowDraft, index: number): string | undefined {
   return draft.workflow.edges[index]?.edge.to.port;
 }
 
-/** Latest items that travelled an edge: a fan-out source's contribution, else the latest run that took it. */
-function latestOver(draft: WorkflowDraft, edgeIndex: number): HandoffItem[] {
+/** Whether an edge ends at an each input. */
+function toEach(draft: WorkflowDraft, index: number): boolean {
+  const edge = draft.workflow.edges[index];
+  return edge !== undefined && draft.node(edge.edge.to.node).inputs.find((input) => input.name === edge.edge.to.port)?.mode === 'each';
+}
+
+/** Latest delivery over an edge: a fan-out source's contribution, else the latest current run that took it. */
+function latestOver(draft: WorkflowDraft, edgeIndex: number): { items: HandoffItem[]; basis?: Basis } {
   const source = draft.workflow.edges[edgeIndex]?.edge.from.node;
-  if (source === undefined) return [];
-  if (isFanOut(draft.node(source))) return contributedItems(draft, contribution(draft, source, [edgeIndex], 0), [edgeIndex]);
+  if (source === undefined) return { items: [] };
+  if (isFanOut(draft.node(source))) {
+    const contributed = contribution(draft, source, [edgeIndex], 0);
+    return { items: contributedItems(contributed, [edgeIndex]), ...(contributed.basis === undefined ? {} : { basis: contributed.basis }) };
+  }
   const latest = nodeProgress(draft.state, source)
     .executions.filter((exec) => exec.completedOrder !== undefined && Object.hasOwn(exec.routes, edgeIndex))
     .sort((a, b) => (b.completedOrder ?? 0) - (a.completedOrder ?? 0))[0];
-  if (latest === undefined || !executionLive(draft.state, draft.workflow, latest)) return [];
-  return routedItems(edgeIndex, latest).filter((item) => !itemOutdated(draft.state, item));
+  if (latest === undefined || !executionLive(draft.state, latest)) return { items: [] };
+  return { items: routedItems(edgeIndex, latest), basis: outgoingBasis(draft.state, latest) };
 }
 
 export interface ActivationExtra {
+  /** Generation record of what this activation consumed. */
+  readonly basis: Basis;
+  /** Set on the activation that opens a new group: whose delivery opened it. */
+  readonly openedBy?: { readonly nodeId: string; readonly run: number };
   readonly group?: string;
   readonly groupParent?: string;
   readonly feedback?: { readonly run: number; readonly comment?: string };
@@ -291,7 +278,7 @@ export function activate(
   lane: string,
   cause: ActivationCause,
   inputs: Readonly<Record<string, readonly HandoffItem[]>>,
-  extra: ActivationExtra = {},
+  extra: ActivationExtra,
 ): number {
   const node = draft.node(nodeId);
   const run = nodeProgress(draft.state, nodeId).executions.length + 1;
@@ -313,6 +300,8 @@ export function activate(
       ...(extra.groupParent === undefined ? {} : { groupParent: extra.groupParent }),
       ...(supersedes === undefined ? {} : { supersedes }),
       ...(extra.feedback === undefined ? {} : { feedback: extra.feedback }),
+      basis: extra.basis,
+      ...(extra.openedBy === undefined ? {} : { openedBy: extra.openedBy }),
     },
   });
   if (node.completion === 'join') {
@@ -325,18 +314,26 @@ export function activate(
 }
 
 export function activateEntries(draft: WorkflowDraft): void {
-  for (const nodeId of draft.workflow.entries) activate(draft, nodeId, MAIN, 'start', {});
+  for (const nodeId of draft.workflow.entries) activate(draft, nodeId, MAIN, 'start', {}, { basis: FREE });
 }
 
-/** Activates a whole-input node: the given ports take the given items, the others their latest delivery. */
-function activateWhole(draft: WorkflowDraft, target: CompiledNode, given: Readonly<Record<string, readonly HandoffItem[]>>, back: boolean): void {
+/**
+ * Activates a whole-input node: the given ports take the given items (whose deliveries carry `consumed`), the
+ * others their latest delivery. The record is the union of everything consumed.
+ */
+function activateWhole(draft: WorkflowDraft, target: CompiledNode, given: Readonly<Record<string, readonly HandoffItem[]>>, consumed: readonly Basis[], back: boolean): void {
   const inputs: Record<string, readonly HandoffItem[]> = {};
+  const bases = [...consumed];
   for (const input of target.inputs) {
-    inputs[input.name] = Object.hasOwn(given, input.name)
-      ? (given[input.name] ?? [])
-      : target.incoming.filter((index) => toPort(draft, index) === input.name).flatMap((index) => latestOver(draft, index));
+    if (Object.hasOwn(given, input.name)) {
+      inputs[input.name] = given[input.name] ?? [];
+      continue;
+    }
+    const latest = target.incoming.filter((index) => toPort(draft, index) === input.name).map((index) => latestOver(draft, index));
+    inputs[input.name] = latest.flatMap((entry) => entry.items);
+    for (const entry of latest) if (entry.basis !== undefined) bases.push(entry.basis);
   }
-  activate(draft, target.id, MAIN, back ? 'rework' : 'input', inputs);
+  activate(draft, target.id, MAIN, back ? 'rework' : 'input', inputs, { basis: mergeBasis(bases) });
 }
 
 function nextLane(draft: WorkflowDraft, nodeId: string): string {
@@ -361,7 +358,7 @@ function retireReplaced(draft: WorkflowDraft): void {
   for (const nodeId of draft.workflow.nodes.keys()) {
     for (const lane of nodeProgress(draft.state, nodeId).laneOrder) {
       const exec = currentExecution(draft.state, nodeId, lane);
-      if (exec === undefined || !ACTIVE_STATUSES.has(exec.status) || executionLive(draft.state, draft.workflow, exec)) continue;
+      if (exec === undefined || !ACTIVE_STATUSES.has(exec.status) || executionLive(draft.state, exec)) continue;
       draft.emit({ type: 'node.superseded', data: { ticketId: draft.ticketId, nodeId, lane, run: exec.run, reason: 'replaced' } });
     }
   }
@@ -381,9 +378,10 @@ function deliverEach(draft: WorkflowDraft, edgeIndex: number, source: Execution,
     if (lanes.size === 0) fresh.push(item);
     for (const lane of lanes) rework.set(lane, [...(rework.get(lane) ?? []), item]);
   }
+  const basis = outgoingBasis(draft.state, source);
   for (const [lane, laneItems] of rework) {
     const group = laneOf(draft.state, target.id, lane)?.group;
-    activate(draft, target.id, lane, 'rework', { [port.name]: laneItems }, group === undefined ? {} : { group });
+    activate(draft, target.id, lane, 'rework', { [port.name]: laneItems }, { basis, ...(group === undefined ? {} : { group }) });
   }
   if (fresh.length === 0) return;
   // Chained fan-out: lanes hang under the source lane's group. Otherwise new items join the current group
@@ -392,7 +390,13 @@ function deliverEach(draft: WorkflowDraft, edgeIndex: number, source: Execution,
   const existing = parent === undefined ? (rework.size > 0 ? nodeProgress(draft.state, target.id).group : undefined) : liveChild(draft.state, target.id, parent);
   const group = existing ?? newGroupId(draft);
   fresh.forEach((item, index) => {
-    const extra: ActivationExtra = { group, ...(existing === undefined && index === 0 && parent !== undefined ? { groupParent: parent } : {}) };
+    const opening = existing === undefined && index === 0;
+    const extra: ActivationExtra = {
+      basis,
+      group,
+      ...(opening && parent !== undefined ? { groupParent: parent } : {}),
+      ...(opening ? { openedBy: { nodeId: source.nodeId, run: source.run } } : {}),
+    };
     activate(draft, target.id, nextLane(draft, target.id), 'input', { [port.name]: [item] }, extra);
   });
   if (existing === undefined) retireReplaced(draft);
@@ -417,10 +421,11 @@ function tryJoin(draft: WorkflowDraft, target: CompiledNode): void {
   for (const port of target.inputs) {
     inputs[port.name] = [...bySource].flatMap(([source, edges]) => {
       const onPort = edges.filter((index) => toPort(draft, index) === port.name);
-      return contributedItems(draft, contribution(draft, source, onPort, since), onPort);
+      return contributedItems(contribution(draft, source, onPort, since), onPort);
     });
   }
-  activate(draft, target.id, MAIN, 'input', inputs);
+  const bases = [...bySource].flatMap(([source, edges]) => contribution(draft, source, edges, since).basis ?? []);
+  activate(draft, target.id, MAIN, 'input', inputs, { basis: mergeBasis(bases) });
 }
 
 /**
@@ -439,11 +444,12 @@ function tryFanIns(draft: WorkflowDraft, target: CompiledNode): void {
   for (const [source, edges] of ready) {
     for (const index of edges) {
       const port = toPort(draft, index) ?? '';
-      given[port] = [...(given[port] ?? []), ...contributedItems(draft, contribution(draft, source, [index], since), [index])];
+      given[port] = [...(given[port] ?? []), ...contributedItems(contribution(draft, source, [index], since), [index])];
     }
   }
+  const consumed = ready.flatMap(([source, edges]) => contribution(draft, source, edges, since).basis ?? []);
   const back = ready.some(([, edges]) => edges.some((index) => draft.workflow.edges[index]?.back === true));
-  activateWhole(draft, target, given, back);
+  activateWhole(draft, target, given, consumed, back);
 }
 
 /** Item 12: re-checks every join and fan-in. A join that fires completes, and its completion sweeps again. */
@@ -463,7 +469,7 @@ function propagate(draft: WorkflowDraft, edgeIndex: number, source: Execution): 
   if (port === undefined) return;
   if (port.mode === 'each') deliverEach(draft, edgeIndex, source, target, port);
   else if (target.completion !== 'join' && !isFanOut(draft.node(source.nodeId))) {
-    activateWhole(draft, target, { [port.name]: routedItems(edgeIndex, source) }, edge.back);
+    activateWhole(draft, target, { [port.name]: routedItems(edgeIndex, source) }, [outgoingBasis(draft.state, source)], edge.back);
   }
 }
 
@@ -471,7 +477,15 @@ function propagate(draft: WorkflowDraft, edgeIndex: number, source: Execution): 
  * Carries an empty delivery over one edge (item 5, last case). `parent` is the group of the lane it comes
  * from; `seen` stops loops of fan-out nodes.
  */
-function propagateEmpty(draft: WorkflowDraft, edgeIndex: number, parent: string | undefined, fromFanOut: boolean, seen: Set<string>): void {
+function propagateEmpty(
+  draft: WorkflowDraft,
+  edgeIndex: number,
+  parent: string | undefined,
+  fromFanOut: boolean,
+  from: Execution,
+  basis: Basis | undefined,
+  seen: Set<string>,
+): void {
   const edge = draft.workflow.edges[edgeIndex];
   if (edge === undefined) return;
   const target = draft.node(edge.edge.to.node);
@@ -492,15 +506,24 @@ function propagateEmpty(draft: WorkflowDraft, edgeIndex: number, parent: string 
     const group = existing ?? newGroupId(draft);
     draft.emit({
       type: 'node.passedOver',
-      data: { ticketId: draft.ticketId, nodeId: target.id, group, ...(existing === undefined && parent !== undefined ? { groupParent: parent } : {}), edges },
+      data: {
+        ticketId: draft.ticketId,
+        nodeId: target.id,
+        group,
+        ...(existing === undefined && parent !== undefined ? { groupParent: parent } : {}),
+        edges,
+        basis: { groups: [group] },
+        ...(existing === undefined ? { openedBy: { nodeId: from.nodeId, run: from.run } } : {}),
+      },
     });
     if (existing === undefined) retireReplaced(draft);
-    for (const next of edges) propagateEmpty(draft, next.edge, group, true, seen);
+    for (const next of edges) propagateEmpty(draft, next.edge, group, true, from, { groups: [group] }, seen);
     return;
   }
   // A join, or a fan-in of a fan-out node, sees the empty delivery in the sweep.
   if (target.completion === 'join' || fromFanOut) return;
-  activateWhole(draft, target, { [port.name]: [] }, edge.back);
+  // A first hop from a lane-less execution: its record now includes any group the same completion opened.
+  activateWhole(draft, target, { [port.name]: [] }, [basis ?? outgoingBasis(draft.state, draft.exec(from.nodeId, from.run))], edge.back);
 }
 
 export interface CompletionExtra {
@@ -528,8 +551,7 @@ function planRoutes(draft: WorkflowDraft, node: CompiledNode, exec: Execution, o
       .filter(({ item }) => edge.when === undefined || evaluateCondition(edge.when, edgeContext(draft.state, draft.workflow, draft.ticketId, { node, exec }, item)));
     const target = draft.node(edge.edge.to.node);
     const each = target.inputs.find((input) => input.name === edge.edge.to.port)?.mode === 'each';
-    // Stale (item 5): it answers only replaced lanes of a fan-out target, or rests only on replaced work at all.
-    const isStale = (item: HandoffItem): boolean => (each && answersOnlyOldLanes(draft, item, target.id)) || outputOutdated(draft, exec, item);
+    const isStale = (item: HandoffItem): boolean => each && answersOnlyOldLanes(draft, item, target.id);
     const items = passing.filter(({ item }) => !isStale(item)).map(({ index }) => index);
     const old = passing.filter(({ item }) => isStale(item)).map(({ index }) => index);
     if (items.length > 0) routes.push({ edge: edgeIndex, to: edge.edge.to.node, items });
@@ -576,12 +598,15 @@ export function complete(
       ...(extra.undeclared === undefined || extra.undeclared.length === 0 ? {} : { undeclared: [...extra.undeclared].slice(0, 256) }),
       ...(empty.length === 0 ? {} : { empty }),
       ...(stale.length === 0 ? {} : { stale }),
+      basis: outgoingBasis(draft.state, exec),
     },
   });
-  const finished = draft.exec(nodeId, run);
-  for (const route of routes) propagate(draft, route.edge, finished);
+  // Fan-out targets first: a new generation this completion opens there is part of what it sends everywhere else.
+  const eachFirst = <T extends { edge: number }>(list: readonly T[]): T[] =>
+    [...list].sort((a, b) => Number(!toEach(draft, a.edge)) - Number(!toEach(draft, b.edge)) || a.edge - b.edge);
+  for (const route of eachFirst(routes)) propagate(draft, route.edge, draft.exec(nodeId, run));
   const parent = laneOf(draft.state, nodeId, exec.lane)?.group;
-  for (const entry of empty) propagateEmpty(draft, entry.edge, parent, isFanOut(node), new Set());
+  for (const entry of eachFirst(empty)) propagateEmpty(draft, entry.edge, parent, isFanOut(node), draft.exec(nodeId, run), undefined, new Set());
   sweep(draft);
   completeTicketIfDone(draft);
 }
@@ -622,7 +647,7 @@ export function ticketWaitReasons(state: TicketWorkflow, workflow: CompiledWorkf
     }
     for (const lane of progress.laneOrder) {
       const exec = currentExecution(state, nodeId, lane);
-      if (exec === undefined || Object.keys(exec.routes).length > 0 || !executionLive(state, workflow, exec)) continue;
+      if (exec === undefined || Object.keys(exec.routes).length > 0 || !executionLive(state, exec)) continue;
       if (exec.status === 'failed') reasons.push({ nodeId, lane, run: exec.run, kind: 'failed', status: exec.status });
       else if (exec.status === 'done' && exec.onlyStale === true) reasons.push({ nodeId, lane, run: exec.run, kind: 'stale', status: exec.status });
     }
@@ -643,7 +668,7 @@ export function endReached(state: TicketWorkflow, workflow: CompiledWorkflow): b
     for (const exec of nodeProgress(state, nodeId).executions) {
       if (exec.status !== 'done') continue;
       // An output whose items were all stale went nowhere, but it says nothing about the current work (D-021).
-      if ((ends.has(nodeId) || (Object.keys(exec.routes).length === 0 && exec.onlyStale !== true)) && executionLive(state, workflow, exec)) return true;
+      if ((ends.has(nodeId) || (Object.keys(exec.routes).length === 0 && exec.onlyStale !== true)) && executionLive(state, exec)) return true;
     }
   }
   return false;
@@ -659,9 +684,10 @@ export function completeTicketIfDone(draft: WorkflowDraft): void {
 
 /** Activates a lane again with the inputs of its current execution (retry, review rejection). Live lanes only. */
 export function rerun(draft: WorkflowDraft, exec: Execution, cause: 'retry' | 'review', feedback?: { run: number; comment?: string }): void {
-  if (!executionLive(draft.state, draft.workflow, exec)) throw new Error(`run ${exec.run} of node '${exec.nodeId}' belongs to a replaced generation`);
+  if (!executionLive(draft.state, exec)) throw new Error(`run ${exec.run} of node '${exec.nodeId}' belongs to a replaced generation`);
   const group = laneOf(draft.state, exec.nodeId, exec.lane)?.group;
   activate(draft, exec.nodeId, exec.lane, cause, exec.inputs, {
+    basis: exec.basis ?? FREE,
     ...(group === undefined ? {} : { group }),
     ...(feedback === undefined ? {} : { feedback }),
   });

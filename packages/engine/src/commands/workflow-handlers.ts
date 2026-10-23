@@ -431,12 +431,12 @@ export const nodeRetry: CommandHandler<'node.retry', TicketState> = {
     if (isFailure(node)) return node;
     // A failure of a replaced generation stays as it is: a newer plan replaced its work (D-019).
     const named = payload.lane === undefined ? undefined : currentExecution(ticket.state, node.id, payload.lane);
-    if (named !== undefined && !executionLive(ticket.state, workflow, named)) {
+    if (named !== undefined && !executionLive(ticket.state, named)) {
       return fail('invariant_violated', `lane '${named.lane}' of node '${node.id}' belongs to a replaced generation; it cannot be retried`);
     }
     // A success whose items all answered replaced work went nowhere (D-021): it is retried like a failure.
     const retriable = (candidate: Execution): boolean =>
-      (candidate.status === 'failed' || (candidate.status === 'done' && candidate.onlyStale === true)) && executionLive(ticket.state, workflow, candidate);
+      (candidate.status === 'failed' || (candidate.status === 'done' && candidate.onlyStale === true)) && executionLive(ticket.state, candidate);
     const exec = pickLane(ticket.state, node.id, payload.lane, retriable, 'failed or stale');
     if (isFailure(exec)) return exec;
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);

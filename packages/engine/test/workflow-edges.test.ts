@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { CommandResponse, DefinitionEnvelope, TemplateDefinition, TemplateEdge, TemplateNode } from '@vuyro/contracts';
 import type { WorkspaceTarget } from '../src/workflow/engine.ts';
 import type { ScriptedBehavior } from '../src/workflow/scripted-agent.ts';
-import { endReached, itemOutdated, ticketWaitReasons } from '../src/workflow/machine.ts';
+import { endReached, ticketWaitReasons } from '../src/workflow/machine.ts';
 import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
 import { nextRequestId } from './helpers/engine-harness.ts';
 import { HUMAN, openWorkflowHarness, type WorkflowHarness } from './helpers/workflow-harness.ts';
@@ -628,12 +628,6 @@ describe('routing edge cases', () => {
     await h.drive();
     let state = await h.ticket(ticketId);
     expect(nodeProgress(state, 'dev').laneOrder).toEqual(['1', '2']);
-    // §10.6 item 3: an item is outdated only when every fan-out lane it rests on was replaced.
-    const ref = (run: number) => ({ nodeId: 'dev', run, item: 0 });
-    expect(itemOutdated(state, { data: {}, lineage: [ref(1)] })).toBe(true);
-    expect(itemOutdated(state, { data: {}, lineage: [ref(1), ref(2)] })).toBe(false);
-    expect(itemOutdated(state, { data: {}, lineage: [ref(2)] })).toBe(false);
-    expect(itemOutdated(state, { data: {}, lineage: [] })).toBe(false);
     // The reviewer's item descends from the old lane 1 and the new lane 2: only lane 2 runs again.
     const lineage = [1, 2].map((run) => ({ nodeId: 'dev', run, item: 0 }));
     await h.ok('node.reject', { ticketId, nodeId: 'qa', items: [{ data: { feedback: 'redo' }, lineage }] });
@@ -760,6 +754,9 @@ describe('routing edge cases', () => {
     expect(state.status).toBe('done');
     const superseded = (await h.store.readAggregate(ticketId)).flatMap((event) => (event.type === 'node.superseded' ? [`${event.data.nodeId}/${event.data.lane}`] : []));
     expect(superseded).toEqual(['qa/main']);
+    // The board can say why the person's review card went away.
+    expect(await h.store.query("SELECT status, superseded_by FROM p_node_lanes WHERE node_id = 'qa'")).toEqual([{ status: 'wait', superseded_by: 'replaced' }]);
+    expect(await h.store.query("SELECT run, status, superseded_by FROM p_node_runs WHERE node_id = 'qa'")).toEqual([{ run: 1, status: 'superseded', superseded_by: 'replaced' }]);
   });
 
   it('does not count an output whose items were all stale as the end of a path (D-021)', async () => {
@@ -819,68 +816,6 @@ describe('routing edge cases', () => {
     await h.ok('node.approve', { ticketId, nodeId: 'qa' });
     state = await h.ticket(ticketId);
     expect(state.status).toBe('done');
-  });
-
-  it('keeps a review whose input also rests on work outside the replaced plan (mixed lineage)', async () => {
-    // summ's item points at the old plan's join and at a note that never passed a fan-out. Not every lineage path
-    // is old, so the person reviewing it keeps their review when a new plan arrives.
-    let planRun = 0;
-    h = await openWorkflowHarness({
-      behavior: async (s) => {
-        const { ticketId, nodeId } = s.request;
-        if (nodeId === 'plan') {
-          planRun += 1;
-          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { task: planRun === 1 ? 'T1' : 'U1' } }] }));
-        } else if (nodeId === 'dev') {
-          if (planRun > 1) await s.sleep(60 * MINUTE);
-          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { done: true } }));
-        } else {
-          const lineage = [{ nodeId: 'join', run: 1, item: 0 }, { nodeId: 'notes', run: 1, item: 0 }];
-          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { summary: true }, lineage }] }));
-        }
-        return undefined;
-      },
-    });
-    await save(
-      h,
-      template(
-        'myteam/mixed-lineage',
-        [
-          { id: 'start', type: 'vuyro.human-task', version: 1 },
-          { id: 'replan', type: 'vuyro.human-task', version: 1 },
-          { id: 'notes', type: 'vuyro.human-task', version: 1 },
-          agent('plan'),
-          agent('dev', 'task {{ input.data.task }}', { ports: { in: { mode: 'each' } } }),
-          { id: 'join', type: 'vuyro.join', version: 1 },
-          agent('summ'),
-          { id: 'qa', type: 'vuyro.human-task', version: 1 },
-          { id: 'end', type: 'vuyro.end', version: 1 },
-        ],
-        [
-          edge('start', 'done', 'plan'),
-          edge('replan', 'done', 'plan'),
-          edge('plan', 'done', 'dev'),
-          edge('dev', 'done', 'join'),
-          edge('join', 'done', 'summ'),
-          edge('notes', 'done', 'end'),
-          edge('summ', 'done', 'qa'),
-          edge('qa', 'done', 'end'),
-        ],
-      ),
-    );
-    const ticketId = await ticketFor(h, 'myteam/mixed-lineage');
-    await h.ok('node.done', { ticketId, nodeId: 'notes', port: 'done', items: [{ data: { note: 'keep the old layout' } }] });
-    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
-    await h.drive();
-    expect(await h.status(ticketId, 'qa')).toBe('review');
-    await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
-    await h.activity.idle();
-    const state = await h.ticket(ticketId);
-    expect(currentExecution(state, 'dev', '1')?.status).toBe('done');
-    expect(currentExecution(state, 'dev', '2')?.status).toBe('running');
-    // The review stays: one lineage path of its input does not rest on the replaced plan.
-    expect(currentExecution(state, 'qa', 'main')?.status).toBe('review');
-    expect((await h.store.readAggregate(ticketId)).some((event) => event.type === 'node.superseded')).toBe(false);
   });
 
   it('stops counting an end reached by the old plan once a new plan replaced it', async () => {
@@ -984,8 +919,9 @@ describe('routing edge cases', () => {
     expect((await h.ticket(ticketId)).status).toBe('done');
   });
 
-  it('holds back an item of current work that cites only the replaced plan, wherever it would go', async () => {
-    // 'cite' runs for the new plan but points only at the old plan's lane output: it is stale, not a new review.
+  it('keeps a review whose work also consumed something outside the replaced plan', async () => {
+    // 'both' joins the old plan's join and a note. Its generation record holds the old group and 'free', so it and
+    // the review it feeds stay when a new plan arrives. Items and lineage play no part.
     let planRun = 0;
     h = await openWorkflowHarness({
       behavior: async (s) => {
@@ -993,8 +929,6 @@ describe('routing edge cases', () => {
         if (nodeId === 'plan') {
           planRun += 1;
           expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { task: planRun === 1 ? 'T1' : 'U1' } }] }));
-        } else if (nodeId === 'cite') {
-          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { cites: 'T1' }, lineage: [{ nodeId: 'dev', run: 1, item: 0 }] }] }));
         } else {
           if (planRun > 1) await s.sleep(60 * MINUTE);
           expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { done: true } }));
@@ -1005,72 +939,7 @@ describe('routing edge cases', () => {
     await save(
       h,
       template(
-        'myteam/cite-old',
-        [
-          { id: 'start', type: 'vuyro.human-task', version: 1 },
-          { id: 'replan', type: 'vuyro.human-task', version: 1 },
-          agent('plan'),
-          agent('dev', 'task {{ input.data.task }}', { ports: { in: { mode: 'each' } } }),
-          { id: 'join', type: 'vuyro.join', version: 1 },
-          agent('cite'),
-          { id: 'check', type: 'vuyro.human-task', version: 1 },
-          { id: 'end', type: 'vuyro.end', version: 1 },
-        ],
-        [
-          edge('start', 'done', 'plan'),
-          edge('replan', 'done', 'plan'),
-          edge('replan', 'done', 'cite'),
-          edge('plan', 'done', 'dev'),
-          edge('dev', 'done', 'join'),
-          edge('join', 'done', 'end'),
-          edge('cite', 'done', 'check'),
-          edge('check', 'done', 'end'),
-        ],
-      ),
-    );
-    const ticketId = await ticketFor(h, 'myteam/cite-old');
-    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
-    await h.drive();
-    await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
-    await h.activity.idle();
-    const state = await h.ticket(ticketId);
-    const citeDone = (await h.store.readAggregate(ticketId)).find((event) => event.type === 'node.completed' && event.data.nodeId === 'cite');
-    expect(citeDone?.type === 'node.completed' ? citeDone.data : undefined).toMatchObject({ routes: [], stale: [{ to: 'check', items: [0] }] });
-    expect(nodeProgress(state, 'check').executions).toHaveLength(0);
-    if (state.template === undefined) throw new Error('no template');
-    const workflow = await h.registry.workflow(state.template);
-    expect(ticketWaitReasons(state, workflow).map((reason) => `${reason.kind}:${reason.nodeId}/${reason.lane}`).sort()).toEqual(['active:dev/2', 'stale:cite/main']);
-  });
-
-  it('leaves out of a join the items that became outdated after they were sent', async () => {
-    // x is current work (its input also rests on a note), but its item A cites only the old plan's lane. When the
-    // join finally runs after a new plan, A is outdated and left out; B and y go in.
-    let planRun = 0;
-    h = await openWorkflowHarness({
-      behavior: async (s) => {
-        const { ticketId, nodeId } = s.request;
-        const done = (extra: Record<string, unknown>) => s.vuyro('node.done', { ticketId, nodeId, port: 'done', ...extra });
-        if (nodeId === 'plan') {
-          planRun += 1;
-          expectOk(await done({ items: [{ data: { task: planRun === 1 ? 'T1' : 'U1' } }] }));
-        } else if (nodeId === 'dev') {
-          if (planRun > 1) await s.sleep(120 * MINUTE);
-          expectOk(await done({ data: { done: true } }));
-        } else if (nodeId === 'rsum') {
-          expectOk(await done({ items: [{ data: { name: 'sum' }, lineage: [{ nodeId: 'join', run: 1, item: 0 }, { nodeId: 'notes', run: 1, item: 0 }] }] }));
-        } else if (nodeId === 'x') {
-          expectOk(await done({ items: [{ data: { name: 'A' }, lineage: [{ nodeId: 'dev', run: 1, item: 0 }] }, { data: { name: 'B' } }] }));
-        } else {
-          await s.sleep(60 * MINUTE);
-          expectOk(await done({ data: { name: 'y' } }));
-        }
-        return undefined;
-      },
-    });
-    await save(
-      h,
-      template(
-        'myteam/outdated-contribution',
+        'myteam/two-sources',
         [
           { id: 'start', type: 'vuyro.human-task', version: 1 },
           { id: 'replan', type: 'vuyro.human-task', version: 1 },
@@ -1078,41 +947,244 @@ describe('routing edge cases', () => {
           agent('plan'),
           agent('dev', 'task {{ input.data.task }}', { ports: { in: { mode: 'each' } } }),
           { id: 'join', type: 'vuyro.join', version: 1 },
-          agent('rsum'),
+          { id: 'both', type: 'vuyro.join', version: 1 },
+          { id: 'qa', type: 'vuyro.human-task', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [
+          edge('start', 'done', 'plan'),
+          edge('replan', 'done', 'plan'),
+          edge('plan', 'done', 'dev'),
+          edge('dev', 'done', 'join'),
+          edge('join', 'done', 'both'),
+          edge('notes', 'done', 'both'),
+          edge('both', 'done', 'qa'),
+          edge('qa', 'done', 'end'),
+        ],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/two-sources');
+    await h.ok('node.done', { ticketId, nodeId: 'notes', port: 'done', items: [{ data: { note: 'keep the old layout' } }] });
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.drive();
+    let state = await h.ticket(ticketId);
+    expect(nodeProgress(state, 'both').executions.at(-1)?.basis).toEqual({ groups: ['g1'], free: true });
+    expect(await h.status(ticketId, 'qa')).toBe('review');
+    await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
+    await h.activity.idle();
+    state = await h.ticket(ticketId);
+    expect(currentExecution(state, 'dev', '2')?.status).toBe('running');
+    expect(currentExecution(state, 'qa', 'main')?.status).toBe('review');
+    expect((await h.store.readAggregate(ticketId)).some((event) => event.type === 'node.superseded')).toBe(false);
+  });
+
+  it('supersedes a review that only got the empty delivery of a skipped plan, and stops counting that end', async () => {
+    // Review counterexample (887ebd3): an empty plan is approved, the join runs with no items and a person reviews
+    // that. The empty delivery carries the skipped group, so a new plan takes the review (and the end) with it.
+    let planRun = 0;
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId } = s.request;
+        if (nodeId === 'plan') {
+          planRun += 1;
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: planRun === 1 ? [] : [{ data: { task: 'U1' } }] }));
+        } else {
+          await s.sleep(60 * MINUTE);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { done: true } }));
+        }
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/empty-replan',
+        [
+          { id: 'start', type: 'vuyro.human-task', version: 1 },
+          { id: 'replan', type: 'vuyro.human-task', version: 1 },
+          agent('plan'),
+          agent('dev', 'task {{ input.data.task }}', { ports: { in: { mode: 'each' } } }),
+          { id: 'join', type: 'vuyro.join', version: 1 },
+          { id: 'qa', type: 'vuyro.human-task', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+          { id: 'side', type: 'vuyro.end', version: 1 },
+        ],
+        [
+          edge('start', 'done', 'plan'),
+          edge('replan', 'done', 'plan'),
+          edge('plan', 'done', 'dev'),
+          edge('dev', 'done', 'join'),
+          edge('join', 'done', 'qa'),
+          edge('join', 'done', 'side'),
+          edge('qa', 'done', 'end'),
+        ],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/empty-replan');
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.drive();
+    await h.ok('node.approve', { ticketId, nodeId: 'plan' });
+    let state = await h.ticket(ticketId);
+    if (state.template === undefined) throw new Error('no template');
+    const workflow = await h.registry.workflow(state.template);
+    expect(nodeProgress(state, 'join').executions[0]?.output?.items).toEqual([]);
+    expect(nodeProgress(state, 'join').executions[0]?.basis).toEqual({ groups: ['g1'] });
+    expect(await h.status(ticketId, 'side')).toBe('done');
+    expect(await h.status(ticketId, 'qa')).toBe('review');
+    expect(endReached(state, workflow)).toBe(true);
+    await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
+    await h.activity.idle();
+    state = await h.ticket(ticketId);
+    expect(currentExecution(state, 'dev', '1')?.status).toBe('running');
+    expect(currentExecution(state, 'qa', 'main')?.status).toBe('superseded');
+    expect((await h.exec('node.done', { ticketId, nodeId: 'qa', port: 'done' })).ok).toBe(false);
+    // The empty-plan end belongs to the replaced plan now.
+    expect(endReached(state, workflow)).toBe(false);
+    expect(await h.store.query("SELECT superseded_by FROM p_node_lanes WHERE node_id = 'qa'")).toEqual([{ superseded_by: 'replaced' }]);
+  });
+
+  it('never runs a join on an emptied contribution after a new plan', async () => {
+    // Review counterexample (887ebd3): x consumed the old plan's results and a note, so it is current work, but its
+    // item pairs with the old input. The old engine dropped that item yet still counted x as new, and j2 ran with
+    // no input once z ended elsewhere. Generations are per execution now: x's item goes in.
+    let planRun = 0;
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId } = s.request;
+        if (nodeId === 'plan') {
+          planRun += 1;
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { task: planRun === 1 ? 'T1' : 'U1' } }] }));
+        } else if (nodeId === 'dev') {
+          if (planRun > 1) await s.sleep(120 * MINUTE);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { done: true } }));
+        } else if (nodeId === 'x') {
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { from: 'x' }, pairedInput: 0 }] }));
+        } else if (nodeId === 'z') {
+          await s.sleep(60 * MINUTE);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'error', data: { reason: 'elsewhere' } }));
+        } else expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { from: nodeId } }));
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/emptied-contribution',
+        [
+          { id: 'start', type: 'vuyro.human-task', version: 1 },
+          { id: 'replan', type: 'vuyro.human-task', version: 1 },
+          { id: 'notes', type: 'vuyro.human-task', version: 1 },
+          agent('plan'),
+          agent('dev', 'task {{ input.data.task }}', { ports: { in: { mode: 'each' } } }),
+          { id: 'join', type: 'vuyro.join', version: 1 },
+          { id: 'both', type: 'vuyro.join', version: 1 },
           agent('x'),
-          agent('y'),
+          agent('z'),
+          agent('log'),
           { id: 'j2', type: 'vuyro.join', version: 1 },
           { id: 'end', type: 'vuyro.end', version: 1 },
         ],
         [
           edge('start', 'done', 'plan'),
-          edge('start', 'done', 'y'),
+          edge('start', 'done', 'z'),
           edge('replan', 'done', 'plan'),
           edge('plan', 'done', 'dev'),
           edge('dev', 'done', 'join'),
-          edge('join', 'done', 'rsum'),
-          edge('rsum', 'done', 'x'),
+          edge('join', 'done', 'both'),
+          edge('notes', 'done', 'both'),
+          edge('both', 'done', 'x'),
           edge('x', 'done', 'j2'),
-          edge('y', 'done', 'j2'),
-          edge('notes', 'done', 'end'),
+          edge('z', 'done', 'j2'),
+          edge('z', 'error', 'log'),
           edge('j2', 'done', 'end'),
         ],
       ),
     );
-    const ticketId = await ticketFor(h, 'myteam/outdated-contribution');
+    const ticketId = await ticketFor(h, 'myteam/emptied-contribution');
     await h.ok('node.done', { ticketId, nodeId: 'notes', port: 'done', items: [{ data: { note: 'n' } }] });
     await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
     await h.activity.idle();
     expect(await h.status(ticketId, 'x')).toBe('done');
-    expect(await h.status(ticketId, 'y')).toBe('running');
+    expect(await h.status(ticketId, 'z')).toBe('running');
     await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
     await h.activity.idle();
     await h.clock.advance(61 * MINUTE);
     await h.activity.idle();
     const state = await h.ticket(ticketId);
+    expect(currentExecution(state, 'z', 'main')?.status).toBe('failed');
     expect(currentExecution(state, 'dev', '2')?.status).toBe('running');
-    const first = nodeProgress(state, 'j2').executions[0];
-    expect(first?.inputs.in?.map((item) => item.data.name)).toEqual(['B', 'y']);
+    const runs = nodeProgress(state, 'j2').executions;
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.inputs.in?.map((item) => item.lineage?.[0])).toEqual([{ nodeId: 'x', run: 1, item: 0 }]);
+  });
+
+  it('does not let a result of the replaced plan contribute to a join', async () => {
+    // x consumed only the old plan's join, so after a new plan it is old work: no contribution to j2 at all. When z
+    // ends elsewhere, j2 keeps waiting for x's next run (reachable from the new lanes) instead of taking the old one.
+    let planRun = 0;
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId } = s.request;
+        if (nodeId === 'plan') {
+          planRun += 1;
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: { task: planRun === 1 ? 'T1' : 'U1' } }] }));
+        } else if (nodeId === 'dev') {
+          if (planRun > 1) await s.sleep(120 * MINUTE);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { done: true } }));
+        } else if (nodeId === 'z') {
+          await s.sleep(60 * MINUTE);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'error', data: { reason: 'elsewhere' } }));
+        } else expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { from: nodeId } }));
+        return undefined;
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/old-contribution',
+        [
+          { id: 'start', type: 'vuyro.human-task', version: 1 },
+          { id: 'replan', type: 'vuyro.human-task', version: 1 },
+          agent('plan'),
+          agent('dev', 'task {{ input.data.task }}', { ports: { in: { mode: 'each' } } }),
+          { id: 'join', type: 'vuyro.join', version: 1 },
+          agent('x'),
+          agent('z'),
+          agent('log'),
+          { id: 'j2', type: 'vuyro.join', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [
+          edge('start', 'done', 'plan'),
+          edge('start', 'done', 'z'),
+          edge('replan', 'done', 'plan'),
+          edge('plan', 'done', 'dev'),
+          edge('dev', 'done', 'join'),
+          edge('join', 'done', 'x'),
+          edge('x', 'done', 'j2'),
+          edge('z', 'done', 'j2'),
+          edge('z', 'error', 'log'),
+          edge('j2', 'done', 'end'),
+        ],
+      ),
+    );
+    const ticketId = await ticketFor(h, 'myteam/old-contribution');
+    await h.ok('node.done', { ticketId, nodeId: 'start', port: 'done' });
+    await h.activity.idle();
+    expect(await h.status(ticketId, 'x')).toBe('done');
+    await h.ok('node.done', { ticketId, nodeId: 'replan', port: 'done' });
+    await h.activity.idle();
+    await h.clock.advance(61 * MINUTE);
+    await h.activity.idle();
+    let state = await h.ticket(ticketId);
+    expect(currentExecution(state, 'z', 'main')?.status).toBe('failed');
+    expect(nodeProgress(state, 'j2').executions).toHaveLength(0);
+    await h.drive();
+    state = await h.ticket(ticketId);
+    const runs = nodeProgress(state, 'j2').executions;
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.inputs.in?.map((item) => item.lineage?.[0])).toEqual([{ nodeId: 'x', run: 2, item: 0 }]);
+    expect(state.status).toBe('done');
   });
 
   it('tells the workspace resolver which execution it serves', async () => {

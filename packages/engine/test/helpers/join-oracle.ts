@@ -1,4 +1,4 @@
-import type { DomainEvent, HandoffItem, ItemRef } from '@vuyro/contracts';
+import type { Basis, DomainEvent, HandoffItem, ItemRef } from '@vuyro/contracts';
 import type { CompiledNode, CompiledWorkflow } from '../../src/workflow/compile.ts';
 
 /**
@@ -60,16 +60,21 @@ export interface OracleCounts {
   chainedGroups: number;
   /** New plans opened after a path had already ended (with the old plan's results). */
   replansAfterEnd: number;
-  /** Active executions outside fan-out lanes, at a new plan, with an input item that has both old and current lineage paths. */
+  /** Active executions outside fan-out lanes, at a new plan, that consumed both replaced and current work. */
   mixedAtReplan: number;
+  /** Executions with no input items (only empty deliveries) retired by a new plan. */
+  retiredEmpty: number;
 }
 
 const refKey = (ref: ItemRef): string => `${ref.nodeId}#${ref.run}#${ref.item}`;
+
+/** What an activation consumed: the execution that delivered, or a passed-over group's empty delivery. */
+type Source = { readonly kind: 'exec'; readonly node: string; readonly run: number } | { readonly kind: 'group'; readonly group: string };
 const itemKeys = (items: readonly HandoffItem[]): string[] => items.map((item) => (item.lineage?.[0] === undefined ? '?' : refKey(item.lineage[0])));
 
 export class JoinOracle {
   readonly violations: string[] = [];
-  readonly counts: OracleCounts = { replans: 0, retired: 0, retiredDownstream: 0, replansOverActive: 0, joinRuns: 0, multiSourceJoinRuns: 0, fanInRuns: 0, extendedGroups: 0, chainedGroups: 0, replansAfterEnd: 0, mixedAtReplan: 0 };
+  readonly counts: OracleCounts = { replans: 0, retired: 0, retiredDownstream: 0, replansOverActive: 0, joinRuns: 0, multiSourceJoinRuns: 0, fanInRuns: 0, extendedGroups: 0, chainedGroups: 0, replansAfterEnd: 0, mixedAtReplan: 0, retiredEmpty: 0 };
   /** Item 1: the step counter. */
   private step = 0;
   private readonly execs = new Map<string, Exec[]>();
@@ -83,11 +88,17 @@ export class JoinOracle {
   /** Items routed to a fan-out node that no activation took yet. */
   private readonly pendingEach = new Map<string, Set<string>>();
   /** Deliveries from a non-fan-out source to a whole input that no activation took yet. */
-  private readonly pendingDirect = new Map<string, { edge: number; port: string; keys: string[] }[]>();
+  private readonly pendingDirect = new Map<string, { edge: number; port: string; keys: string[]; source: Source }[]>();
   /** Fan-out nodes the last completion reworked from a lane-less source: they must not open a new generation (D-020). */
   private reworked = new Set<string>();
-  /** Every output item's lineage, from the log: item key → parents. */
-  private readonly lineage = new Map<string, readonly ItemRef[]>();
+  /** What every execution consumed, worked out by the oracle itself (never read from `basis`): node#run → sources. */
+  private readonly consumed = new Map<string, readonly Source[]>();
+  /** The record the oracle expects each activation to carry, as classes: node#run → classes. */
+  private readonly recorded = new Map<string, string[]>();
+  /** Groups each execution's deliveries opened, attributed by the oracle to the completion being routed: node#run → groups. */
+  private readonly opened = new Map<string, string[]>();
+  /** The execution whose completion is being routed (group openings belong to it). */
+  private routing: { node: string; run: number } | undefined;
   /** Item 13 candidates; whether one counts is decided when asked, by the generation it belongs to now. */
   private readonly endRecords: ({ kind: 'exec'; node: string; run: number } | { kind: 'group'; group: string })[] = [];
   private done = false;
@@ -112,7 +123,6 @@ export class JoinOracle {
         break;
       case 'node.reviewRequested':
         this.setStatus(event.data.nodeId, event.data.run, 'review');
-        this.recordLineage(event.data.nodeId, event.data.run, event.data.output.items);
         break;
       case 'node.returned':
         this.setStatus(event.data.nodeId, event.data.run, 'discarded');
@@ -132,7 +142,10 @@ export class JoinOracle {
         if (exec === undefined || this.execLive(exec)) this.violate(`${nodeId}/${lane} run ${run} was superseded as replaced, but it belongs to the current generation${exec === undefined ? '' : ` (${this.explain(exec)})`}`);
         this.setStatus(nodeId, run, 'superseded');
         this.counts.retired += 1;
-        if (!this.laneGroup.has(`${nodeId}#${lane}`)) this.counts.retiredDownstream += 1;
+        if (!this.laneGroup.has(`${nodeId}#${lane}`)) {
+          this.counts.retiredDownstream += 1;
+          if (exec !== undefined && exec.inputs.length === 0) this.counts.retiredEmpty += 1;
+        }
         break;
       }
       case 'node.completed':
@@ -183,8 +196,15 @@ export class JoinOracle {
     if (group !== undefined && this.groups.has(group) && !this.groupLive(group)) {
       this.violate(`${nodeId}/${lane} run ${run} (${data.cause}) was activated in replaced group ${group}`);
     }
-    if (node.completion === 'join') this.checkJoin(node, data.inputs);
-    else if (!this.isFanOut(node) && (data.cause === 'input' || data.cause === 'rework')) this.checkWhole(node, data.inputs);
+    let consumed: readonly Source[] = [];
+    let rerunOf: string | undefined;
+    if (data.cause === 'retry' || data.cause === 'review') {
+      const previous = this.currentExec(nodeId, lane);
+      rerunOf = previous === undefined ? undefined : `${nodeId}#${previous.run}`;
+      consumed = rerunOf === undefined ? [] : (this.consumed.get(rerunOf) ?? []);
+    } else if (node.completion === 'join') consumed = this.checkJoin(node, data.inputs);
+    else if (!this.isFanOut(node) && (data.cause === 'input' || data.cause === 'rework')) consumed = this.checkWhole(node, data.inputs);
+    else if (this.isFanOut(node)) consumed = this.deliveredBy(Object.values(data.inputs).flat());
     if (this.isFanOut(node)) {
       const pending = this.pendingEach.get(nodeId);
       for (const key of itemKeys(Object.values(data.inputs).flat())) pending?.delete(key);
@@ -199,15 +219,48 @@ export class JoinOracle {
     if (group !== undefined && data.cause === 'input' && this.reworked.has(nodeId) && this.groups.has(group) && !lanes.has(lane)) this.counts.extendedGroups += 1;
     lanes.set(lane, [...(lanes.get(lane) ?? []), run]);
     this.lanes.set(nodeId, lanes);
+    this.consumed.set(`${nodeId}#${run}`, consumed);
+    // A lane's record leaves out its own group when the source just opened it (the lane's generation is its group).
+    // A re-run keeps the record its execution got when it was first activated.
+    const classes =
+      rerunOf !== undefined ? (this.recorded.get(rerunOf) ?? ['free']) : consumed.length === 0 ? ['free'] : consumed.flatMap((source) => this.sourceClasses(source, group));
+    this.recorded.set(`${nodeId}#${run}`, classes);
+    this.checkBasis(`activation of ${nodeId}/${lane} run ${run}`, data.basis, classes);
     if (group !== undefined) {
       this.laneGroup.set(`${nodeId}#${lane}`, group);
-      if (!this.groups.has(group)) this.openGroup(nodeId, group, data.groupParent);
+      if (!this.groups.has(group)) this.openGroup(nodeId, group, data.groupParent, data.openedBy);
     }
     this.lastActivation.set(nodeId, this.step);
   }
 
-  private openGroup(nodeId: string, group: string, parent: string | undefined): void {
+  /** The executions whose items an activation got (each item's lineage starts at the output it copies). */
+  private deliveredBy(items: readonly HandoffItem[]): Source[] {
+    const sources = new Map<string, Source>();
+    for (const item of items) {
+      const ref = item.lineage?.[0];
+      if (ref !== undefined) sources.set(`${ref.nodeId}#${ref.run}`, { kind: 'exec', node: ref.nodeId, run: ref.run });
+    }
+    return [...sources.values()];
+  }
+
+  /** The engine's recorded generation must equal what the oracle worked out (`classes`: 'free' or 'g:<group>'). */
+  private checkBasis(what: string, basis: Basis | undefined, classes: readonly string[]): void {
+    const expected = { groups: [...new Set(classes.filter((c) => c !== 'free').map((c) => c.slice(2)))].sort(), free: classes.includes('free') };
+    const actual = { groups: [...(basis?.groups ?? [])].sort(), free: basis?.free === true };
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) this.violate(`${what} records basis ${JSON.stringify(actual)}, but it consumed ${JSON.stringify(expected)}`);
+  }
+
+  private openGroup(nodeId: string, group: string, parent: string | undefined, claimed: { nodeId: string; run: number } | undefined): void {
     const previous = this.current.get(nodeId);
+    // A group is opened by the completion being routed; the engine's claim must agree.
+    const opener = this.routing;
+    if (JSON.stringify(opener === undefined ? null : { nodeId: opener.node, run: opener.run }) !== JSON.stringify(claimed ?? null)) {
+      this.violate(`group ${group} of ${nodeId} was opened by ${opener === undefined ? 'no completion' : `${opener.node} run ${opener.run}`}, but the log says ${claimed === undefined ? 'nobody' : `${claimed.nodeId} run ${claimed.run}`}`);
+    }
+    if (opener !== undefined) {
+      const key = `${opener.node}#${opener.run}`;
+      this.opened.set(key, [...(this.opened.get(key) ?? []), group]);
+    }
     if (parent !== undefined) this.counts.chainedGroups += 1;
     if (parent === undefined && this.reworked.has(nodeId)) this.violate(`${nodeId} opened a new generation although the same delivery reworks its current one (D-020)`);
     if (previous !== undefined && parent === undefined) {
@@ -224,15 +277,15 @@ export class JoinOracle {
       for (const list of this.execs.values()) {
         for (const exec of list) {
           if (!ACTIVE.has(exec.status) || this.laneGroup.has(`${exec.node}#${exec.lane}`)) continue;
-          if (exec.inputs.some((item) => new Set(this.paths(item).map((path) => this.pathGeneration(path))).size > 1)) this.counts.mixedAtReplan += 1;
+          const classes = this.sourceClasses({ kind: 'exec', node: exec.node, run: exec.run });
+          const old = classes.some((c) => c !== 'free' && !this.groupLive(c.slice(2)));
+          const current = classes.some((c) => c === 'free' || this.groupLive(c.slice(2)));
+          if (old && current) this.counts.mixedAtReplan += 1;
         }
       }
     }
   }
 
-  private recordLineage(nodeId: string, run: number, items: readonly HandoffItem[]): void {
-    items.forEach((item, index) => this.lineage.set(refKey({ nodeId, run, item: index }), item.lineage ?? []));
-  }
 
   private onCompleted(data: Extract<DomainEvent, { type: 'node.completed' }>['data']): void {
     const exec = this.exec(data.nodeId, data.run);
@@ -251,28 +304,26 @@ export class JoinOracle {
         if (route.items.some((index) => this.lanesReached(data.output.items[index], target.id).some((lane) => this.laneLive(target.id, lane)))) this.reworked.add(target.id);
       }
     }
-    // Item 5: stale items are exactly those that answer only replaced lanes of a fan-out target, or that are
-    // outdated themselves. Judged on the copy a target would get, so the output's lineage is recorded first.
-    this.recordLineage(data.nodeId, data.run, data.output.items);
-    const copyOutdated = (index: number): boolean => this.outdated({ data: {}, lineage: [{ nodeId: data.nodeId, run: data.run, item: index }] });
+    // Item 5: stale items are exactly those that answer only replaced lanes of a fan-out target.
     const stale = (index: number, targetId: string): boolean => {
       const target = this.workflow.nodes.get(targetId);
-      return (target !== undefined && this.isFanOut(target) && this.onlyOldLanes(data.output.items[index], targetId)) || copyOutdated(index);
+      return target !== undefined && this.isFanOut(target) && this.onlyOldLanes(data.output.items[index], targetId);
     };
     for (const route of data.routes) {
       for (const index of route.items) {
-        if (stale(index, route.to)) this.violate(`item ${index} of ${data.nodeId} run ${data.run} went to ${route.to} but is stale (it rests only on replaced work)`);
+        if (stale(index, route.to)) this.violate(`item ${index} of ${data.nodeId} run ${data.run} went to ${route.to} but answers only replaced lanes`);
       }
     }
     for (const entry of data.stale ?? []) {
       for (const index of entry.items) {
-        if (!stale(index, entry.to)) this.violate(`item ${index} of ${data.nodeId} run ${data.run} was held back as stale but rests on current work (to ${entry.to})`);
+        if (!stale(index, entry.to)) this.violate(`item ${index} of ${data.nodeId} run ${data.run} was held back as stale but leads to a live lane of ${entry.to}`);
       }
     }
     this.step += 1;
     exec.status = data.status;
     exec.items = data.output.items;
-    this.recordLineage(data.nodeId, data.run, data.output.items);
+    this.checkBasis(`completion of ${data.nodeId}/${data.lane} run ${data.run}`, data.basis, this.sourceClasses({ kind: 'exec', node: data.nodeId, run: data.run }));
+    this.routing = { node: data.nodeId, run: data.run };
     exec.completedAt = this.step;
     exec.routes = new Map([...(data.empty ?? []).map((entry): [number, number[]] => [entry.edge, []]), ...data.routes.map((route): [number, number[]] => [route.edge, route.items])]);
     exec.onlyStale = exec.routes.size === 0 && (data.stale ?? []).length > 0;
@@ -287,7 +338,8 @@ export class JoinOracle {
         this.pendingEach.set(target.id, pending);
       } else if (!this.isFanOut(source)) {
         const keys = indexes.map((item) => refKey({ nodeId: data.nodeId, run: data.run, item }));
-        this.pendingDirect.set(target.id, [...(this.pendingDirect.get(target.id) ?? []), { edge, port, keys }]);
+        const from: Source = { kind: 'exec', node: data.nodeId, run: data.run };
+        this.pendingDirect.set(target.id, [...(this.pendingDirect.get(target.id) ?? []), { edge, port, keys, source: from }]);
       }
     }
     // Item 13: an output that went nowhere only because all its items were stale is no end (D-021).
@@ -297,8 +349,9 @@ export class JoinOracle {
   }
 
   private onPassedOver(data: Extract<DomainEvent, { type: 'node.passedOver' }>['data']): void {
+    this.checkBasis(`pass-over of ${data.nodeId}`, data.basis, [`g:${data.group}`]);
     this.step += 1;
-    if (!this.groups.has(data.group)) this.openGroup(data.nodeId, data.group, data.groupParent);
+    if (!this.groups.has(data.group)) this.openGroup(data.nodeId, data.group, data.groupParent, data.openedBy);
     else if (!this.groupLive(data.group)) this.violate(`${data.nodeId} passed an empty delivery on through replaced group ${data.group}`);
     const group = this.groups.get(data.group);
     if (group !== undefined) {
@@ -337,43 +390,37 @@ export class JoinOracle {
   }
 
   /**
-   * Every lineage path from an item to a root (an item without lineage), listed in full: brute force on purpose,
-   * so the generation rule below is checked against the plain definition rather than a clever walk.
+   * Item 3 by brute force, without the engine's `basis`: every path through what an execution consumed, listed in
+   * full, each ending at the class that decides it: 'g:<group>' (a fan-out lane's group, or a passed-over group's
+   * empty delivery) or 'free' (an execution that consumed nothing). Duplicates are kept on purpose.
    */
-  private paths(item: HandoffItem): ItemRef[][] {
-    const result: ItemRef[][] = [];
-    const walk = (ref: ItemRef, path: readonly ItemRef[]): void => {
-      if (result.length > 200_000) throw new Error('oracle: too many lineage paths');
-      const next = [...path, ref];
-      const parents = this.lineage.get(refKey(ref)) ?? [];
-      if (parents.length === 0) result.push(next);
-      for (const parent of parents) walk(parent, next);
-    };
-    for (const ref of item.lineage ?? []) walk(ref, []);
-    return result;
+  private consumedClasses(node: string, run: number): string[] {
+    const sources = this.consumed.get(`${node}#${run}`) ?? [];
+    if (sources.length === 0) return ['free'];
+    const classes = sources.flatMap((source) => this.sourceClasses(source));
+    if (classes.length > 200_000) throw new Error('oracle: too many consumption paths');
+    return classes;
   }
 
-  /** Item 3, one path: its first fan-out lane output decides (live: current, replaced: old); none: current. */
-  private pathGeneration(path: readonly ItemRef[]): 'old' | 'current' {
-    for (const ref of path) {
-      const exec = this.exec(ref.nodeId, ref.run);
-      if (exec === undefined) return 'current';
-      if (this.laneGroup.has(`${ref.nodeId}#${exec.lane}`)) return this.laneLive(ref.nodeId, exec.lane) ? 'current' : 'old';
-    }
-    return 'current';
+  /**
+   * The classes of what a source delivers: a fan-out lane's group, a passed-over group, or what the execution consumed
+   * plus the groups its own deliveries opened (it started that generation).
+   */
+  private sourceClasses(source: Source, notOpened?: string): string[] {
+    if (source.kind === 'group') return [`g:${source.group}`];
+    const exec = this.exec(source.node, source.run);
+    if (exec === undefined) return ['free'];
+    const group = this.laneGroup.get(`${exec.node}#${exec.lane}`);
+    if (group !== undefined) return [`g:${group}`];
+    const opened = (this.opened.get(`${exec.node}#${exec.run}`) ?? []).filter((id) => id !== notOpened);
+    return [...this.consumedClasses(exec.node, exec.run), ...opened.map((id) => `g:${id}`)];
   }
 
-  /** Item 3: an item is outdated when it has lineage paths and every one of them is old. */
-  private outdated(item: HandoffItem): boolean {
-    const paths = this.paths(item);
-    return paths.length > 0 && paths.every((path) => this.pathGeneration(path) === 'old');
-  }
-
-  /** The lineage paths of an execution's inputs with their generation, for counterexamples. */
+  /** What an execution consumed and the classes of its paths, for counterexamples. */
   private explain(exec: Exec): string {
-    return exec.inputs
-      .map((item, index) => `input ${index}: ` + this.paths(item).slice(0, 6).map((path) => `${this.pathGeneration(path)}[${path.map(refKey).join(' < ')}]`).join(' | '))
-      .join('; ');
+    const sources = (this.consumed.get(`${exec.node}#${exec.run}`) ?? []).map((source) => (source.kind === 'group' ? `group ${source.group}` : `${source.node} run ${source.run}`));
+    const classes = [...new Set(this.consumedClasses(exec.node, exec.run))].map((c) => (c === 'free' ? 'free' : `${c.slice(2)}:${this.groupLive(c.slice(2)) ? 'live' : 'old'}`));
+    return `consumed [${sources.join(', ')}], paths end at [${classes.join(', ')}]`;
   }
 
   /** Item 13: a path end of the current generation exists. */
@@ -385,10 +432,10 @@ export class JoinOracle {
     });
   }
 
-  /** Item 3: an execution of the current generation. */
+  /** Item 3: an execution of the current generation: a live lane's, or one with a path to something current. */
   private execLive(exec: Exec): boolean {
     if (this.laneGroup.has(`${exec.node}#${exec.lane}`)) return this.laneLive(exec.node, exec.lane);
-    return exec.inputs.length === 0 || !exec.inputs.every((item) => this.outdated(item));
+    return this.sourceClasses({ kind: 'exec', node: exec.node, run: exec.run }).some((c) => c === 'free' || this.groupLive(c.slice(2)));
   }
 
   private currentExec(nodeId: string, lane: string): Exec | undefined {
@@ -427,9 +474,8 @@ export class JoinOracle {
   }
 
   /** Items 7 and 8. */
-  private contribution(source: string, edges: readonly number[], since: number): { execs: Exec[]; fresh: boolean } {
+  private contribution(source: string, edges: readonly number[], since: number): { execs: Exec[]; fresh: boolean; group?: string } {
     let candidates: Exec[];
-    let fresh = false;
     if (this.isFanOut(this.node(source))) {
       const group = this.current.get(source);
       if (group === undefined || !this.groupLive(group)) return { execs: [], fresh: false };
@@ -438,7 +484,10 @@ export class JoinOracle {
         .map((lane) => this.currentExec(source, lane))
         .filter((exec): exec is Exec => exec !== undefined && SETTLED.has(exec.status));
       const info = this.groups.get(group);
-      fresh = info?.passedAt !== undefined && info.passedAt > since && info.passedEdges.some((edge) => edges.includes(edge));
+      const passedHere = info?.passedAt !== undefined && info.passedEdges.some((edge) => edges.includes(edge));
+      const execs = candidates.filter((exec) => edges.some((edge) => exec.routes.has(edge)));
+      if (execs.length === 0 && !passedHere) return { execs, fresh: false };
+      return { execs, fresh: (passedHere && (info.passedAt ?? 0) > since) || execs.some((exec) => (exec.completedAt ?? 0) > since), group };
     } else {
       let latest: Exec | undefined;
       for (const exec of this.execs.get(source) ?? []) {
@@ -447,19 +496,20 @@ export class JoinOracle {
       candidates = latest === undefined || !this.execLive(latest) ? [] : [latest];
     }
     const execs = candidates.filter((exec) => edges.some((edge) => exec.routes.has(edge)));
-    return { execs, fresh: fresh || execs.some((exec) => (exec.completedAt ?? 0) > since) };
+    return { execs, fresh: execs.some((exec) => (exec.completedAt ?? 0) > since) };
   }
 
-  /** Contributed item refs, without items that are outdated by now (item 7). */
   private contributedKeys(source: string, edges: readonly number[], since: number): string[] {
     return this.contribution(source, edges, since).execs.flatMap((exec) =>
-      edges.flatMap((edge) =>
-        (exec.routes.get(edge) ?? [])
-          .map((item) => ({ nodeId: source, run: exec.run, item }))
-          .filter((ref) => !this.outdated({ data: {}, lineage: [ref] }))
-          .map(refKey),
-      ),
+      edges.flatMap((edge) => (exec.routes.get(edge) ?? []).map((item) => refKey({ nodeId: source, run: exec.run, item }))),
     );
+  }
+
+  /** What a source gives as consumption: its contributing group (fan-out) or its contributing execution. */
+  private contributionSource(source: string, edges: readonly number[], since: number): Source[] {
+    const contributed = this.contribution(source, edges, since);
+    if (contributed.group !== undefined) return [{ kind: 'group', group: contributed.group }];
+    return contributed.execs.map((exec) => ({ kind: 'exec', node: exec.node, run: exec.run }));
   }
 
   /** Item 9, first part. */
@@ -542,33 +592,36 @@ export class JoinOracle {
     return ready;
   }
 
-  private checkJoin(join: CompiledNode, inputs: Readonly<Record<string, readonly HandoffItem[]>>): void {
+  private checkJoin(join: CompiledNode, inputs: Readonly<Record<string, readonly HandoffItem[]>>): Source[] {
     this.counts.joinRuns += 1;
     if (this.sources(join).size >= 2) this.counts.multiSourceJoinRuns += 1;
+    const since = this.lastActivation.get(join.id) ?? 0;
+    const consumed = [...this.sources(join)].flatMap(([source, edges]) => this.contributionSource(source, edges, since));
     const blocker = this.joinBlocker(join);
     if (blocker !== undefined) {
       this.violate(`join ${join.id} ran although ${blocker}`);
-      return;
+      return consumed;
     }
     for (const port of join.inputs) {
       const actual = itemKeys(inputs[port.name] ?? []).join(',');
       const expected = this.joinInput(join, port.name).join(',');
       if (actual !== expected) this.violate(`join ${join.id} took [${actual}] on '${port.name}', but the contributions are [${expected}]`);
     }
+    return consumed;
   }
 
   /** A whole-input activation is a direct delivery (item 11, last sentence) or a fan-in that is ready. */
-  private checkWhole(target: CompiledNode, inputs: Readonly<Record<string, readonly HandoffItem[]>>): void {
+  private checkWhole(target: CompiledNode, inputs: Readonly<Record<string, readonly HandoffItem[]>>): Source[] {
     const pending = this.pendingDirect.get(target.id) ?? [];
     const direct = pending.findIndex((entry) => itemKeys(inputs[entry.port] ?? []).join(',') === entry.keys.join(','));
     if (direct >= 0) {
-      pending.splice(direct, 1);
-      return;
+      const [taken] = pending.splice(direct, 1);
+      return taken === undefined ? [] : [taken.source];
     }
     const ready = this.readyFanIns(target);
     if (ready.size === 0) {
       this.violate(`${target.id} ran with no direct delivery waiting and no fan-in ready`);
-      return;
+      return [];
     }
     this.counts.fanInRuns += 1;
     const since = this.lastActivation.get(target.id) ?? 0;
@@ -583,6 +636,7 @@ export class JoinOracle {
       const actual = itemKeys(inputs[port] ?? []).join(',');
       if (actual !== keys.join(',')) this.violate(`fan-in ${target.id} took [${actual}] on '${port}', but the contributions are [${keys.join(',')}]`);
     }
+    return [...ready].flatMap(([source, edges]) => this.contributionSource(source, edges, since));
   }
 
   // -------------------------------------------------------------------------
