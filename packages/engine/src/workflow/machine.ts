@@ -17,7 +17,6 @@ import {
   evolveTicket,
   type Execution,
   execution,
-  executionLive,
   type Group,
   groupLive,
   laneLive,
@@ -97,6 +96,65 @@ function routedItems(edgeIndex: number, exec: Execution): HandoffItem[] {
   });
 }
 
+const MAX_LINEAGE_STATES = 100_000;
+
+/**
+ * §10.6 item 3: an item is outdated when every lineage path from it is old: the first fan-out lane output on it
+ * is a replaced lane's. A path that reaches a root without a fan-out lane output is current, and any current path
+ * makes the item current.
+ */
+export function itemOutdated(state: TicketWorkflow, item: HandoffItem): boolean {
+  return pathsOld(state, item.lineage ?? []);
+}
+
+/**
+ * Whether an output item about to be routed is outdated, judged like the copy its target would receive (whose
+ * lineage starts at this output). An output of a fan-out lane is of that lane's generation, which is live.
+ */
+function outputOutdated(draft: WorkflowDraft, exec: Execution, item: HandoffItem): boolean {
+  if (laneOf(draft.state, exec.nodeId, exec.lane)?.group !== undefined) return false;
+  return pathsOld(draft.state, item.lineage ?? []);
+}
+
+/**
+ * True when there is at least one lineage path from `start` and every one is old (see itemOutdated). Every path
+ * through a reference has the same verdict from there on, so each reference is visited once.
+ */
+function pathsOld(state: TicketWorkflow, start: readonly ItemRef[]): boolean {
+  const queue = [...start];
+  if (queue.length === 0) return false;
+  const seen = new Set<string>();
+  while (queue.length > 0) {
+    if (seen.size > MAX_LINEAGE_STATES) return false;
+    const ref = queue.shift();
+    if (ref === undefined) break;
+    const key = `${ref.nodeId}#${ref.run}#${ref.item}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const exec = execution(state, ref.nodeId, ref.run);
+    if (exec === undefined) return false;
+    if (laneOf(state, ref.nodeId, exec.lane)?.group !== undefined) {
+      // The first fan-out lane output on this path decides it.
+      if (laneLive(state, ref.nodeId, exec.lane)) return false;
+      continue;
+    }
+    const parents = exec.output?.items[ref.item]?.lineage ?? [];
+    if (parents.length === 0) return false;
+    queue.push(...parents);
+  }
+  return true;
+}
+
+/**
+ * §10.6 item 3: whether an execution belongs to the current generation. A fan-out lane's execution follows its
+ * lane; any other execution is of a replaced generation when it has inputs and all of them are outdated.
+ */
+export function executionLive(state: TicketWorkflow, workflow: CompiledWorkflow, exec: Execution): boolean {
+  if (laneOf(state, exec.nodeId, exec.lane)?.group !== undefined) return laneLive(state, exec.nodeId, exec.lane);
+  const items = Object.values(exec.inputs).flat();
+  return items.length === 0 || !items.every((item) => itemOutdated(state, item));
+}
+
 /** A fan-out node: it has an each input, so it runs in lanes grouped by delivery. */
 function isFanOut(node: CompiledNode): boolean {
   return node.inputs.some((port) => port.mode === 'each');
@@ -140,14 +198,15 @@ function contribution(draft: WorkflowDraft, source: string, edges: readonly numb
       .executions.filter(settled)
       .sort((a, b) => (b.completedOrder ?? 0) - (a.completedOrder ?? 0))[0];
     // A result that only rests on a replaced generation is no contribution (item 7).
-    execs = latest === undefined || !executionLive(state, latest) ? [] : [latest];
+    execs = latest === undefined || !executionLive(state, draft.workflow, latest) ? [] : [latest];
   }
   execs = execs.filter(routedOver);
   return { execs, fresh: fresh || execs.some((exec) => (exec.completedOrder ?? 0) > since) };
 }
 
-function contributedItems(contributed: Contribution, edges: readonly number[]): HandoffItem[] {
-  return contributed.execs.flatMap((exec) => edges.flatMap((index) => routedItems(index, exec)));
+/** The contributed items, without those that became outdated since they were sent (item 7). */
+function contributedItems(draft: WorkflowDraft, contributed: Contribution, edges: readonly number[]): HandoffItem[] {
+  return contributed.execs.flatMap((exec) => edges.flatMap((index) => routedItems(index, exec))).filter((item) => !itemOutdated(draft.state, item));
 }
 
 /** Item 9, first part: the source, or a lane of a group its current group hangs under, is still active. */
@@ -211,11 +270,12 @@ function toPort(draft: WorkflowDraft, index: number): string | undefined {
 function latestOver(draft: WorkflowDraft, edgeIndex: number): HandoffItem[] {
   const source = draft.workflow.edges[edgeIndex]?.edge.from.node;
   if (source === undefined) return [];
-  if (isFanOut(draft.node(source))) return contributedItems(contribution(draft, source, [edgeIndex], 0), [edgeIndex]);
+  if (isFanOut(draft.node(source))) return contributedItems(draft, contribution(draft, source, [edgeIndex], 0), [edgeIndex]);
   const latest = nodeProgress(draft.state, source)
     .executions.filter((exec) => exec.completedOrder !== undefined && Object.hasOwn(exec.routes, edgeIndex))
     .sort((a, b) => (b.completedOrder ?? 0) - (a.completedOrder ?? 0))[0];
-  return latest === undefined || !executionLive(draft.state, latest) ? [] : routedItems(edgeIndex, latest);
+  if (latest === undefined || !executionLive(draft.state, draft.workflow, latest)) return [];
+  return routedItems(edgeIndex, latest).filter((item) => !itemOutdated(draft.state, item));
 }
 
 export interface ActivationExtra {
@@ -301,7 +361,7 @@ function retireReplaced(draft: WorkflowDraft): void {
   for (const nodeId of draft.workflow.nodes.keys()) {
     for (const lane of nodeProgress(draft.state, nodeId).laneOrder) {
       const exec = currentExecution(draft.state, nodeId, lane);
-      if (exec === undefined || !ACTIVE_STATUSES.has(exec.status) || executionLive(draft.state, exec)) continue;
+      if (exec === undefined || !ACTIVE_STATUSES.has(exec.status) || executionLive(draft.state, draft.workflow, exec)) continue;
       draft.emit({ type: 'node.superseded', data: { ticketId: draft.ticketId, nodeId, lane, run: exec.run, reason: 'replaced' } });
     }
   }
@@ -357,7 +417,7 @@ function tryJoin(draft: WorkflowDraft, target: CompiledNode): void {
   for (const port of target.inputs) {
     inputs[port.name] = [...bySource].flatMap(([source, edges]) => {
       const onPort = edges.filter((index) => toPort(draft, index) === port.name);
-      return contributedItems(contribution(draft, source, onPort, since), onPort);
+      return contributedItems(draft, contribution(draft, source, onPort, since), onPort);
     });
   }
   activate(draft, target.id, MAIN, 'input', inputs);
@@ -379,7 +439,7 @@ function tryFanIns(draft: WorkflowDraft, target: CompiledNode): void {
   for (const [source, edges] of ready) {
     for (const index of edges) {
       const port = toPort(draft, index) ?? '';
-      given[port] = [...(given[port] ?? []), ...contributedItems(contribution(draft, source, [index], since), [index])];
+      given[port] = [...(given[port] ?? []), ...contributedItems(draft, contribution(draft, source, [index], since), [index])];
     }
   }
   const back = ready.some(([, edges]) => edges.some((index) => draft.workflow.edges[index]?.back === true));
@@ -468,7 +528,8 @@ function planRoutes(draft: WorkflowDraft, node: CompiledNode, exec: Execution, o
       .filter(({ item }) => edge.when === undefined || evaluateCondition(edge.when, edgeContext(draft.state, draft.workflow, draft.ticketId, { node, exec }, item)));
     const target = draft.node(edge.edge.to.node);
     const each = target.inputs.find((input) => input.name === edge.edge.to.port)?.mode === 'each';
-    const isStale = (item: HandoffItem): boolean => each && answersOnlyOldLanes(draft, item, target.id);
+    // Stale (item 5): it answers only replaced lanes of a fan-out target, or rests only on replaced work at all.
+    const isStale = (item: HandoffItem): boolean => (each && answersOnlyOldLanes(draft, item, target.id)) || outputOutdated(draft, exec, item);
     const items = passing.filter(({ item }) => !isStale(item)).map(({ index }) => index);
     const old = passing.filter(({ item }) => isStale(item)).map(({ index }) => index);
     if (items.length > 0) routes.push({ edge: edgeIndex, to: edge.edge.to.node, items });
@@ -561,7 +622,7 @@ export function ticketWaitReasons(state: TicketWorkflow, workflow: CompiledWorkf
     }
     for (const lane of progress.laneOrder) {
       const exec = currentExecution(state, nodeId, lane);
-      if (exec === undefined || Object.keys(exec.routes).length > 0 || !executionLive(state, exec)) continue;
+      if (exec === undefined || Object.keys(exec.routes).length > 0 || !executionLive(state, workflow, exec)) continue;
       if (exec.status === 'failed') reasons.push({ nodeId, lane, run: exec.run, kind: 'failed', status: exec.status });
       else if (exec.status === 'done' && exec.onlyStale === true) reasons.push({ nodeId, lane, run: exec.run, kind: 'stale', status: exec.status });
     }
@@ -574,14 +635,15 @@ export function ticketWaitReasons(state: TicketWorkflow, workflow: CompiledWorkf
  * through a port without edges. Not an output whose items were all stale.
  */
 export function endReached(state: TicketWorkflow, workflow: CompiledWorkflow): boolean {
+  // Only ends of the current generation count: after a new plan, an end reached with the old plan's results does not.
   // An empty delivery that passed over a fan-out node with no further edges ended its path there too.
-  if (state.pathEnds > 0) return true;
+  if (state.endGroups.some((group) => groupLive(state, group))) return true;
   const ends = new Set(workflow.ends);
   for (const nodeId of workflow.nodes.keys()) {
     for (const exec of nodeProgress(state, nodeId).executions) {
       if (exec.status !== 'done') continue;
       // An output whose items were all stale went nowhere, but it says nothing about the current work (D-021).
-      if (ends.has(nodeId) || (Object.keys(exec.routes).length === 0 && exec.onlyStale !== true)) return true;
+      if ((ends.has(nodeId) || (Object.keys(exec.routes).length === 0 && exec.onlyStale !== true)) && executionLive(state, workflow, exec)) return true;
     }
   }
   return false;
@@ -597,7 +659,7 @@ export function completeTicketIfDone(draft: WorkflowDraft): void {
 
 /** Activates a lane again with the inputs of its current execution (retry, review rejection). Live lanes only. */
 export function rerun(draft: WorkflowDraft, exec: Execution, cause: 'retry' | 'review', feedback?: { run: number; comment?: string }): void {
-  if (!executionLive(draft.state, exec)) throw new Error(`run ${exec.run} of node '${exec.nodeId}' belongs to a replaced generation`);
+  if (!executionLive(draft.state, draft.workflow, exec)) throw new Error(`run ${exec.run} of node '${exec.nodeId}' belongs to a replaced generation`);
   const group = laneOf(draft.state, exec.nodeId, exec.lane)?.group;
   activate(draft, exec.nodeId, exec.lane, cause, exec.inputs, {
     ...(group === undefined ? {} : { group }),

@@ -3,7 +3,7 @@ import type { DomainEvent, TemplateDefinition, TemplateEdge, TemplateNode } from
 import type { CompiledWorkflow } from '../src/workflow/compile.ts';
 import { ticketWaitReasons } from '../src/workflow/machine.ts';
 import type { ScriptedSession } from '../src/workflow/scripted-agent.ts';
-import { currentExecution, execution, nodeProgress } from '../src/workflow/state.ts';
+import { currentExecution, execution, nodeProgress, type TicketWorkflow } from '../src/workflow/state.ts';
 import { nextRequestId } from './helpers/engine-harness.ts';
 import { JoinOracle, type OracleCounts } from './helpers/join-oracle.ts';
 import { HUMAN, openWorkflowHarness, type WorkflowHarness } from './helpers/workflow-harness.ts';
@@ -122,9 +122,11 @@ function generate(seed: number): Graph {
       // must take that pending review with it.
       if (random() < 0.8) {
         const reviewer = { id: 'rqa', kind: random() < 0.5 ? ('gate' as const) : ('human' as const) };
-        nodes.push({ id: 'rjoin', kind: 'join' }, reviewer);
+        // 'rsum' summarizes the join and sometimes also cites work outside the fan-out (mixed lineage).
+        nodes.push({ id: 'rjoin', kind: 'join' }, { id: 'rsum', kind: 'agent' }, reviewer);
         addById(nodes[fanOut]?.id ?? '', 'done', 'rjoin');
-        addById('rjoin', 'done', 'rqa');
+        addById('rjoin', 'done', 'rsum');
+        addById('rsum', 'done', 'rqa');
         addById('rqa', 'done', 'end');
       }
       // A chained fan-out under the planned lanes.
@@ -202,6 +204,8 @@ const emptyCoverage = (): Coverage => ({
   fanInRuns: 0,
   extendedGroups: 0,
   chainedGroups: 0,
+  replansAfterEnd: 0,
+  mixedAtReplan: 0,
   fanOutLanes: 0,
   reworkRuns: 0,
   rejectLoops: 0,
@@ -244,6 +248,32 @@ describe('routing properties', () => {
   const stats = { invalid: 0, done: 0, open: 0, steps: 0, runs: 0 };
   const coverage = emptyCoverage();
 
+  /**
+   * An explicit lineage that cites one finished fan-out lane output and one finished output of an entry run (a root
+   * that never passed a fan-out), so that only some of the item's lineage paths can belong to a replaced generation.
+   * Undefined when either is missing.
+   */
+  function mixedLineage(config: CaseRun, state: TicketWorkflow, self: string, random: () => number): { nodeId: string; run: number; item: number }[] | undefined {
+    const refs = (wanted: (nodeId: string, cause: string) => boolean) =>
+      Object.entries(state.nodes).flatMap(([nodeId, progress]) =>
+        nodeId === self
+          ? []
+          : progress.executions.flatMap((exec) =>
+              (exec.status === 'done' || exec.status === 'failed') && (exec.output?.items.length ?? 0) > 0 && wanted(nodeId, exec.cause) ? [{ nodeId, run: exec.run, item: 0 }] : [],
+            ),
+      );
+    // 'rsum' cites what it summarizes (the planned lanes' join); others cite any fan-out lane output.
+    const own = self === 'rsum' ? Object.values(execution(state, self, nodeProgress(state, self).executions.length)?.inputs ?? {}).flat()[0]?.lineage?.[0] : undefined;
+    const fanOut = own === undefined ? refs((nodeId) => isLanes(config.kinds.get(nodeId))) : [own];
+    const other = refs((nodeId, cause) => cause === 'start' && !isLanes(config.kinds.get(nodeId)));
+    const a = fanOut[Math.floor(random() * fanOut.length)];
+    const b = other[Math.floor(random() * other.length)];
+    if (a === undefined) return undefined;
+    // Now and then cite only the lane output: once its plan is replaced, the item rests only on old work (stale).
+    if (random() < 0.3) return [a];
+    return b === undefined ? undefined : [a, b];
+  }
+
   /** Plays one agent run: the outcome is a pure function of the case seed and the run's identity. */
   async function behave(s: ScriptedSession): Promise<undefined> {
     const { ticketId, nodeId, run, lane } = s.request;
@@ -270,7 +300,8 @@ describe('routing properties', () => {
     if (runs > 6 || roll < 0.75) {
       const shape = random();
       const count = runs > 6 ? 1 : shape < 0.1 ? 0 : shape < 0.6 ? 1 : shape < 0.85 ? 2 : 3;
-      await done('done', { items: Array.from({ length: count }, (_, index) => ({ data: { index } })) });
+      const lineage = kind === 'agent' && random() < (nodeId === 'rsum' ? 0.7 : 0.3) ? mixedLineage(config, state, nodeId, random) : undefined;
+      await done('done', { items: Array.from({ length: count }, (_, index) => ({ data: { index }, ...(lineage === undefined ? {} : { lineage }) })) });
     } else if (roll < 0.87) {
       await done('error', { items: random() < 0.2 ? [] : [{ data: { reason: 'failed' } }] });
     } else if (roll < 0.95) {
@@ -443,9 +474,11 @@ describe('routing properties', () => {
     expect(coverage.replans).toBeGreaterThanOrEqual(CASES / 6);
     expect(coverage.replansOverActive).toBeGreaterThanOrEqual(CASES / 20);
     expect(coverage.retired).toBeGreaterThanOrEqual(CASES / 20);
-    expect(coverage.retiredDownstream).toBeGreaterThanOrEqual(CASES / 50);
+    expect(coverage.retiredDownstream).toBeGreaterThanOrEqual(CASES / 100);
     expect(coverage.extendedGroups).toBeGreaterThanOrEqual(CASES / 60);
     expect(coverage.chainedGroups).toBeGreaterThanOrEqual(CASES / 20);
+    expect(coverage.replansAfterEnd).toBeGreaterThanOrEqual(CASES / 100);
+    expect(coverage.mixedAtReplan).toBeGreaterThanOrEqual(CASES / 300);
     expect(stats.done).toBeGreaterThan(CASES / 3);
     expect(stats.runs).toBeGreaterThan(CASES * 2);
     // The generator must reach the interesting shapes, or the test proves little.

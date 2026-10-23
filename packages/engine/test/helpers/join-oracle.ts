@@ -58,6 +58,10 @@ export interface OracleCounts {
   extendedGroups: number;
   /** Groups opened under an upstream fan-out group. */
   chainedGroups: number;
+  /** New plans opened after a path had already ended (with the old plan's results). */
+  replansAfterEnd: number;
+  /** Active executions outside fan-out lanes, at a new plan, with an input item that has both old and current lineage paths. */
+  mixedAtReplan: number;
 }
 
 const refKey = (ref: ItemRef): string => `${ref.nodeId}#${ref.run}#${ref.item}`;
@@ -65,7 +69,7 @@ const itemKeys = (items: readonly HandoffItem[]): string[] => items.map((item) =
 
 export class JoinOracle {
   readonly violations: string[] = [];
-  readonly counts: OracleCounts = { replans: 0, retired: 0, retiredDownstream: 0, replansOverActive: 0, joinRuns: 0, multiSourceJoinRuns: 0, fanInRuns: 0, extendedGroups: 0, chainedGroups: 0 };
+  readonly counts: OracleCounts = { replans: 0, retired: 0, retiredDownstream: 0, replansOverActive: 0, joinRuns: 0, multiSourceJoinRuns: 0, fanInRuns: 0, extendedGroups: 0, chainedGroups: 0, replansAfterEnd: 0, mixedAtReplan: 0 };
   /** Item 1: the step counter. */
   private step = 0;
   private readonly execs = new Map<string, Exec[]>();
@@ -82,7 +86,10 @@ export class JoinOracle {
   private readonly pendingDirect = new Map<string, { edge: number; port: string; keys: string[] }[]>();
   /** Fan-out nodes the last completion reworked from a lane-less source: they must not open a new generation (D-020). */
   private reworked = new Set<string>();
-  private ended = false;
+  /** Every output item's lineage, from the log: item key → parents. */
+  private readonly lineage = new Map<string, readonly ItemRef[]>();
+  /** Item 13 candidates; whether one counts is decided when asked, by the generation it belongs to now. */
+  private readonly endRecords: ({ kind: 'exec'; node: string; run: number } | { kind: 'group'; group: string })[] = [];
   private done = false;
 
   private readonly workflow: CompiledWorkflow;
@@ -105,6 +112,7 @@ export class JoinOracle {
         break;
       case 'node.reviewRequested':
         this.setStatus(event.data.nodeId, event.data.run, 'review');
+        this.recordLineage(event.data.nodeId, event.data.run, event.data.output.items);
         break;
       case 'node.returned':
         this.setStatus(event.data.nodeId, event.data.run, 'discarded');
@@ -121,7 +129,7 @@ export class JoinOracle {
       case 'node.superseded': {
         const { nodeId, lane, run } = event.data;
         const exec = this.exec(nodeId, run);
-        if (exec === undefined || this.execLive(exec)) this.violate(`${nodeId}/${lane} run ${run} was superseded as replaced, but it belongs to the current generation`);
+        if (exec === undefined || this.execLive(exec)) this.violate(`${nodeId}/${lane} run ${run} was superseded as replaced, but it belongs to the current generation${exec === undefined ? '' : ` (${this.explain(exec)})`}`);
         this.setStatus(nodeId, run, 'superseded');
         this.counts.retired += 1;
         if (!this.laneGroup.has(`${nodeId}#${lane}`)) this.counts.retiredDownstream += 1;
@@ -136,7 +144,7 @@ export class JoinOracle {
       case 'ticket.completed': {
         const reasons = this.waitReasons();
         if (reasons.length > 0) this.violate(`ticket completed while ${reasons.map((r) => `${r.kind}:${r.nodeId}/${r.lane}`).join(', ')} held it open`);
-        if (!this.ended) this.violate('ticket completed before any path ended');
+        if (!this.endedNow()) this.violate('ticket completed before a path of the current generation ended');
         this.done = true;
         break;
       }
@@ -204,6 +212,7 @@ export class JoinOracle {
     if (parent === undefined && this.reworked.has(nodeId)) this.violate(`${nodeId} opened a new generation although the same delivery reworks its current one (D-020)`);
     if (previous !== undefined && parent === undefined) {
       this.counts.replans += 1;
+      if (this.endRecords.length > 0) this.counts.replansAfterEnd += 1;
       const replacedActive = [...(this.lanes.get(nodeId)?.keys() ?? [])].some(
         (lane) => this.laneGroup.get(`${nodeId}#${lane}`) === previous && ACTIVE.has(this.currentExec(nodeId, lane)?.status ?? ''),
       );
@@ -211,6 +220,18 @@ export class JoinOracle {
     }
     this.groups.set(group, { node: nodeId, ...(parent === undefined ? {} : { parent }), passedEdges: [] });
     this.current.set(nodeId, group);
+    if (previous !== undefined && parent === undefined) {
+      for (const list of this.execs.values()) {
+        for (const exec of list) {
+          if (!ACTIVE.has(exec.status) || this.laneGroup.has(`${exec.node}#${exec.lane}`)) continue;
+          if (exec.inputs.some((item) => new Set(this.paths(item).map((path) => this.pathGeneration(path))).size > 1)) this.counts.mixedAtReplan += 1;
+        }
+      }
+    }
+  }
+
+  private recordLineage(nodeId: string, run: number, items: readonly HandoffItem[]): void {
+    items.forEach((item, index) => this.lineage.set(refKey({ nodeId, run, item: index }), item.lineage ?? []));
   }
 
   private onCompleted(data: Extract<DomainEvent, { type: 'node.completed' }>['data']): void {
@@ -219,7 +240,7 @@ export class JoinOracle {
       this.violate(`completion of unknown execution ${data.nodeId} run ${data.run}`);
       return;
     }
-    if (!this.execLive(exec)) this.violate(`${data.nodeId}/${data.lane} run ${data.run} completed in a replaced generation`);
+    if (!this.execLive(exec)) this.violate(`${data.nodeId}/${data.lane} run ${data.run} completed in a replaced generation (${this.explain(exec)})`);
     const source = this.node(data.nodeId);
     // D-020: a delivery from a lane-less source that reworks live lanes must not open a new generation.
     this.reworked = new Set();
@@ -230,23 +251,28 @@ export class JoinOracle {
         if (route.items.some((index) => this.lanesReached(data.output.items[index], target.id).some((lane) => this.laneLive(target.id, lane)))) this.reworked.add(target.id);
       }
     }
-    // Item 5: stale items are exactly those that lead only to replaced lanes of a fan-out target.
+    // Item 5: stale items are exactly those that answer only replaced lanes of a fan-out target, or that are
+    // outdated themselves. Judged on the copy a target would get, so the output's lineage is recorded first.
+    this.recordLineage(data.nodeId, data.run, data.output.items);
+    const copyOutdated = (index: number): boolean => this.outdated({ data: {}, lineage: [{ nodeId: data.nodeId, run: data.run, item: index }] });
+    const stale = (index: number, targetId: string): boolean => {
+      const target = this.workflow.nodes.get(targetId);
+      return (target !== undefined && this.isFanOut(target) && this.onlyOldLanes(data.output.items[index], targetId)) || copyOutdated(index);
+    };
     for (const route of data.routes) {
-      const target = this.targetOf(route.edge);
-      if (target !== undefined && this.isFanOut(target)) {
-        for (const index of route.items) {
-          if (this.onlyOldLanes(data.output.items[index], target.id)) this.violate(`item ${index} of ${data.nodeId} run ${data.run} went to ${target.id} but answers only replaced lanes`);
-        }
+      for (const index of route.items) {
+        if (stale(index, route.to)) this.violate(`item ${index} of ${data.nodeId} run ${data.run} went to ${route.to} but is stale (it rests only on replaced work)`);
       }
     }
     for (const entry of data.stale ?? []) {
       for (const index of entry.items) {
-        if (!this.onlyOldLanes(data.output.items[index], entry.to)) this.violate(`item ${index} of ${data.nodeId} run ${data.run} was held back as stale but leads to a live lane of ${entry.to}`);
+        if (!stale(index, entry.to)) this.violate(`item ${index} of ${data.nodeId} run ${data.run} was held back as stale but rests on current work (to ${entry.to})`);
       }
     }
     this.step += 1;
     exec.status = data.status;
     exec.items = data.output.items;
+    this.recordLineage(data.nodeId, data.run, data.output.items);
     exec.completedAt = this.step;
     exec.routes = new Map([...(data.empty ?? []).map((entry): [number, number[]] => [entry.edge, []]), ...data.routes.map((route): [number, number[]] => [route.edge, route.items])]);
     exec.onlyStale = exec.routes.size === 0 && (data.stale ?? []).length > 0;
@@ -265,7 +291,9 @@ export class JoinOracle {
       }
     }
     // Item 13: an output that went nowhere only because all its items were stale is no end (D-021).
-    if (data.status === 'done' && (this.workflow.ends.includes(data.nodeId) || (exec.routes.size === 0 && !exec.onlyStale))) this.ended = true;
+    if (data.status === 'done' && (this.workflow.ends.includes(data.nodeId) || (exec.routes.size === 0 && !exec.onlyStale))) {
+      this.endRecords.push({ kind: 'exec', node: data.nodeId, run: data.run });
+    }
   }
 
   private onPassedOver(data: Extract<DomainEvent, { type: 'node.passedOver' }>['data']): void {
@@ -277,7 +305,7 @@ export class JoinOracle {
       group.passedAt = this.step;
       group.passedEdges = data.edges.map((entry) => entry.edge);
     }
-    if (data.edges.length === 0) this.ended = true;
+    if (data.edges.length === 0) this.endRecords.push({ kind: 'group', group: data.group });
   }
 
   // -------------------------------------------------------------------------
@@ -308,26 +336,53 @@ export class JoinOracle {
     return group === undefined || this.groupLive(group);
   }
 
-  /** Item 3: walking lineage, the first fan-out lane output on every path is of a replaced lane (at least one). */
-  private outdated(item: HandoffItem): boolean {
-    let reached = false;
-    const seen = new Set<string>();
-    const queue = [...(item.lineage ?? [])];
-    while (queue.length > 0) {
-      const ref = queue.shift() as ItemRef;
-      const key = refKey(ref);
-      if (seen.has(key)) continue;
-      seen.add(key);
+  /**
+   * Every lineage path from an item to a root (an item without lineage), listed in full: brute force on purpose,
+   * so the generation rule below is checked against the plain definition rather than a clever walk.
+   */
+  private paths(item: HandoffItem): ItemRef[][] {
+    const result: ItemRef[][] = [];
+    const walk = (ref: ItemRef, path: readonly ItemRef[]): void => {
+      if (result.length > 200_000) throw new Error('oracle: too many lineage paths');
+      const next = [...path, ref];
+      const parents = this.lineage.get(refKey(ref)) ?? [];
+      if (parents.length === 0) result.push(next);
+      for (const parent of parents) walk(parent, next);
+    };
+    for (const ref of item.lineage ?? []) walk(ref, []);
+    return result;
+  }
+
+  /** Item 3, one path: its first fan-out lane output decides (live: current, replaced: old); none: current. */
+  private pathGeneration(path: readonly ItemRef[]): 'old' | 'current' {
+    for (const ref of path) {
       const exec = this.exec(ref.nodeId, ref.run);
-      if (exec === undefined) continue;
-      if (this.laneGroup.has(`${ref.nodeId}#${exec.lane}`)) {
-        if (this.laneLive(ref.nodeId, exec.lane)) return false;
-        reached = true;
-        continue;
-      }
-      queue.push(...(exec.items[ref.item]?.lineage ?? []));
+      if (exec === undefined) return 'current';
+      if (this.laneGroup.has(`${ref.nodeId}#${exec.lane}`)) return this.laneLive(ref.nodeId, exec.lane) ? 'current' : 'old';
     }
-    return reached;
+    return 'current';
+  }
+
+  /** Item 3: an item is outdated when it has lineage paths and every one of them is old. */
+  private outdated(item: HandoffItem): boolean {
+    const paths = this.paths(item);
+    return paths.length > 0 && paths.every((path) => this.pathGeneration(path) === 'old');
+  }
+
+  /** The lineage paths of an execution's inputs with their generation, for counterexamples. */
+  private explain(exec: Exec): string {
+    return exec.inputs
+      .map((item, index) => `input ${index}: ` + this.paths(item).slice(0, 6).map((path) => `${this.pathGeneration(path)}[${path.map(refKey).join(' < ')}]`).join(' | '))
+      .join('; ');
+  }
+
+  /** Item 13: a path end of the current generation exists. */
+  private endedNow(): boolean {
+    return this.endRecords.some((end) => {
+      if (end.kind === 'group') return this.groupLive(end.group);
+      const exec = this.exec(end.node, end.run);
+      return exec !== undefined && this.execLive(exec);
+    });
   }
 
   /** Item 3: an execution of the current generation. */
@@ -395,9 +450,15 @@ export class JoinOracle {
     return { execs, fresh: fresh || execs.some((exec) => (exec.completedAt ?? 0) > since) };
   }
 
+  /** Contributed item refs, without items that are outdated by now (item 7). */
   private contributedKeys(source: string, edges: readonly number[], since: number): string[] {
     return this.contribution(source, edges, since).execs.flatMap((exec) =>
-      edges.flatMap((edge) => (exec.routes.get(edge) ?? []).map((item) => refKey({ nodeId: source, run: exec.run, item }))),
+      edges.flatMap((edge) =>
+        (exec.routes.get(edge) ?? [])
+          .map((item) => ({ nodeId: source, run: exec.run, item }))
+          .filter((ref) => !this.outdated({ data: {}, lineage: [ref] }))
+          .map(refKey),
+      ),
     );
   }
 
@@ -565,11 +626,11 @@ export class JoinOracle {
     for (const [nodeId, lanes] of this.lanes) {
       for (const lane of lanes.keys()) {
         const exec = this.currentExec(nodeId, lane);
-        if (exec !== undefined && ACTIVE.has(exec.status) && !this.execLive(exec)) problems.push(`${nodeId}/${lane} run ${exec.run} is active but belongs to a replaced generation`);
+        if (exec !== undefined && ACTIVE.has(exec.status) && !this.execLive(exec)) problems.push(`${nodeId}/${lane} run ${exec.run} is active but belongs to a replaced generation (${this.explain(exec)})`);
       }
     }
     const reasons = this.waitReasons();
-    if (!this.done && reasons.length === 0) problems.push(`open ticket without a wait reason (a path ended: ${String(this.ended)})`);
+    if (!this.done && reasons.length === 0) problems.push(`open ticket without a wait reason (a current path ended: ${String(this.endedNow())})`);
     if (this.done && reasons.length > 0) problems.push('done ticket with a wait reason');
     return problems;
   }

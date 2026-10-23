@@ -165,10 +165,12 @@ type LaneKey = { readonly ticketId: string; readonly nodeId: string; readonly la
 /**
  * Node progress for boards and stats: one row per lane (its current run) and one per execution
  * (activated, started, reviewed, finished; port and error). No row for a node means it is waiting.
+ * `superseded_by` says why an execution was cut short: 'new-input' (newer input for its lane) or 'replaced' (a
+ * new plan replaced its generation). A lane row keeps it while that execution is the lane's last one.
  */
 const nodes: Projector = {
   name: 'nodes',
-  version: 2,
+  version: 3,
   tables: ['p_node_lanes', 'p_node_runs'],
   ddl: [
     `CREATE TABLE p_node_lanes (
@@ -182,6 +184,7 @@ const nodes: Projector = {
       run_id TEXT,
       attempt INTEGER NOT NULL DEFAULT 0,
       pause_requested INTEGER NOT NULL DEFAULT 0,
+      superseded_by TEXT,
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (ticket_id, node_id, lane)
     ) STRICT`,
@@ -201,6 +204,7 @@ const nodes: Projector = {
       review_at INTEGER,
       finished_at INTEGER,
       error TEXT,
+      superseded_by TEXT,
       PRIMARY KEY (ticket_id, node_id, run)
     ) STRICT`,
   ],
@@ -219,14 +223,14 @@ const nodes: Projector = {
         const { data } = event;
         const statements: SqliteStatement[] = [];
         if (data.supersedes !== undefined) {
-          statements.push(run("status = 'superseded', finished_at = ?", [event.timestamp], { ...data, run: data.supersedes }));
+          statements.push(run("status = 'superseded', superseded_by = 'new-input', finished_at = ?", [event.timestamp], { ...data, run: data.supersedes }));
         }
         statements.push(
           {
             sql: `INSERT INTO p_node_lanes (ticket_id, node_id, lane, lane_group, run, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
                   ON CONFLICT (ticket_id, node_id, lane) DO UPDATE SET
                     lane_group = COALESCE(excluded.lane_group, lane_group), run = excluded.run, status = excluded.status,
-                    executor = NULL, run_id = NULL, attempt = 0, pause_requested = 0, updated_at = excluded.updated_at`,
+                    executor = NULL, run_id = NULL, attempt = 0, pause_requested = 0, superseded_by = NULL, updated_at = excluded.updated_at`,
             params: [data.ticketId, data.nodeId, data.lane, data.group ?? null, data.run, data.status, event.timestamp],
           },
           {
@@ -249,8 +253,11 @@ const nodes: Projector = {
       case 'node.returned':
         return [run("status = 'discarded', finished_at = ?", [event.timestamp], event.data)];
       case 'node.superseded':
-        // The lane belongs to a replaced group: nothing will come of it (a lane shows 'wait' then, as laneStatus does).
-        return [lane("status = 'wait'", [], event.data), run("status = 'superseded', finished_at = ?", [event.timestamp], event.data)];
+        // A new plan replaced its generation: nothing will come of it. The lane shows 'wait' (as laneStatus does) and why.
+        return [
+          lane("status = 'wait', superseded_by = ?", [event.data.reason], event.data),
+          run("status = 'superseded', superseded_by = ?, finished_at = ?", [event.data.reason, event.timestamp], event.data),
+        ];
       case 'node.completed':
         return [
           lane('status = ?', [event.data.status], event.data),

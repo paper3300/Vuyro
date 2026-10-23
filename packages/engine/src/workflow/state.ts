@@ -87,8 +87,8 @@ export interface TicketWorkflow {
    * these steps.
    */
   readonly step: number;
-  /** Empty deliveries that ended at a passed-over fan-out node with nowhere further to go (implicit ends). */
-  readonly pathEnds: number;
+  /** Groups of passed-over fan-out nodes whose empty delivery had nowhere further to go (implicit ends). */
+  readonly endGroups: readonly string[];
   /** Agent run id → execution. */
   readonly runIndex: Readonly<Record<string, { readonly nodeId: string; readonly run: number }>>;
 }
@@ -101,7 +101,7 @@ export const EMPTY_TICKET: TicketWorkflow = {
   nodes: {},
   groups: {},
   step: 0,
-  pathEnds: 0,
+  endGroups: [],
   runIndex: {},
 };
 
@@ -148,42 +148,6 @@ export function groupLive(state: TicketWorkflow, groupId: string): boolean {
 export function laneLive(state: TicketWorkflow, nodeId: string, lane: string): boolean {
   const group = laneOf(state, nodeId, lane)?.group;
   return group === undefined || groupLive(state, group);
-}
-
-/**
- * §10.6 item 3: an output item is outdated when, walking its lineage, the first fan-out lane output on every
- * path is one of a replaced lane (and there is at least one). Items that never passed a fan-out are not.
- */
-export function itemOutdated(state: TicketWorkflow, item: HandoffItem): boolean {
-  let reached = false;
-  const seen = new Set<string>();
-  const queue = [...(item.lineage ?? [])];
-  for (let steps = 0; queue.length > 0 && steps < 100_000; steps++) {
-    const ref = queue.shift();
-    if (ref === undefined) break;
-    const key = `${ref.nodeId}#${ref.run}#${ref.item}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const exec = execution(state, ref.nodeId, ref.run);
-    if (exec === undefined) continue;
-    if (laneOf(state, ref.nodeId, exec.lane)?.group !== undefined) {
-      if (laneLive(state, ref.nodeId, exec.lane)) return false;
-      reached = true;
-      continue;
-    }
-    queue.push(...(exec.output?.items[ref.item]?.lineage ?? []));
-  }
-  return reached;
-}
-
-/**
- * §10.6 item 3: whether an execution belongs to the current generation. A fan-out lane's execution follows its
- * lane; any other execution is of a replaced generation when it has inputs and all of them are outdated.
- */
-export function executionLive(state: TicketWorkflow, exec: Execution): boolean {
-  if (laneOf(state, exec.nodeId, exec.lane)?.group !== undefined) return laneLive(state, exec.nodeId, exec.lane);
-  const items = Object.values(exec.inputs).flat();
-  return items.length === 0 || !items.every((item) => itemOutdated(state, item));
 }
 
 /** Lane-visible status: the current execution's status; a node with no lanes is waiting. */
@@ -332,7 +296,7 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent): TicketWork
         ...state,
         step,
         groups: { ...state.groups, [data.group]: group },
-        pathEnds: state.pathEnds + (data.edges.length === 0 ? 1 : 0),
+        endGroups: data.edges.length === 0 ? [...state.endGroups, data.group] : state.endGroups,
       };
       return setNode(next, data.nodeId, (node) => ({ ...node, group: data.group }));
     }
