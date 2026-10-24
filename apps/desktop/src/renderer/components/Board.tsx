@@ -177,6 +177,8 @@ function SortableCard({ ticket, workflow }: { ticket: BoardTicketView; workflow:
 
 export function TicketCard({ ticket, workflow }: { ticket: BoardTicketView; workflow: WorkflowView | undefined }) {
   const openTicket = useUi((state) => state.openTicket);
+  // The selected ticket (kept across the board and the graph) is outlined.
+  const selected = useUi((state) => state.ticketId === ticket.ticketId);
   const badge = personBadge(ticket, workflow);
   const failed = ticket.lanes.some((lane) => lane.status === 'failed');
   const labels = new Map(workflow?.nodes.map((node) => [node.id, node.label]));
@@ -192,7 +194,8 @@ export function TicketCard({ ticket, workflow }: { ticket: BoardTicketView; work
         if (event.key === 'Enter') openTicket(ticket.ticketId);
       }}
       aria-label={ticket.title}
-      className={`flex cursor-pointer flex-col gap-2 rounded-[10px] border bg-white p-3 shadow-sm hover:border-agent ${badge !== undefined ? 'border-[#e7b98a]' : 'border-line'}`}
+      aria-current={selected ? 'true' : undefined}
+      className={`flex cursor-pointer flex-col gap-2 rounded-[10px] border bg-white p-3 shadow-sm hover:border-agent ${badge !== undefined ? 'border-[#e7b98a]' : 'border-line'} ${selected ? 'ring-2 ring-agent/40' : ''}`}
     >
       <div className="flex items-center justify-between">
         <span className="font-mono text-[11px] text-muted">{shortId(ticket.ticketId)}</span>

@@ -28,6 +28,23 @@ export const SDLC: WorkflowView = {
   edges: [],
 };
 
+/** The default template as the engine sends it: positions, edges, and the two rework loops. */
+export const SDLC_WITH_EDGES: WorkflowView = {
+  ...SDLC,
+  nodes: SDLC.nodes.map((node, index) => ({ ...node, position: { x: index * 240, y: 0 } })),
+  edges: [
+    { from: { node: 'brainstorming', port: 'done' }, to: { node: 'spec', port: 'in' }, back: false },
+    { from: { node: 'spec', port: 'done' }, to: { node: 'specApproval', port: 'in' }, back: false },
+    { from: { node: 'specApproval', port: 'approve' }, to: { node: 'plan', port: 'in' }, back: false },
+    { from: { node: 'specApproval', port: 'reject' }, to: { node: 'spec', port: 'in' }, back: true, label: 'rework' },
+    { from: { node: 'plan', port: 'done' }, to: { node: 'dev', port: 'in' }, back: false },
+    { from: { node: 'dev', port: 'done' }, to: { node: 'join', port: 'in' }, back: false },
+    { from: { node: 'join', port: 'done' }, to: { node: 'qa', port: 'in' }, back: false },
+    { from: { node: 'qa', port: 'approve' }, to: { node: 'done', port: 'in' }, back: false },
+    { from: { node: 'qa', port: 'reject' }, to: { node: 'dev', port: 'in' }, back: true, label: 'rework (rejected tasks only)' },
+  ],
+};
+
 export const TEMPLATE: TemplateSummary = SDLC;
 const PIN = { id: SDLC.id, version: 1, hash: SDLC.hash };
 const zero = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0 };
@@ -115,20 +132,27 @@ export function installBridge(handlers: Partial<Record<RendererMethod, Handler>>
   });
   const pair = vi.fn(() => Promise.resolve<BridgeResult<null>>({ ok: true, value: null }));
   const retry = vi.fn(() => Promise.resolve());
+  const subscribe = vi.fn<VuyroBridge['subscribe']>(() => () => undefined);
+  const openJsonFile = vi.fn<VuyroBridge['openJsonFile']>(() => Promise.resolve({ ok: true, value: null }));
+  const saveJsonFile = vi.fn<VuyroBridge['saveJsonFile']>(() => Promise.resolve({ ok: true, value: { name: 'saved.json' } }));
+  const copyText = vi.fn<VuyroBridge['copyText']>(() => Promise.resolve({ ok: true, value: null }));
   const bridge: VuyroBridge = {
     request,
-    subscribe: vi.fn(() => () => undefined),
+    subscribe,
     connection: () => Promise.resolve(useUi.getState().connection),
     onConnection: () => () => undefined,
     pair,
     retry,
+    openJsonFile,
+    saveJsonFile,
+    copyText,
   };
   window.vuyro = bridge;
-  return { commands, request, pair, retry };
+  return { commands, request, pair, retry, subscribe, openJsonFile, saveJsonFile, copyText };
 }
 
 export function setConnection(state: ConnectionState = { phase: 'connected', access: 'write' }): void {
-  useUi.setState({ connection: state, projectId: undefined, ticketId: undefined, lastSequence: 0 });
+  useUi.setState({ connection: state, projectId: undefined, view: 'board', ticketId: undefined, detailOpen: false, nodeId: undefined, lastSequence: 0 });
 }
 
 export function renderWithClient(element: ReactElement): RenderResult {

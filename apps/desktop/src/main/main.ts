@@ -1,11 +1,12 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, protocol, session, Tray, type WebContents } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, protocol, session, Tray, type WebContents } from 'electron';
 import { BRIDGE_CHANNELS, type ConnectionState } from '../shared/bridge.ts';
 import { APP_INDEX, APP_SCHEME, appResponseHeaders, resolveAppFile } from './app-protocol.ts';
 import { EngineConnection } from './engine-connection.ts';
 import { engineConnector } from './engine-connector.ts';
+import { checkCopyText, type FileAccess, type FileDialogs, openJsonFile, saveJsonFile } from './file-exchange.ts';
 import { checkRendererRequest, checkSubscribe, isTrustedFrame } from './ipc-policy.ts';
 import { quitForGood, trayItems, trayTooltip } from './tray-model.ts';
 import { mainWindowOptions } from './window-options.ts';
@@ -154,6 +155,40 @@ function registerIpc(): void {
   ipcMain.handle(BRIDGE_CHANNELS.pair, async (event) => (trusted(event) ? connection.pair() : refusal));
   ipcMain.handle(BRIDGE_CHANNELS.retry, async (event) => {
     if (trusted(event)) await connection.retry();
+  });
+  // Files and the clipboard for JSON import and export: the person picks paths in system dialogs; the page gets text.
+  const files: FileAccess = {
+    stat: async (path) => {
+      const info = await stat(path);
+      return { size: info.size, isFile: info.isFile() };
+    },
+    readText: (path) => readFile(path, 'utf8'),
+    writeText: (path, text) => writeFile(path, text, 'utf8'),
+  };
+  const dialogs = (event: Electron.IpcMainInvokeEvent): FileDialogs => {
+    const parent = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+    const filters = [{ name: 'JSON', extensions: ['json'] }];
+    return {
+      pickOpen: async () => {
+        const options: Electron.OpenDialogOptions = { title: 'JSON 가져오기', properties: ['openFile'], filters };
+        const picked = parent === undefined ? await dialog.showOpenDialog(options) : await dialog.showOpenDialog(parent, options);
+        return picked.canceled ? undefined : picked.filePaths[0];
+      },
+      pickSave: async (suggestedName) => {
+        const options: Electron.SaveDialogOptions = { title: 'JSON 내보내기', defaultPath: join(app.getPath('documents'), suggestedName), filters };
+        const picked = parent === undefined ? await dialog.showSaveDialog(options) : await dialog.showSaveDialog(parent, options);
+        return picked.canceled ? undefined : picked.filePath;
+      },
+    };
+  };
+  ipcMain.handle(BRIDGE_CHANNELS.openFile, async (event) => (trusted(event) ? openJsonFile(dialogs(event), files) : refusal));
+  ipcMain.handle(BRIDGE_CHANNELS.saveFile, async (event, message: unknown) => (trusted(event) ? saveJsonFile(dialogs(event), files, message) : refusal));
+  ipcMain.handle(BRIDGE_CHANNELS.copyText, async (event, message: unknown) => {
+    if (!trusted(event)) return refusal;
+    const checked = checkCopyText(message);
+    if (!checked.ok) return checked;
+    await clipboard.writeText(checked.text);
+    return { ok: true, value: null };
   });
   ipcMain.on(BRIDGE_CHANNELS.subscribe, (event, message: unknown) => {
     if (!trusted(event)) return;

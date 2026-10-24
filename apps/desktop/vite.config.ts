@@ -14,5 +14,7 @@ export default defineConfig({
     // The CSP allows only our own files: no inline module preload polyfill.
     modulePreload: { polyfill: false },
     sourcemap: true,
+    // One chunk read from disk by the app window; splitting would not make it start faster.
+    chunkSizeWarningLimit: 1024,
   },
 });

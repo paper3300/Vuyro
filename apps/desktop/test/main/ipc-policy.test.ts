@@ -40,6 +40,14 @@ describe('IPC from the page', () => {
     expect(checkRendererRequest({ method: 'query.projects' })).toMatchObject({ ok: true });
   });
 
+  it('the page may read run logs, list, export and preview definitions; saving them is a command like any other', () => {
+    expect(RENDERER_METHODS).toEqual(expect.arrayContaining(['query.runEvents', 'query.definitions', 'query.exportDefinition', 'query.importPreview']));
+    // Nothing that reads or writes files on the engine side, and no other definition writes than the save commands.
+    for (const method of ['query.worktreeCleanup', 'definition.activate', 'nodeType.save', 'template.save']) {
+      expect(checkRendererRequest({ method, params: {} }), method).toMatchObject({ ok: false, error: { code: 'bridge_refused' } });
+    }
+  });
+
   it('refuses malformed requests and run tokens from the page', () => {
     expect(checkRendererRequest(null)).toMatchObject({ ok: false });
     expect(checkRendererRequest([])).toMatchObject({ ok: false });

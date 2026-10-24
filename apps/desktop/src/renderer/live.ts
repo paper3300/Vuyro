@@ -28,6 +28,7 @@ export function queryKeysFor(events: EventsMessage['events']): string[][] {
       add(['sharedNodes']);
     } else if (aggregateType === 'run') {
       // Run events carry the run id; the stats and boards that count tokens and tool calls change.
+      add(['runLog', event.aggregateId]);
       add(['ticketStats']);
       add(['ticket']);
       add(['board']);
@@ -38,6 +39,7 @@ export function queryKeysFor(events: EventsMessage['events']): string[][] {
       add(['sharedNodes']);
     } else if (aggregateType === 'definition') {
       add(['templates']);
+      add(['definitions']);
       add(['board']);
     }
   }

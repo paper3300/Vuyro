@@ -1,13 +1,21 @@
 import { useEffect, useState } from 'react';
 import { useConnectionState, useLiveEvents } from '../live.ts';
 import { useProjects } from '../queries.ts';
-import { useUi } from '../store.ts';
+import { useUi, type View } from '../store.ts';
 import { Board } from './Board.tsx';
 import { ConnectionBanner } from './ConnectionBanner.tsx';
+import { GraphView } from './GraphView.tsx';
+import { Library } from './Library.tsx';
 import { NewProjectDialog, ProjectHome } from './ProjectHome.tsx';
 import { TicketDrawer } from './TicketDetail.tsx';
 
 const NEW_PROJECT = '__new__';
+
+const VIEWS: readonly { key: View; label: string; crumb: string; title: string }[] = [
+  { key: 'board', label: '보드', crumb: '티켓 보드', title: '칸반 보드 (단계별)' },
+  { key: 'graph', label: '그래프', crumb: '그래프 캔버스', title: '선택한 티켓의 워크플로 그래프' },
+  { key: 'library', label: '템플릿', crumb: '템플릿 · 노드 타입', title: '템플릿과 노드 타입: 미리보기, JSON 가져오기·내보내기' },
+];
 
 export function App() {
   useConnectionState();
@@ -15,6 +23,8 @@ export function App() {
   const projects = useProjects();
   const projectId = useUi((state) => state.projectId);
   const selectProject = useUi((state) => state.selectProject);
+  const view = useUi((state) => state.view);
+  const setView = useUi((state) => state.setView);
   const [creatingProject, setCreatingProject] = useState(false);
   const list = projects.data ?? [];
   const project = list.find((each) => each.projectId === projectId);
@@ -49,21 +59,29 @@ export function App() {
               <option value={NEW_PROJECT}>+ 새 프로젝트…</option>
             </select>
           )}
-          {project !== undefined && <span className="text-muted">/ 티켓 보드</span>}
+          {project !== undefined && <span className="text-muted">/ {VIEWS.find((each) => each.key === view)?.crumb}</span>}
         </div>
         {project !== undefined && (
           <nav aria-label="보기 전환" className="flex gap-1 rounded-[10px] bg-chip p-1">
-            <button type="button" aria-current="page" className="h-[30px] rounded-[7px] bg-white px-3.5 font-semibold shadow-sm">
-              보드
-            </button>
-            <button type="button" disabled title="그래프 캔버스는 다음 단계(M6b)에서 추가됩니다" className="h-[30px] rounded-[7px] px-3.5 text-muted opacity-60">
-              그래프
-            </button>
+            {VIEWS.map((each) => (
+              <button
+                key={each.key}
+                type="button"
+                aria-current={view === each.key ? 'page' : undefined}
+                title={each.title}
+                onClick={() => { setView(each.key); }}
+                className={`h-[30px] rounded-[7px] px-3.5 ${view === each.key ? 'bg-white font-semibold shadow-sm' : 'text-muted hover:text-ink'}`}
+              >
+                {each.label}
+              </button>
+            ))}
           </nav>
         )}
       </header>
       <ConnectionBanner />
-      <main className="min-h-0 flex-1 overflow-auto">{project === undefined ? <ProjectHome /> : <Board projectId={project.projectId} />}</main>
+      <main className="min-h-0 flex-1 overflow-auto">
+        {project === undefined ? <ProjectHome /> : view === 'graph' ? <GraphView projectId={project.projectId} /> : view === 'library' ? <Library /> : <Board projectId={project.projectId} />}
+      </main>
       <TicketDrawer />
       <StatusLine />
       {creatingProject && (

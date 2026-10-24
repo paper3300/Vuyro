@@ -6,7 +6,8 @@ import { stageHint } from '../board-model.ts';
 import { causeLabel, errorText, formatDuration, formatTime, formatTokens, shortId, statusLabel, supersedeLabel } from '../format.ts';
 import { useArtifacts, useTicket, useTicketStats } from '../queries.ts';
 import { useCanWrite, useUi } from '../store.ts';
-import type { ExecutionRow, LaneRow, TicketDetail as Detail, WaitReason } from '../types.ts';
+import type { AgentRunRow, ExecutionRow, LaneRow, TicketDetail as Detail, WaitReason } from '../types.ts';
+import { AgentRuns } from './NodeDetail.tsx';
 import { SharedNodes } from './SharedNodes.tsx';
 import { Button, Chip, ErrorNote, JsonBlock, PlainText, statusTone } from './ui.tsx';
 
@@ -17,34 +18,38 @@ import { Button, Chip, ErrorNote, JsonBlock, PlainText, statusTone } from './ui.
  */
 export function TicketDrawer() {
   const ticketId = useUi((state) => state.ticketId);
-  const openTicket = useUi((state) => state.openTicket);
+  const detailOpen = useUi((state) => state.detailOpen);
+  const closeDetail = useUi((state) => state.closeDetail);
+  const view = useUi((state) => state.view);
+  const setView = useUi((state) => state.setView);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') openTicket(undefined);
+      if (event.key === 'Escape') closeDetail();
     };
     window.addEventListener('keydown', onKey);
     return () => {
       window.removeEventListener('keydown', onKey);
     };
-  }, [openTicket]);
-  if (ticketId === undefined) return null;
+  }, [closeDetail]);
+  if (ticketId === undefined || !detailOpen) return null;
   return (
     <div className="fixed inset-0 z-30 flex justify-end bg-ink/20" onMouseDown={(event) => {
-        if (event.target === event.currentTarget) openTicket(undefined);
+        if (event.target === event.currentTarget) closeDetail();
       }}>
       <aside aria-label="티켓 상세" className="flex h-full w-[min(880px,92vw)] flex-col overflow-y-auto border-l border-line bg-canvas shadow-2xl">
+        {/* Keyed by ticket: moving to another ticket (a blamed ticket, a cause) starts with no drafts or notices. */}
         <TicketDetailView
+          key={ticketId}
           ticketId={ticketId}
-          onClose={() => {
-            openTicket(undefined);
-          }}
+          onClose={closeDetail}
+          {...(view === 'graph' ? {} : { onGraph: () => { setView('graph'); } })}
         />
       </aside>
     </div>
   );
 }
 
-export function TicketDetailView({ ticketId, onClose }: { ticketId: string; onClose: () => void }) {
+export function TicketDetailView({ ticketId, onClose, onGraph }: { ticketId: string; onClose: () => void; onGraph?: () => void }) {
   const detail = useTicket(ticketId);
   const open = detail.data?.ticket.status === 'open';
   const stats = useTicketStats(ticketId, open);
@@ -67,6 +72,11 @@ export function TicketDetailView({ ticketId, onClose }: { ticketId: string; onCl
           {ticket.description !== null && <PlainText text={ticket.description} className="mt-1.5 text-muted" />}
         </div>
         <Chip tone={ticket.status === 'done' ? 'done' : ticket.attention !== null ? 'stale' : 'agent'}>{ticket.status === 'done' ? '완료' : ticket.attention !== null ? '주의 필요' : '진행 중'}</Chip>
+        {onGraph !== undefined && (
+          <Button small onClick={onGraph} title="이 티켓의 워크플로를 그래프로 봅니다">
+            그래프로 보기
+          </Button>
+        )}
         <Button kind="ghost" small onClick={onClose} title="닫기 (Esc)">
           ✕
         </Button>
@@ -404,7 +414,15 @@ function NodeTable({ detail, stats }: { detail: Detail; stats: TicketStats | und
           </thead>
           <tbody>
             {nodes.map((node) => (
-              <NodeRow key={node.id} label={node.label} lanes={detail.lanes.filter((lane) => lane.nodeId === node.id)} executions={detail.executions.filter((execution) => execution.nodeId === node.id)} stats={byNode.get(node.id)} bottleneck={stats?.bottleneck === node.id} />
+              <NodeRow
+                key={node.id}
+                label={node.label}
+                lanes={detail.lanes.filter((lane) => lane.nodeId === node.id)}
+                executions={detail.executions.filter((execution) => execution.nodeId === node.id)}
+                runs={detail.runs.filter((run) => run.nodeId === node.id)}
+                stats={byNode.get(node.id)}
+                bottleneck={stats?.bottleneck === node.id}
+              />
             ))}
           </tbody>
         </table>
@@ -413,7 +431,21 @@ function NodeTable({ detail, stats }: { detail: Detail; stats: TicketStats | und
   );
 }
 
-function NodeRow({ label, lanes, executions, stats, bottleneck }: { label: string; lanes: readonly LaneRow[]; executions: readonly ExecutionRow[]; stats: NodeStats | undefined; bottleneck: boolean }) {
+function NodeRow({
+  label,
+  lanes,
+  executions,
+  runs,
+  stats,
+  bottleneck,
+}: {
+  label: string;
+  lanes: readonly LaneRow[];
+  executions: readonly ExecutionRow[];
+  runs: readonly AgentRunRow[];
+  stats: NodeStats | undefined;
+  bottleneck: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const statuses = lanes.length === 0 ? ['wait'] : [...new Set(lanes.map((lane) => lane.status))];
   return (
@@ -470,6 +502,11 @@ function NodeRow({ label, lanes, executions, stats, bottleneck }: { label: strin
                 </li>
               ))}
             </ol>
+            {runs.length > 0 && (
+              <div className="mt-2">
+                <AgentRuns runs={runs} />
+              </div>
+            )}
           </td>
         </tr>
       )}

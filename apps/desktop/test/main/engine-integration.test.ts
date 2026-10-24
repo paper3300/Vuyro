@@ -126,4 +126,52 @@ describe.runIf(process.platform === 'win32')('engine connection with real engine
     const stats = await connection.request<{ nodes: { nodeId: string; tokens: { input: number } }[] }>('query.ticketStats', { ticketId });
     expect(stats.ok && stats.value.nodes.find((node) => node.nodeId === 'spec')?.tokens.input).toBe(1800);
   }, 60_000);
+
+  it("work goes on while no window listens; a window opened again starts at the engine's last event and misses none after it", async () => {
+    const { connection } = open(devEngine);
+    await connection.start();
+    const { projectId } = await command<{ projectId: string }>(connection, 'project.create', { name: 'sample' });
+    const { ticketId } = await command<{ ticketId: string }>(connection, 'ticket.create', { projectId, title: 'Tray', template: { id: 'vuyro/ai-sdlc' } });
+    type Detail = { reviews: { nodeId: string }[] };
+    const detail = async () => {
+      const result = await connection.request<Detail>('query.ticket', { ticketId });
+      if (!result.ok) throw new Error(result.error.message);
+      return result.value;
+    };
+    const status = async () => {
+      const result = await connection.request<{ lastSequence: number }>('engine.status', {});
+      if (!result.ok) throw new Error(result.error.message);
+      return result.value.lastSequence;
+    };
+    // The first window listens, then closes (its subscription ends) right after the person approves the spec.
+    const first: number[] = [];
+    const closeFirst = connection.subscribe(await status(), (events) => first.push(...events.map((event) => event.sequence)));
+    await command(connection, 'node.done', { ticketId, nodeId: 'brainstorming', port: 'done', summary: 'idea' });
+    await until(detail, (value) => value.reviews.some((review) => review.nodeId === 'specApproval'));
+    await command(connection, 'node.approve', { ticketId, nodeId: 'specApproval' });
+    closeFirst();
+    const heardBeforeClosing = first.length;
+    const closedAt = await status();
+
+    // Nobody listens: plan, the parallel devs, the join and QA still run until QA waits for the person.
+    await until(detail, (value) => value.reviews.some((review) => review.nodeId === 'qa'), 40_000);
+    const reopenedAt = await status();
+    expect(reopenedAt).toBeGreaterThan(closedAt);
+
+    // The window opens again like the screen does: reads where the engine is, reads the state, subscribes from there.
+    const second: number[] = [];
+    connection.subscribe(reopenedAt, (events) => second.push(...events.map((event) => event.sequence)));
+    await command(connection, 'node.approve', { ticketId, nodeId: 'qa' });
+    const board = await until(
+      async () => connection.request<BoardResult>('query.board', { projectId }),
+      (result) => result.ok && result.value.tickets[0]?.status === 'done',
+    );
+    expect(board.ok).toBe(true);
+    const last = await status();
+    await until(() => [...second], (list) => list.at(-1) === last);
+    // Every event after the reopening point, once, in order.
+    expect(second).toEqual(Array.from({ length: last - reopenedAt }, (_, index) => reopenedAt + 1 + index));
+    // The closed window heard nothing more.
+    expect(first).toHaveLength(heardBeforeClosing);
+  }, 90_000);
 });

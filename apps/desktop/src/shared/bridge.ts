@@ -22,6 +22,12 @@ export const BRIDGE_CHANNELS = {
   pair: 'vuyro:pair',
   /** invoke: try to reach (or start) the engine now. */
   retry: 'vuyro:retry',
+  /** invoke: the person picks a JSON file in a system dialog; main reads it. → BridgeResult<OpenedFile | null>. */
+  openFile: 'vuyro:open-file',
+  /** invoke: `{name, text}`; the person picks where in a system dialog; main writes it. → BridgeResult<SavedFile | null>. */
+  saveFile: 'vuyro:save-file',
+  /** invoke: `{text}` onto the clipboard. → BridgeResult<null>. */
+  copyText: 'vuyro:copy-text',
 } as const;
 
 /**
@@ -39,6 +45,10 @@ export const RENDERER_METHODS = [
   'query.board',
   'query.workspace',
   'query.sharedNodes',
+  'query.runEvents',
+  'query.definitions',
+  'query.exportDefinition',
+  'query.importPreview',
   'events.read',
   'engine.status',
 ] as const;
@@ -84,6 +94,16 @@ export interface EventsMessage {
   readonly events: readonly { readonly sequence: number; readonly type: string; readonly aggregateId: string; readonly data: unknown; readonly [key: string]: unknown }[];
 }
 
+/** A file the person picked: its name and text only (the page never learns or chooses paths). */
+export interface OpenedFile {
+  readonly name: string;
+  readonly text: string;
+}
+
+export interface SavedFile {
+  readonly name: string;
+}
+
 /** `window.vuyro`. */
 export interface VuyroBridge {
   request(method: RendererMethod, params?: unknown): Promise<BridgeResult<unknown>>;
@@ -93,4 +113,9 @@ export interface VuyroBridge {
   onConnection(listener: (state: ConnectionState) => void): () => void;
   pair(): Promise<BridgeResult<null>>;
   retry(): Promise<void>;
+  /** Opens a system dialog for a JSON file; null when the person cancels. */
+  openJsonFile(): Promise<BridgeResult<OpenedFile | null>>;
+  /** Opens a system save dialog with `name` suggested and writes `text` there; null when the person cancels. */
+  saveJsonFile(name: string, text: string): Promise<BridgeResult<SavedFile | null>>;
+  copyText(text: string): Promise<BridgeResult<null>>;
 }

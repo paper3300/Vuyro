@@ -14,6 +14,9 @@ const CHANNELS = {
   connectionChanged: 'vuyro:connection-changed',
   pair: 'vuyro:pair',
   retry: 'vuyro:retry',
+  openFile: 'vuyro:open-file',
+  saveFile: 'vuyro:save-file',
+  copyText: 'vuyro:copy-text',
 } as const;
 
 type Listener = (payload: unknown) => void;
@@ -49,4 +52,7 @@ contextBridge.exposeInMainWorld('vuyro', {
   },
   pair: (): Promise<unknown> => ipcRenderer.invoke(CHANNELS.pair),
   retry: (): Promise<unknown> => ipcRenderer.invoke(CHANNELS.retry),
+  openJsonFile: (): Promise<unknown> => ipcRenderer.invoke(CHANNELS.openFile),
+  saveJsonFile: (name: string, text: string): Promise<unknown> => ipcRenderer.invoke(CHANNELS.saveFile, { name, text }),
+  copyText: (text: string): Promise<unknown> => ipcRenderer.invoke(CHANNELS.copyText, { text }),
 });

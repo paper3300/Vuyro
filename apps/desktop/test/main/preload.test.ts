@@ -70,14 +70,17 @@ interface Api {
   onConnection(listener: (state: unknown) => void): () => void;
   pair(): Promise<unknown>;
   retry(): Promise<unknown>;
+  openJsonFile(): Promise<unknown>;
+  saveJsonFile(name: string, text: string): Promise<unknown>;
+  copyText(text: string): Promise<unknown>;
 }
 
 describe('preload bridge', () => {
-  it('exposes window.vuyro with six functions and nothing of Electron or Node', () => {
+  it('exposes window.vuyro with nine functions and nothing of Electron or Node', () => {
     const { exposed, required } = loadPreload();
     expect([...exposed.keys()]).toEqual(['vuyro']);
     const api = exposed.get('vuyro') as Record<string, unknown>;
-    expect(Object.keys(api).sort()).toEqual(['connection', 'onConnection', 'pair', 'request', 'retry', 'subscribe']);
+    expect(Object.keys(api).sort()).toEqual(['connection', 'copyText', 'onConnection', 'openJsonFile', 'pair', 'request', 'retry', 'saveJsonFile', 'subscribe']);
     expect(Object.values(api).every((value) => typeof value === 'function')).toBe(true);
     expect(required).toEqual(['electron']);
   });
@@ -89,18 +92,24 @@ describe('preload bridge', () => {
     expect(channels).toEqual(BRIDGE_CHANNELS);
   });
 
-  it('forwards requests, connection, pairing and retry to their channels', async () => {
+  it('forwards requests, connection, pairing, retry and the file and clipboard calls to their channels', async () => {
     const { exposed, invoked } = loadPreload();
     const api = exposed.get('vuyro') as Api;
     await api.request('query.board', { projectId: 'p' });
     await api.connection();
     await api.pair();
     await api.retry();
+    await api.openJsonFile();
+    await api.saveJsonFile('a.json', '{}');
+    await api.copyText('{}');
     expect(invoked).toEqual([
       { channel: 'vuyro:request', args: [{ method: 'query.board', params: { projectId: 'p' } }] },
       { channel: 'vuyro:connection', args: [] },
       { channel: 'vuyro:pair', args: [] },
       { channel: 'vuyro:retry', args: [] },
+      { channel: 'vuyro:open-file', args: [] },
+      { channel: 'vuyro:save-file', args: [{ name: 'a.json', text: '{}' }] },
+      { channel: 'vuyro:copy-text', args: [{ text: '{}' }] },
     ]);
   });
 

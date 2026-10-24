@@ -6,6 +6,7 @@ import { errorText } from '../format.ts';
 import { useTemplates } from '../queries.ts';
 import { useCanWrite, useUi } from '../store.ts';
 import { Button, Chip, ErrorNote, Modal } from './ui.tsx';
+import { WorkflowCanvas } from './WorkflowCanvas.tsx';
 
 const DEFAULT_TEMPLATE = 'vuyro/ai-sdlc';
 
@@ -25,6 +26,7 @@ export function NewTicketDialog({ projectId, onClose }: { projectId: string; onC
   const [description, setDescription] = useState('');
   const [picked, setPicked] = useState<string>();
   const [priority, setPriority] = useState(0);
+  const [showGraph, setShowGraph] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const usable = (templates.data ?? []).filter((template) => template.problem === undefined);
@@ -115,6 +117,16 @@ export function NewTicketDialog({ projectId, onClose }: { projectId: string; onC
               </span>
             </label>
           ))}
+          {chosen !== undefined && (
+            <div className="flex flex-col gap-2">
+              <span>
+                <Button small kind="ghost" onClick={() => { setShowGraph(!showGraph); }}>
+                  {showGraph ? '그래프 접기' : `「${chosen.name}」 그래프 미리보기`}
+                </Button>
+              </span>
+              {showGraph && <WorkflowCanvas key={`${chosen.id}@${String(chosen.version)}`} workflow={chosen} height={260} label={`${chosen.name} 미리보기`} />}
+            </div>
+          )}
           {(templates.data ?? [])
             .filter((template) => template.problem !== undefined)
             .map((template) => (
