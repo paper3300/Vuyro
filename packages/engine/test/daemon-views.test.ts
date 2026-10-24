@@ -75,7 +75,7 @@ describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
     const ui = await h.ui();
     const { result: bare } = await ui.execute({ requestId: rid(), type: 'project.create', payload: { name: 'no folder' } });
     const { result: ticket } = await ui.execute({ requestId: rid(), type: 'ticket.create', payload: { projectId: (bare as { projectId: string }).projectId, title: 'Bare', template: { id: 'test/one-agent' } } });
-    await until(async () => seen.length, (count) => count === 1);
+    await until(() => Promise.resolve(seen.length), (count) => count === 1);
     const expected = join(enginePaths(h.dataDir).work, ticketKey((ticket as { ticketId: string }).ticketId));
     expect(seen).toEqual([expected]);
     expect(readdirSync(expected)).toEqual([]);
@@ -85,7 +85,7 @@ describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
     const { result: rooted } = await ui.execute({ requestId: rid(), type: 'project.create', payload: { name: 'with folder' } });
     await ui.execute({ requestId: rid(), type: 'project.configure', payload: { projectId: (rooted as { projectId: string }).projectId, root: folder } });
     await ui.execute({ requestId: rid(), type: 'ticket.create', payload: { projectId: (rooted as { projectId: string }).projectId, title: 'Rooted', template: { id: 'test/one-agent' } } });
-    await until(async () => seen.length, (count) => count === 2);
+    await until(() => Promise.resolve(seen.length), (count) => count === 2);
     expect(seen[1]).toBe(folder);
   });
 
