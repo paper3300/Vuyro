@@ -149,6 +149,44 @@ describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
     expect(detail.executions.filter((execution) => execution.nodeId === 'specApproval').map((execution) => execution.port)).toEqual(['reject', 'approve']);
   });
 
+  it('refuses a decision on an execution the screen did not see (stale screen), and takes the one it saw', async () => {
+    const agent = lateAdapter(specAgent);
+    h = await openDaemonHarness({ adapters: { claude: agent.adapter } });
+    agent.bind(h);
+    const ui = await h.ui();
+    const { result: project } = await ui.execute({ requestId: rid(), type: 'project.create', payload: { name: 'sample' } });
+    const created = await ui.execute({ requestId: rid(), type: 'ticket.create', payload: { projectId: (project as { projectId: string }).projectId, title: 'Notepad', template: { id: 'vuyro/ai-sdlc' } } });
+    const ticketId = (created.result as { ticketId: string }).ticketId;
+    // A human task: finishing an execution that is not the one waiting is refused.
+    const wrongTask = await ui.execute({ requestId: rid(), type: 'node.done', payload: { ticketId, nodeId: 'brainstorming', run: 2, port: 'done' } }).catch((error: unknown) => error);
+    expect(wrongTask).toMatchObject({ data: { code: 'revision_conflict', details: { nodeId: 'brainstorming', lane: 'main', expectedRun: 2, actualRun: 1 } } });
+    await ui.execute({ requestId: rid(), type: 'node.done', payload: { ticketId, nodeId: 'brainstorming', run: 1, port: 'done', summary: 'idea' } });
+    await until(
+      () => ui.request<TicketDetail>(RPC_METHODS.ticket, { ticketId }),
+      (value) => value.reviews.some((review) => review.nodeId === 'specApproval'),
+    );
+    // The screen saw approval run 1 and the person rejected it; the spec ran again and approval run 2 waits.
+    await ui.execute({ requestId: rid(), type: 'node.reject', payload: { ticketId, nodeId: 'specApproval', run: 1, comment: 'Add undo' } });
+    await until(
+      () => ui.request<TicketDetail>(RPC_METHODS.ticket, { ticketId }),
+      (value) => value.reviews.some((review) => review.nodeId === 'specApproval' && review.run === 2),
+    );
+    // A second screen still showing run 1 tries to approve (or reject) it: refused, nothing changes.
+    const before = (await ui.request<TicketDetail>(RPC_METHODS.ticket, { ticketId })).ticket.revision;
+    for (const type of ['node.approve', 'node.reject', 'node.pause']) {
+      const stale = await ui.execute({ requestId: rid(), type, payload: { ticketId, nodeId: 'specApproval', run: 1 } }).catch((error: unknown) => error);
+      expect(stale, type).toMatchObject({ data: { code: 'revision_conflict', details: { aggregateId: ticketId, expectedRun: 1, actualRun: 2 } } });
+    }
+    expect((await ui.request<TicketDetail>(RPC_METHODS.ticket, { ticketId })).ticket.revision).toBe(before);
+    // The screen that shows run 2 decides.
+    await ui.execute({ requestId: rid(), type: 'node.approve', payload: { ticketId, nodeId: 'specApproval', run: 2 } });
+    const detail = await until(
+      () => ui.request<TicketDetail>(RPC_METHODS.ticket, { ticketId }),
+      (value) => value.executions.some((execution) => execution.nodeId === 'plan'),
+    );
+    expect(detail.executions.filter((execution) => execution.nodeId === 'specApproval').map((execution) => execution.port)).toEqual(['reject', 'approve']);
+  });
+
   it('a review gate shows the held output, and an empty output says so', async () => {
     const agent = lateAdapter(async (session) => {
       await session.vuyro('node.done', { ticketId: session.request.ticketId, nodeId: session.request.nodeId, port: 'done', items: [] });

@@ -132,7 +132,17 @@ export const DraftItemSchema = Type.Object(
 );
 export type DraftItem = Static<typeof DraftItemSchema>;
 
-const NodeTarget = { ticketId: IdSchema, nodeId: NodeIdSchema, lane: Type.Optional(LaneSchema) };
+const NodeTarget = {
+  ticketId: IdSchema,
+  nodeId: NodeIdSchema,
+  lane: Type.Optional(LaneSchema),
+  /**
+   * The execution (ItemRef.run) the caller saw. When the lane the command picks is now on another execution, the
+   * command is refused with `revision_conflict` instead of deciding on work the caller never saw (M6a: a screen
+   * left open while a rejection started the node again). Node agents need not send it: their run token decides.
+   */
+  run: Type.Optional(Type.Integer({ minimum: 1 })),
+};
 const Comment = Type.Optional(Type.String({ maxLength: 65536 }));
 
 const DefinitionSaveResult = Type.Object(

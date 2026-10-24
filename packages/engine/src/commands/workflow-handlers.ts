@@ -366,6 +366,8 @@ export const nodeDone: CommandHandler<'node.done', TicketState> = {
     }
     const exec = pickLane(ticket.state, node.id, payload.lane, (candidate) => candidate.status === 'review' || candidate.status === 'rejected', 'waiting for a person');
     if (isFailure(exec)) return exec;
+    const stale = seenExecution(ticket.aggregateId, exec, payload.run);
+    if (stale !== undefined) return stale;
     const result = outputOrFail(draft, node, exec, payload.port, drafts, ctx);
     if (isFailure(result)) return result;
     finishWithOutput(draft, node, exec, result.output, result.undeclared);
@@ -375,6 +377,21 @@ export const nodeDone: CommandHandler<'node.done', TicketState> = {
 
 function reviewable(exec: Execution): boolean {
   return exec.status === 'review';
+}
+
+/**
+ * A person's command names the execution they saw (`run`): refuse it when the lane has moved on to another one, so an
+ * old screen never approves, rejects or finishes work it did not show.
+ */
+function seenExecution(ticketId: string, exec: Execution, run: number | undefined): Failure | undefined {
+  if (run === undefined || run === exec.run) return undefined;
+  return fail('revision_conflict', `lane '${exec.lane}' of node '${exec.nodeId}' is on execution ${exec.run} now, not ${run}; look again`, {
+    aggregateId: ticketId,
+    nodeId: exec.nodeId,
+    lane: exec.lane,
+    expectedRun: run,
+    actualRun: exec.run,
+  });
 }
 
 export const nodeApprove: CommandHandler<'node.approve', TicketState> = {
@@ -388,6 +405,8 @@ export const nodeApprove: CommandHandler<'node.approve', TicketState> = {
     if (isFailure(node)) return node;
     const exec = pickLane(ticket.state, node.id, payload.lane, reviewable, 'in review');
     if (isFailure(exec)) return exec;
+    const stale = seenExecution(ticket.aggregateId, exec, payload.run);
+    if (stale !== undefined) return stale;
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);
     if (exec.merge !== undefined) {
       // A merge that stopped on conflicts: the person resolved them (or let the agent's resolution stand); the merge step goes on.
@@ -420,6 +439,8 @@ export const nodeReject: CommandHandler<'node.reject', TicketState> = {
     if (isFailure(node)) return node;
     const exec = pickLane(ticket.state, node.id, payload.lane, reviewable, 'in review');
     if (isFailure(exec)) return exec;
+    const stale = seenExecution(ticket.aggregateId, exec, payload.run);
+    if (stale !== undefined) return stale;
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);
     if (exec.merge !== undefined) {
       // A merge that stopped on conflicts: an agent resolves them, with the person's comment as instructions.
@@ -466,6 +487,8 @@ export const nodeRetry: CommandHandler<'node.retry', TicketState> = {
       (candidate.status === 'failed' || (candidate.status === 'done' && candidate.onlyStale === true)) && executionLive(ticket.state, candidate);
     const exec = pickLane(ticket.state, node.id, payload.lane, retriable, 'failed or stale');
     if (isFailure(exec)) return exec;
+    const stale = seenExecution(ticket.aggregateId, exec, payload.run);
+    if (stale !== undefined) return stale;
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);
     rerun(draft, exec, 'retry');
     return decided(ticket, draft);
@@ -483,6 +506,8 @@ export const nodePause: CommandHandler<'node.pause', TicketState> = {
     if (isFailure(node)) return node;
     const exec = pickLane(ticket.state, node.id, payload.lane, (candidate) => ACTIVE_STATUSES.has(candidate.status) && candidate.status !== 'paused' && !candidate.pauseRequested, 'pausable');
     if (isFailure(exec)) return exec;
+    const stale = seenExecution(ticket.aggregateId, exec, payload.run);
+    if (stale !== undefined) return stale;
     const fields = { ticketId: ticket.aggregateId, nodeId: node.id, lane: exec.lane, run: exec.run };
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);
     if (exec.status === 'running') {
@@ -506,6 +531,8 @@ export const nodeResume: CommandHandler<'node.resume', TicketState> = {
     if (isFailure(node)) return node;
     const exec = pickLane(ticket.state, node.id, payload.lane, (candidate) => candidate.status === 'paused' || candidate.pauseRequested, 'paused');
     if (isFailure(exec)) return exec;
+    const stale = seenExecution(ticket.aggregateId, exec, payload.run);
+    if (stale !== undefined) return stale;
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);
     const status = exec.status === 'paused' ? (exec.resumeTo ?? 'queued') : 'running';
     // A lane waiting for a claim: the engine resumes it when the paths are free (its start checks them again);
