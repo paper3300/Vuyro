@@ -1,4 +1,4 @@
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -28,6 +28,11 @@ function hookCommand(): string | undefined {
   return settings.hooks?.PreToolUse?.find((entry) => entry.matcher.split('|').includes('Edit'))?.hooks[0]?.command;
 }
 
+/** Claude runs hook commands through Git Bash on Windows (measured, [[초기 검증 결과]] M7a), so the stand-in does too. */
+const BASH = [process.env.CLAUDE_CODE_GIT_BASH_PATH, 'C:\\Program Files\\Git\\bin\\bash.exe', 'C:\\Program Files (x86)\\Git\\bin\\bash.exe'].find(
+  (path): path is string => path !== undefined && path !== '' && existsSync(path),
+);
+
 /** Runs the hook like the CLI would: the tool call as JSON on stdin; stdout empty = allowed. */
 function edit(file: string, text: string): boolean {
   const command = hookCommand();
@@ -40,7 +45,10 @@ function edit(file: string, text: string): boolean {
     tool_use_id: `toolu_${node}`,
   });
   let output = '';
-  if (command !== undefined) output = execSync(command, { input, encoding: 'utf8', env: process.env, cwd }).trim();
+  if (command !== undefined) {
+    if (BASH === undefined) throw new Error('fake-editor: Git Bash not found (Claude needs it on Windows too)');
+    output = execFileSync(BASH, ['-c', command], { input, encoding: 'utf8', env: process.env, cwd }).trim();
+  }
   const decision = output === '' ? undefined : (JSON.parse(output) as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } }).hookSpecificOutput;
   record({ step: 'edit', file, hook: command !== undefined, decision: decision?.permissionDecision ?? 'allow', reason: decision?.permissionDecisionReason ?? null });
   if (decision?.permissionDecision === 'deny') return false;
