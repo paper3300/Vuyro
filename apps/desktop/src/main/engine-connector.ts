@@ -13,8 +13,10 @@ export interface EngineConnectorOptions {
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly dataDir?: string;
   readonly pipePath?: string;
-  /** Node that runs the engine. Default: `findNode(env)`. */
+  /** Node that runs the engine. Default: `findNode(env, existsSync, bundledNode)`. */
   readonly nodePath?: string;
+  /** The Node the installed app carries (`resources/node/node.exe`). Used when `VUYRO_NODE` is not set. */
+  readonly bundledNode?: string;
   /** Daemon entry. Default: the engine's own (`VUYRO_ENGINE_ENTRY` overrides it for development). */
   readonly entryPath?: string;
   /** The `vuyro` CLI script handed to the engine (`--vuyro-cli`). Default: the bundled CLI. */
@@ -41,7 +43,7 @@ export function engineConnector(options: EngineConnectorOptions = {}): EngineCon
       }
     },
     async launch(uiCredential) {
-      const nodePath = options.nodePath ?? findNode(env);
+      const nodePath = options.nodePath ?? findNode(env, existsSync, options.bundledNode);
       const entryPath = options.entryPath ?? nonEmpty(env.VUYRO_ENGINE_ENTRY);
       const launched = await launchEngineDaemon({
         ...location,
@@ -61,12 +63,13 @@ function nonEmpty(value: string | undefined): string | undefined {
 }
 
 /**
- * The Node that runs the engine: `VUYRO_NODE`, else `node` on PATH. Never Electron's own runtime: the engine is a
- * separate pinned Node so the CLI runs without Electron (기술 스택 결정 §2). The installer will bundle one (M7).
+ * The Node that runs the engine: `VUYRO_NODE`, else the Node the installed app carries, else `node` on PATH. Never
+ * Electron's own runtime: the engine is a separate pinned Node so the CLI runs without Electron (기술 스택 결정 §2).
  */
-export function findNode(env: Readonly<Record<string, string | undefined>>, exists: (path: string) => boolean = existsSync): string {
+export function findNode(env: Readonly<Record<string, string | undefined>>, exists: (path: string) => boolean = existsSync, bundled?: string): string {
   const configured = nonEmpty(env.VUYRO_NODE);
   if (configured !== undefined) return configured;
+  if (bundled !== undefined && exists(bundled)) return bundled;
   const names = process.platform === 'win32' ? ['node.exe'] : ['node'];
   const path = env.PATH ?? env.Path ?? '';
   for (const folder of path.split(delimiter)) {

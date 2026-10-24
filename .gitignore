@@ -15,3 +15,7 @@ out/
 *.log
 .env
 .env.*
+
+# Desktop installer: staged Node runtime and electron-builder output
+apps/desktop/build/
+apps/desktop/release/

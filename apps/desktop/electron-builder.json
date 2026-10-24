@@ -1,0 +1,38 @@
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "appId": "dev.vuyro.desktop",
+  "productName": "Vuyro",
+  "directories": {
+    "output": "release",
+    "buildResources": "static"
+  },
+  "files": [
+    "dist/**",
+    "static/**",
+    "package.json",
+    "!dist/**/*.map",
+    "!dist/**/*.d.ts",
+    "!node_modules/@vuyro/*/{src,spikes,test,scripts,fixtures}/**",
+    "!node_modules/@vuyro/*/tsconfig*.json",
+    "!node_modules/@vuyro/*/dist/**/*.map"
+  ],
+  "asar": false,
+  "npmRebuild": false,
+  "extraResources": [
+    {
+      "from": "build/node",
+      "to": "node"
+    }
+  ],
+  "win": {
+    "target": [
+      "nsis"
+    ],
+    "icon": "static/icon.png"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true
+  }
+}

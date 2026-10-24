@@ -37,7 +37,11 @@ function log(error: Error, context: string): void {
 let window: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let toldAboutTray = false;
-const connection = new EngineConnection({ connector: engineConnector(), onError: log });
+// The installed app carries its own Node 24 for the engine (L-13); a development run uses VUYRO_NODE or PATH.
+const connection = new EngineConnection({
+  connector: engineConnector(app.isPackaged ? { bundledNode: join(process.resourcesPath, 'node', process.platform === 'win32' ? 'node.exe' : 'node') } : {}),
+  onError: log,
+});
 /** Renderer subscriptions by web contents, so a closed window stops its subscriptions. */
 const subscriptions = new Map<number, Map<string, () => void>>();
 
