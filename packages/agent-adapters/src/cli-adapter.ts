@@ -2,6 +2,7 @@ import type { AgentProvider, RunObservation } from '@vuyro/contracts';
 import { ClaudeStreamNormalizer, claudeArgs } from './claude.ts';
 import type { Clock, TimerHandle } from './clock.ts';
 import { CodexStreamNormalizer, codexArgs } from './codex.ts';
+import { AGENT_ENV } from './agent-env.ts';
 import { agentEnvironment, resolveExecutable } from './environment.ts';
 import type { AgentAdapter, AgentRunHandle, AgentStartRequest } from './index.ts';
 import { clip, LIMITS } from './limits.ts';
@@ -27,6 +28,26 @@ export interface CliAgentAdapterOptions {
   readonly maxStderrLines?: number;
   /** Finds the executable. Default: PATH lookup of real executables (`resolveExecutable`). Tests skip it. */
   readonly resolve?: (command: string, env: Readonly<Record<string, string>>) => string;
+  /**
+   * How to start `vuyro mcp` (the node agent's MCP bridge to the engine). Codex runs shell commands in an OS
+   * sandbox that cannot open the engine pipe, but it starts MCP servers outside it, so the agent reports
+   * through this server's tools instead ([[초기 검증 결과]] M3). Only paths and variable names go on the
+   * command line; the server gets the run token by Codex forwarding the named environment variables.
+   */
+  readonly vuyroMcp?: { readonly command: string; readonly args: readonly string[] };
+}
+
+/** `-c` overrides that register `vuyro mcp` with Codex and forward the run variables to it. */
+export function codexMcpArgs(server: { readonly command: string; readonly args: readonly string[] }): string[] {
+  // JSON strings are valid TOML basic strings.
+  return [
+    '-c',
+    `mcp_servers.vuyro.command=${JSON.stringify(server.command)}`,
+    '-c',
+    `mcp_servers.vuyro.args=[${server.args.map((arg) => JSON.stringify(arg)).join(',')}]`,
+    '-c',
+    `mcp_servers.vuyro.env_vars=[${Object.values(AGENT_ENV).map((name) => JSON.stringify(name)).join(',')}]`,
+  ];
 }
 
 /**
@@ -102,7 +123,11 @@ export class CliAgentAdapter implements AgentAdapter {
     const { clock, runner } = this.options;
     const env = agentEnvironment(this.options.baseEnv ?? process.env, request.env);
     const command = (this.options.resolve ?? resolveExecutable)(this.options.command ?? this.spec.command, env);
-    const args = [...(this.options.prefixArgs ?? []), ...this.spec.args(request, this.options.extraArgs ?? this.spec.extraArgs)];
+    const extraArgs = [
+      ...(this.options.extraArgs ?? this.spec.extraArgs),
+      ...(this.provider === 'codex' && this.options.vuyroMcp !== undefined ? codexMcpArgs(this.options.vuyroMcp) : []),
+    ];
+    const args = [...(this.options.prefixArgs ?? []), ...this.spec.args(request, extraArgs)];
     const normalizer = this.spec.normalizer(request);
     const child = runner.spawn({ command, args, env, killTree: true, ...(request.cwd === undefined ? {} : { cwd: request.cwd }) });
     child.write(request.prompt);

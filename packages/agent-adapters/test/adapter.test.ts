@@ -206,3 +206,52 @@ describe('resolveExecutable', () => {
     expect(() => resolveExecutable('vuyro-no-such-cli', { PATH: process.cwd() })).toThrow(/not found on PATH/);
   });
 });
+
+describe('vuyro MCP bridge for Codex', () => {
+  it('registers vuyro mcp and forwards the run variables by name; the token never reaches the command line', async () => {
+    const clock = new ManualClock();
+    const runner = new FakeProcessRunner(clock);
+    runner.enqueue({ steps: [{ exit: 0 }] });
+    const adapter = CliAgentAdapter.codex({ runner, clock, resolve: (command) => command, baseEnv: {}, vuyroMcp: { command: 'C:\\node\\node.exe', args: ['C:\\vuyro\\bin.js', 'mcp'] } });
+    const handle = adapter.start(request({ provider: 'codex' }));
+    await drain(handle.observations);
+    const args = runner.spawned[0]?.spec.args ?? [];
+    expect(args).toEqual([
+      'exec',
+      '--json',
+      '-s',
+      'workspace-write',
+      '-c',
+      'mcp_servers.vuyro.command="C:\\\\node\\\\node.exe"',
+      '-c',
+      'mcp_servers.vuyro.args=["C:\\\\vuyro\\\\bin.js","mcp"]',
+      '-c',
+      'mcp_servers.vuyro.env_vars=["VUYRO_RUN_TOKEN","VUYRO_TICKET","VUYRO_NODE","VUYRO_LANE","VUYRO_RUN_ID","VUYRO_PIPE","VUYRO_DATA_DIR"]',
+      '-',
+    ]);
+    expect(args.join(' ')).not.toContain('vrt_token');
+  });
+
+  it('Claude reports through its own shell tool and gets no MCP flags', async () => {
+    const clock = new ManualClock();
+    const runner = new FakeProcessRunner(clock);
+    runner.enqueue({ steps: [{ exit: 0 }] });
+    const adapter = CliAgentAdapter.claude({ runner, clock, resolve: (command) => command, baseEnv: {}, vuyroMcp: { command: 'node', args: ['bin.js', 'mcp'] } });
+    const handle = adapter.start(request());
+    await drain(handle.observations);
+    expect(runner.spawned[0]?.spec.args.join(' ')).not.toContain('mcp_servers');
+  });
+});
+
+describe('Codex MCP tool items', () => {
+  it('an MCP call with error null succeeded; one with an error failed', async () => {
+    const { CodexStreamNormalizer } = await import('../src/codex.ts');
+    const normalizer = new CodexStreamNormalizer();
+    const item = (error: unknown) => JSON.stringify({ type: 'item.completed', item: { id: 'item_0', type: 'mcp_tool_call', server: 'vuyro', tool: 'vuyro_node_done', arguments: { port: 'done' }, result: { content: [] }, error, status: 'completed' } });
+    const ok = normalizer.stdout(item(null), 0);
+    expect(ok.map((observation) => observation.kind)).toEqual(['toolCallStarted', 'toolCallFinished']);
+    expect(ok[0]).toMatchObject({ name: 'mcp:vuyro/vuyro_node_done' });
+    expect(ok[1]).not.toHaveProperty('isError');
+    expect(normalizer.stdout(item({ message: 'boom' }), 0)[1]).toMatchObject({ isError: true });
+  });
+});

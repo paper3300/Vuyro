@@ -7,7 +7,7 @@ import { defaultDataDir, enginePaths } from './paths.ts';
 /**
  * Entry point of the engine daemon (headless; no Electron). Started detached by the app or `vuyro engine start`:
  *
- *   node main.js [--data-dir <dir>] [--pipe <name>] [--ui-credential-stdin]
+ *   node main.js [--data-dir <dir>] [--pipe <name>] [--ui-credential-stdin] [--vuyro-cli <bin.js>]
  *
  * `--ui-credential-stdin`: the first stdin line is the app's UI credential (never a file or an argument).
  */
@@ -35,6 +35,7 @@ async function main(): Promise<void> {
   const uiCredential = args.includes('--ui-credential-stdin') ? await readFirstLine() : undefined;
   const dataDir = argValue(args, '--data-dir');
   const pipePath = argValue(args, '--pipe');
+  const cli = argValue(args, '--vuyro-cli');
   let stopping = false;
   const stop = (code: number): void => {
     if (stopping) return;
@@ -48,6 +49,7 @@ async function main(): Promise<void> {
     ...(dataDir === undefined ? {} : { dataDir }),
     ...(pipePath === undefined ? {} : { pipePath }),
     ...(uiCredential === undefined || uiCredential === '' ? {} : { uiCredential }),
+    ...(cli === undefined ? {} : { vuyroCli: { command: process.execPath, args: [cli] } }),
     onShutdownRequest: () => {
       stop(0);
     },

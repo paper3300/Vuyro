@@ -136,7 +136,8 @@ export class CodexStreamNormalizer implements StreamNormalizer {
     this.started.delete(id);
     const status = str(item.status);
     const exitCode = typeof item.exit_code === 'number' ? item.exit_code : undefined;
-    const failed = status === 'failed' || status === 'declined' || (exitCode !== undefined && exitCode !== 0) || item.error !== undefined;
+    // `error: null` is how an MCP call says it did not fail.
+    const failed = status === 'failed' || status === 'declined' || (exitCode !== undefined && exitCode !== 0) || (item.error !== undefined && item.error !== null);
     const output = toolOutput(kind, item);
     out.push({
       kind: 'toolCallFinished',

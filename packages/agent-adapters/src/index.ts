@@ -53,17 +53,7 @@ export function describeAdapter(adapter: Pick<AgentAdapter, 'provider'>): string
   return `agent-adapter:${adapter.provider}`;
 }
 
-/** Environment variable names the engine sets for node agents (and the `vuyro` CLI reads). */
-export const AGENT_ENV = {
-  runToken: 'VUYRO_RUN_TOKEN',
-  ticket: 'VUYRO_TICKET',
-  node: 'VUYRO_NODE',
-  lane: 'VUYRO_LANE',
-  runId: 'VUYRO_RUN_ID',
-  /** Where the engine listens and keeps its token, so the agent's `vuyro` calls reach the same engine. */
-  pipe: 'VUYRO_PIPE',
-  dataDir: 'VUYRO_DATA_DIR',
-} as const;
+export { AGENT_ENV } from './agent-env.ts';
 
 export type { AgentSettlement, ProviderTerminal, SettleInput, StreamNormalizer } from './settle.ts';
 export { settleRun } from './settle.ts';
@@ -72,7 +62,7 @@ export { AsyncQueue, FakeProcessRunner, nodeProcessRunner, readLines } from './p
 export type { FakeProcessContext, FakeScript, FakeSpawn, FakeStep, ManagedProcess, ProcessExit, ProcessRunner, SpawnSpec } from './process.ts';
 export { ClaudeStreamNormalizer, claudeArgs } from './claude.ts';
 export { CodexStreamNormalizer, codexArgs } from './codex.ts';
-export { CliAgentAdapter, DEFAULT_CLAUDE_ARGS, DEFAULT_CODEX_ARGS } from './cli-adapter.ts';
+export { CliAgentAdapter, codexMcpArgs, DEFAULT_CLAUDE_ARGS, DEFAULT_CODEX_ARGS } from './cli-adapter.ts';
 export type { CliAgentAdapterOptions } from './cli-adapter.ts';
 export { agentEnvironment, envValue, ExecutableNotFoundError, resolveExecutable } from './environment.ts';
 export { clip, fitValue, LIMITS } from './limits.ts';

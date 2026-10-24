@@ -17,6 +17,7 @@ function reportingInstructions(node: CompiledNode, ticketTitle: string, lane: st
     '## Reporting to Vuyro',
     `You are working on node "${node.label}" (\`${node.id}\`, lane ${lane}, run ${run}) of the ticket "${ticketTitle}".`,
     'Report through the `vuyro` CLI. It identifies you with VUYRO_RUN_TOKEN from your environment; never print that value.',
+    'If you have the `vuyro_node_done` and `vuyro_artifact_add` tools (the vuyro MCP server), use them instead of the shell commands below: same arguments, same rules.',
     '- Register each artifact first: `vuyro artifact add <slot> --kind <kind> --uri <uri> [--version <version>]`',
     '- Then finish exactly once: `vuyro node done --port <port> [--data @result.json] [--summary "<what you did and what is left>"]`',
     '  For several items: `vuyro node done --port <port> --items @items.json` (an array of {data, summary, artifacts, pairedInput}).',

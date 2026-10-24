@@ -36,6 +36,11 @@ export interface EngineDaemonOptions {
   readonly processRunner?: ProcessRunner;
   /** Default: a Windows dialog on this PC. */
   readonly approver?: HumanApprover;
+  /**
+   * How to run the `vuyro` CLI (e.g. node + its bin.js). Codex agents get `vuyro mcp` from it as an MCP server,
+   * because their sandboxed shell cannot open the engine pipe. Absent = Codex agents can only use the shell.
+   */
+  readonly vuyroCli?: { readonly command: string; readonly args: readonly string[] };
   /** The app's credential when the app launched this engine (read from stdin by the entry point). */
   readonly uiCredential?: string;
   readonly maxConcurrent?: number;
@@ -174,7 +179,11 @@ export async function startEngineDaemon(options: EngineDaemonOptions = {}): Prom
     const processRunner = options.processRunner ?? nodeProcessRunner;
     const adapters = options.adapters ?? {
       claude: CliAgentAdapter.claude({ runner: processRunner, clock }),
-      codex: CliAgentAdapter.codex({ runner: processRunner, clock }),
+      codex: CliAgentAdapter.codex({
+        runner: processRunner,
+        clock,
+        ...(options.vuyroCli === undefined ? {} : { vuyroMcp: { command: options.vuyroCli.command, args: [...options.vuyroCli.args, 'mcp'] } }),
+      }),
     };
     engine = new WorkflowEngine({
       bus,

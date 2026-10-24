@@ -19,6 +19,8 @@ export interface LaunchOptions {
   readonly env?: Readonly<Record<string, string | undefined>>;
   /** Client kind for the readiness check. */
   readonly client?: ClientKind;
+  /** The `vuyro` CLI script; agents that cannot reach the pipe from their sandbox run `vuyro mcp` from it. */
+  readonly cliEntry?: string;
 }
 
 export interface LaunchResult {
@@ -38,6 +40,7 @@ export async function launchEngineDaemon(options: LaunchOptions = {}): Promise<L
   const location = resolveEngineLocation(options);
   const args = [daemonEntryPath(), '--data-dir', location.dataDir, '--pipe', location.pipePath];
   if (options.uiCredential !== undefined) args.push('--ui-credential-stdin');
+  if (options.cliEntry !== undefined) args.push('--vuyro-cli', options.cliEntry);
   const child = spawn(process.execPath, args, {
     detached: true,
     windowsHide: true,

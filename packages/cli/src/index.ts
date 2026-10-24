@@ -14,7 +14,9 @@ import {
   type LaunchResult,
   resolveEngineLocation,
 } from '@vuyro/engine';
+import { fileURLToPath } from 'node:url';
 import { flag, has, onlyFlags, type ParsedArgs, parseArgs, requireFlag, UsageError } from './args.ts';
+import { serveMcp } from './mcp.ts';
 
 export interface CliIo {
   out(line: string): void;
@@ -29,6 +31,8 @@ export interface CliOptions {
   readonly cwd?: string;
   readonly connect?: (options: EngineClientOptions) => Promise<EngineClient>;
   readonly launch?: (options: LaunchOptions) => Promise<LaunchResult>;
+  /** Standard input, for `vuyro mcp`. */
+  readonly stdin?: AsyncIterable<string>;
 }
 
 /** Exit codes: 0 ok, 1 the engine refused, 2 usage, 3 no engine to talk to. */
@@ -54,6 +58,7 @@ Work
   artifact add <slot> --kind <kind> --uri <uri> [--version <v>] [--title <t>] [--mime <type>] [--hash <hash>]
   artifact list --ticket <id> [--node <id>]
   definition save <json|@file> Save a node type or template version (export envelope)
+  mcp                          Serve the node agent's report tools over stdio MCP (started by the agent CLI)
   events [--after <sequence>] [--follow]
 
 Node and ticket default to VUYRO_TICKET / VUYRO_NODE; --ticket, --node, --lane override them.
@@ -117,6 +122,12 @@ export async function runCli(argv: readonly string[], io: CliIo, options: CliOpt
         return await artifactCommand(ctx, sub);
       case 'definition':
         return await definitionCommand(ctx, sub);
+      case 'mcp':
+        onlyFlags(ctx.args, []);
+        await serveMcp(options.stdin ?? (process.stdin.setEncoding('utf8') as AsyncIterable<string>), (line) => {
+          io.out(line);
+        }, { env: ctx.env, ...(options.connect === undefined ? {} : { connect: options.connect }) });
+        return EXIT.ok;
       case 'events':
         return await eventsCommand(ctx);
       default:
@@ -236,7 +247,8 @@ async function engineCommand(ctx: Context, sub: string | undefined): Promise<num
       } catch (error) {
         if (!(error instanceof EngineUnavailableError)) throw error;
       }
-      const launched = await (ctx.options.launch ?? launchEngineDaemon)({ ...location(ctx), client: 'cli' });
+      // The engine tells Codex agents to start this same CLI as their MCP bridge (`vuyro mcp`).
+      const launched = await (ctx.options.launch ?? launchEngineDaemon)({ ...location(ctx), client: 'cli', cliEntry: fileURLToPath(new URL('./bin.js', import.meta.url)) });
       print(ctx, { running: true, ...launched }, () => [
         launched.started ? `Started the engine (pid ${launched.pid}).` : `The engine is already running (pid ${launched.pid}).`,
         `  data: ${launched.dataDir}`,
