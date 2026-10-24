@@ -183,6 +183,10 @@ describe('WorkflowEngine', () => {
     await h.drive();
     expect(prompts).toHaveLength(2);
     expect(prompts[1]).toContain('too short');
+    // What a port is, and a command to copy (M7a: a small model took "port" for a network port and left it out).
+    expect(prompts[0]).toContain('A "port" here is not a network port');
+    expect(prompts[0]).toContain("`vuyro node done --port done --data '<json>'");
+    expect(prompts[0]).toContain('- `--port done` (Done)');
     const state = await h.ticket(ticketId);
     expect(nodeProgress(state, 'write').executions.map((exec) => `${exec.cause}:${exec.status}`)).toEqual(['start:discarded', 'review:review']);
     await h.ok('node.approve', { ticketId, nodeId: 'write' });

@@ -115,6 +115,7 @@ describe('vuyro command envelopes', () => {
     [['node', 'done', '--ticket', 'T', '--node', 'n', '--port', 'done', '--data', '{bad'], 'not valid JSON'],
     [['artifact', 'add', 'slot', '--ticket', 'T', '--node', 'n', '--kind', 'file'], '--uri is required'],
     [['node', 'done', '--ticket', 'T', '--node', 'n', '--port'], '--port needs a value'],
+    [['node', 'done', '--ticket', 'T', '--node', 'n', '--data', '{}'], "the name of the node's output to finish on"],
     [['definition', 'save', '{"kind":"other"}'], "'kind' must be"],
   ])('%j is a usage error', async (args, message) => {
     const out = io();

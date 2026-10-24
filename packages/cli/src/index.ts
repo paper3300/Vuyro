@@ -58,7 +58,7 @@ Work
   ticket create --project <id> --title <text> [--description <text>] [--template <id>[@<version>]] [--priority <n>]
   ticket list [--project <id>]     ticket show <ticketId>     ticket stats <ticketId>
   node done --port <port> [--data <json|@file>] [--summary <text>] [--artifacts <json|@file>] [--items <json|@file>]
-  node approve|reject|retry|pause|resume [--comment <text>] [--items <json|@file>]
+  node approve|reject [--comment <text>]   node reject [--items <json|@file>]   node retry|pause|resume
   artifact add <slot> --kind <kind> --uri <uri> [--version <v>] [--title <t>] [--mime <type>] [--hash <hash>]
   artifact list --ticket <id> [--node <id>]
   definition save <json|@file> Save a node type or template version (export envelope)
@@ -118,7 +118,8 @@ export async function runCli(argv: readonly string[], io: CliIo, options: CliOpt
     return EXIT.usage;
   }
   const [command, sub] = args.positionals;
-  if (command === undefined || command === 'help' || command === '-h') {
+  // `--help` anywhere (e.g. `vuyro node done --help`) shows the usage instead of running the command.
+  if (command === undefined || command === 'help' || command === '-h' || has(args, 'help')) {
     io.out(USAGE);
     return EXIT.ok;
   }
@@ -429,6 +430,13 @@ async function ticketCommand(ctx: Context, sub: string | undefined): Promise<num
   }
 }
 
+/** The output port: an agent that left it out learns what it is (measured: a small model took it for a network port). */
+function portFlag(ctx: Context): string {
+  const port = flag(ctx.args, 'port');
+  if (port === undefined || port === '') throw new UsageError("--port is required: the name of the node's output to finish on (for example done), listed under 'Output ports' in the instructions");
+  return port;
+}
+
 function ticketArgument(ctx: Context): string {
   const ticketId = ctx.args.positionals[2] ?? ctx.env[AGENT_ENV.ticket];
   if (ticketId === undefined || ticketId === '') throw new UsageError('give a ticket id');
@@ -462,7 +470,7 @@ async function nodeCommand(ctx: Context, sub: string | undefined): Promise<numbe
       const summary = flag(ctx.args, 'summary');
       await execute(ctx, 'node.done', {
         ...target(ctx),
-        port: requireFlag(ctx.args, 'port'),
+        port: portFlag(ctx),
         ...(data === undefined ? {} : { data }),
         ...(summary === undefined ? {} : { summary }),
         ...(artifacts === undefined ? {} : { artifacts }),
