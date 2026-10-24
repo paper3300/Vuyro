@@ -85,7 +85,7 @@ export async function openDaemonHarness(
     async saveDefinition(definition) {
       const ui = await harness.ui();
       const kind = definition.kind === 'nodeType' ? 'nodeType.save' : 'template.save';
-      const saved: CommandSuccess = await ui.execute({ requestId: `save-${String(definition.id)}-${String(definition.version)}`, type: kind, payload: { definition } });
+      const saved: CommandSuccess = await ui.execute({ requestId: `save-${String(definition.id).replace(/[^A-Za-z0-9._:-]/g, '-')}-${String(definition.version)}`, type: kind, payload: { definition } });
       if ((saved.result as { status: string }).status === 'active') return;
       for (let attempt = 0; attempt < 200; attempt++) {
         const row = await daemon.store.queryOne<{ status: string }>('SELECT status FROM p_definitions WHERE id = ? AND version = ?', [definition.id as string, definition.version as number]);

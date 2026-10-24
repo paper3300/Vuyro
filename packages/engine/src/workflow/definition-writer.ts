@@ -86,6 +86,20 @@ export class DefinitionWriter {
       this.forget(hash, waiting.resolve);
       return response;
     }
+    if (response.replayed) {
+      // The same save was sent before (the built-ins on every start): the replayed answer says 'staged' from back
+      // then, and no new `definition.staged` will come. The registry says how that save ended.
+      const row = await this.options.registry.row(definition.kind, definition.id, definition.version);
+      if (row?.hash === hash && row.status === 'active') {
+        this.forget(hash, waiting.resolve);
+        return { ...response, result: { ...(response.result as object), status: 'active' } };
+      }
+      if (row?.hash === hash && row.status === 'abandoned') {
+        this.forget(hash, waiting.resolve);
+        return { ok: false, requestId, error: { code: 'internal', message: 'this definition version was abandoned earlier (its file could not be written)', retryable: false } };
+      }
+      // Still staged: `recover()` or the writer's queue finishes it, and `waiting` hears about it.
+    }
     const outcome = await waiting.promise;
     if (outcome.ok) return { ...response, result: { ...(response.result as object), status: 'active' } };
     return { ok: false, requestId, error: { code: 'internal', message: `could not write the definition file: ${outcome.reason ?? ''}`, retryable: true } };

@@ -243,6 +243,22 @@ describe.runIf(process.platform === 'win32')('engine daemon', () => {
       }
     });
 
+    it('starts again on its own data: the built-ins it installed last time do not hold up the start', async () => {
+      // Regression: installing the built-ins again replayed the first 'staged' answer and waited forever.
+      h = await openDaemonHarness();
+      const ui = await h.ui();
+      const { result } = await ui.execute({ requestId: rid(), type: 'project.create', payload: { name: 'sample' } });
+      const started = Date.now();
+      await h.restart();
+      expect(Date.now() - started).toBeLessThan(10_000);
+      const again = await h.ui();
+      expect(await again.request(RPC_METHODS.projects, {})).toMatchObject({ projects: [{ projectId: (result as { projectId: string }).projectId }] });
+      const templates = await h.daemon.store.query<{ status: string }>("SELECT status FROM p_definitions WHERE kind = 'template'");
+      expect(templates.map((row) => row.status)).toEqual(['active']);
+      await h.restart();
+      expect((await (await h.ui()).request<{ projects: unknown[] }>(RPC_METHODS.projects, {})).projects).toHaveLength(1);
+    }, 30_000);
+
     it('does not touch the runs while another engine holds the data directory', async () => {
       const temp = tempDir('vuyro-daemon-held-');
       try {
