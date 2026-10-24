@@ -5,7 +5,7 @@ import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 import { prependPath } from '@vuyro/agent-adapters';
-import { nodeFileSystem, writeVuyroShims } from '@vuyro/engine';
+import { VuyroShims } from '@vuyro/engine';
 import { cliVersion } from '../src/index.ts';
 
 /**
@@ -32,8 +32,8 @@ function agentEnv(): Record<string, string> {
 const expected = `vuyro ${cliVersion()}`;
 
 describe.runIf(process.platform === 'win32')('vuyro on the agent PATH', () => {
-  it('writes vuyro.cmd and the Git Bash script, and nothing else', async () => {
-    await writeVuyroShims(nodeFileSystem, dir, { command: process.execPath, args: [bin] });
+  it('writes vuyro.cmd and the Git Bash script, and nothing else', () => {
+    new VuyroShims(dir, { command: process.execPath, args: [bin] }).ensure();
     expect(readdirSync(dir).sort()).toEqual(['vuyro', 'vuyro.cmd']);
   });
 

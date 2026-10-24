@@ -14,7 +14,10 @@
     "!dist/**/*.d.ts",
     "!node_modules/@vuyro/*/{src,spikes,test,scripts,fixtures}/**",
     "!node_modules/@vuyro/*/tsconfig*.json",
-    "!node_modules/@vuyro/*/dist/**/*.map"
+    "!node_modules/**/*.map",
+    "!node_modules/**/*.d.ts",
+    "!node_modules/@parcel/watcher/{src,scripts}/**",
+    "!node_modules/json-schema-traverse/spec/**"
   ],
   "asar": false,
   "npmRebuild": false,

@@ -22,6 +22,8 @@ export const READ_CONTROL = 0x00020000;
 export const WRITE_DAC = 0x00040000;
 export const OPEN_EXISTING = 3;
 export const FILE_SHARE_ALL = 0x7;
+/** CreateFileW needs it to open a directory. */
+export const FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
 
 export const OWNER_SECURITY_INFORMATION = 0x1;
 export const GROUP_SECURITY_INFORMATION = 0x2;

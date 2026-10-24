@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import type net from 'node:net';
-import { AGENT_ENV, type AgentAdapter, CliAgentAdapter, vuyroShims } from '@vuyro/agent-adapters';
+import { AGENT_ENV, type AgentAdapter, CliAgentAdapter } from '@vuyro/agent-adapters';
 import { type AgentProvider, type EngineStatus, SchemaValidator } from '@vuyro/contracts';
 import { CommandBus } from '../commands/command-bus.ts';
 import { startEnginePipe, type AuthenticatedPipeServer } from '../ipc/pipe-auth.ts';
@@ -24,6 +24,7 @@ import { HumanCredentials } from './credentials.ts';
 import { defaultDataDir, defaultPipePath, type EnginePaths, enginePaths } from './paths.ts';
 import { EngineQueries } from './queries.ts';
 import { PairingGate, RpcConnection } from './rpc-server.ts';
+import { type ShimSecurity, VuyroShims } from './vuyro-shims.ts';
 
 export interface EngineDaemonOptions {
   /** Default `%LOCALAPPDATA%\Vuyro`. */
@@ -44,6 +45,8 @@ export interface EngineDaemonOptions {
    * because their sandboxed shell cannot open the engine pipe. Absent = Codex agents can only use the shell.
    */
   readonly vuyroCli?: { readonly command: string; readonly args: readonly string[] };
+  /** How the `vuyro` shims are kept to the current user. Default: Windows DACLs (tests replace it). */
+  readonly shimSecurity?: ShimSecurity;
   /** The app's credential when the app launched this engine (read from stdin by the entry point). */
   readonly uiCredential?: string;
   readonly maxConcurrent?: number;
@@ -187,8 +190,10 @@ export async function startEngineDaemon(options: EngineDaemonOptions = {}): Prom
     const processRunner = options.processRunner ?? nodeProcessRunner;
     // The checkout hook runs `vuyro hook pretooluse` with the same CLI.
     const vuyroHook = options.vuyroCli === undefined ? {} : { vuyroHook: { command: options.vuyroCli.command, args: options.vuyroCli.args } };
-    // Agents run `vuyro …` from their shell: put this engine's CLI first on their PATH.
-    const pathDirs = options.vuyroCli === undefined ? {} : { pathDirs: [await writeVuyroShims(fs, paths.bin, options.vuyroCli)] };
+    // Agents run `vuyro …` from their shell: this engine's CLI goes first on their PATH, checked before every start.
+    const shims = options.vuyroCli === undefined ? undefined : new VuyroShims(paths.bin, options.vuyroCli, options.shimSecurity);
+    shims?.ensure();
+    const pathDirs = shims === undefined ? {} : { pathDirs: () => [shims.ensure()] };
     const adapters = options.adapters ?? {
       claude: CliAgentAdapter.claude({ runner: processRunner, clock, ...vuyroHook, ...pathDirs }),
       codex: CliAgentAdapter.codex({
@@ -272,19 +277,4 @@ export async function startEngineDaemon(options: EngineDaemonOptions = {}): Prom
     await closeParts().catch(() => undefined);
     throw error;
   }
-}
-
-/**
- * Writes the `vuyro` shims (`vuyroShims`) into `dir`, replacing each file whole (temporary file, then rename), and
- * returns `dir`. Written at every start: the CLI's location changes when the app is installed elsewhere or updated.
- */
-export async function writeVuyroShims(fs: FileSystem, dir: string, cli: { readonly command: string; readonly args: readonly string[] }): Promise<string> {
-  await fs.mkdir(dir, { recursive: true });
-  for (const [name, content] of Object.entries(vuyroShims(cli))) {
-    const file = join(dir, name);
-    const temporary = `${file}.${String(process.pid)}.tmp`;
-    await fs.writeFile(temporary, content);
-    await fs.rename(temporary, file);
-  }
-  return dir;
 }

@@ -193,6 +193,26 @@ describe('agent environment', () => {
     expect(runner.spawned[0]?.spec.env?.PATH).toBeUndefined();
   });
 
+  it('asks for the PATH folders at every start, and does not start an agent when that fails', async () => {
+    const clock = new ManualClock();
+    const runner = new FakeProcessRunner(clock);
+    runner.enqueue({ steps: [{ stdout: RESULT }, { exit: 0 }] });
+    let calls = 0;
+    let broken = false;
+    const pathDirs = (): readonly string[] => {
+      calls += 1;
+      if (broken) throw new Error('shim replaced and could not be put back');
+      return ['C:/data/bin'];
+    };
+    const adapter = CliAgentAdapter.claude({ runner, clock, resolve: (command) => `C:/bin/${command}.exe`, baseEnv: { PATH: 'C:/bin' }, pathDirs });
+    await drain(adapter.start(request()).observations);
+    expect(calls).toBe(1);
+    broken = true;
+    expect(() => adapter.start(request())).toThrow('shim replaced');
+    expect(calls).toBe(2);
+    expect(runner.spawned).toHaveLength(1);
+  });
+
   it('vuyro shims quote the CLI for cmd and sh', () => {
     expect(vuyroShims({ command: 'C:\\Program Files\\nodejs\\node.exe', args: ["D:\\it's 100%\\bin.js"] })).toEqual({
       'vuyro.cmd': `@"C:\\Program Files\\nodejs\\node.exe" "D:\\it's 100%%\\bin.js" %*\r\n`,
