@@ -61,15 +61,21 @@ export function useArtifacts(ticketId: string | undefined) {
   return useQuery({ queryKey: ['artifacts', ticketId], enabled, queryFn: async () => (await call<{ artifacts: ArtifactRow[] }>('query.artifacts', { ticketId })).artifacts });
 }
 
-/** A run's log so far. Each refetch (an event of the run arrived) asks only for what came after the last entry. */
+/**
+ * The newest part of a run's log (M6b re-review): the screen keeps at most `LOG_KEEP` entries. It starts from the run's
+ * last entries, and each refetch (an event of the run arrived) asks only for what came after the last one, dropping the
+ * oldest beyond the limit. Older entries are read again page by page (`useRunLogPage`).
+ */
 export interface RunLog {
   readonly run: RunEventsResult['run'];
   readonly entries: readonly RunLogEntry[];
   readonly cursor: number;
-  /** Older pages were not all fetched yet (a very long run); `loadMore` continues. */
+  /** More new entries than one refresh reads; `loadMore` continues. */
   readonly more: boolean;
+  readonly lastRevision: number;
 }
 
+export const LOG_KEEP = 1000;
 /** Pages fetched per refresh; a longer backlog waits for "더 불러오기". */
 const LOG_PAGES_PER_FETCH = 10;
 const LOG_PAGE = 500;
@@ -83,9 +89,12 @@ export function useRunLog(runId: string | undefined) {
     enabled,
     queryFn: async (): Promise<RunLog> => {
       const previous = client.getQueryData<RunLog>(key);
-      let { cursor } = previous ?? { cursor: 0 };
-      let entries = previous?.entries ?? [];
-      let run = previous?.run;
+      if (previous === undefined) {
+        const first = await call<RunEventsResult>('query.runEvents', { runId, tail: LOG_KEEP });
+        return { run: first.run, entries: first.entries, cursor: first.cursor, more: first.more, lastRevision: first.lastRevision };
+      }
+      let { cursor, run, lastRevision } = previous;
+      let entries = previous.entries;
       let more = true;
       for (let page = 0; page < LOG_PAGES_PER_FETCH && more; page++) {
         const result = await call<RunEventsResult>('query.runEvents', { runId, after: cursor, limit: LOG_PAGE });
@@ -93,12 +102,26 @@ export function useRunLog(runId: string | undefined) {
         entries = entries.concat(result.entries);
         cursor = result.cursor;
         more = result.more;
+        lastRevision = result.lastRevision;
       }
-      if (run === undefined) throw new Error('no run');
-      return { run, entries, cursor, more };
+      return { run, entries: entries.length > LOG_KEEP ? entries.slice(-LOG_KEEP) : entries, cursor, more, lastRevision };
     },
   });
   return { ...query, loadMore: () => void client.invalidateQueries({ queryKey: key }) };
+}
+
+export const LOG_PAGE_SIZE = 200;
+
+/** One page of a run's log from its start (page 0 = events 1..200); revisions have no gaps, so pages are by number. */
+export function useRunLogPage(runId: string, page: number) {
+  const enabled = useConnected();
+  return useQuery({
+    queryKey: ['runLogPage', runId, page],
+    enabled,
+    queryFn: () => call<RunEventsResult>('query.runEvents', { runId, after: page * LOG_PAGE_SIZE, limit: LOG_PAGE_SIZE }),
+    // Old pages do not change; only the page count grows.
+    staleTime: Number.POSITIVE_INFINITY,
+  });
 }
 
 /** One log entry in full (its text was cut for the list). */

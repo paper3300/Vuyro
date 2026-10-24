@@ -187,6 +187,8 @@ export const RunEventsQuerySchema = Type.Object(
     after: Type.Optional(Type.Integer({ minimum: 0 })),
     limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
     textLimit: Type.Optional(Type.Integer({ minimum: 200, maximum: 1_048_576 })),
+    /** The last `tail` events instead of a page after `after` (where a screen starts on a long run). */
+    tail: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
   },
   strict,
 );
@@ -234,6 +236,8 @@ export interface RunEventsResult {
   readonly cursor: number;
   /** More events after this page (now). */
   readonly more: boolean;
+  /** The run's last event revision now (revisions run 1, 2, … without gaps, so pages can be read by number). */
+  readonly lastRevision: number;
 }
 
 /** Active templates, latest version of each (M6: ticket creation). */

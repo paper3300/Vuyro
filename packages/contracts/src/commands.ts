@@ -534,6 +534,19 @@ export const COMMAND_CATALOG = {
     payload: Type.Object(DefinitionKeyPayload, strict),
     result: Empty,
   },
+  /**
+   * The versions one save or import staged, activated in one commit once every file is written (M6b re-review): all
+   * become usable together, or none does (the engine then abandons them all).
+   */
+  'definition.activateMany': {
+    version: 1,
+    scope: 'app',
+    category: 'definition',
+    access: { nodeAgent: 'deny', systemOnly: true },
+    summary: 'Mark the staged definitions of one save or import usable together, once all their files are in place.',
+    payload: Type.Object({ items: Type.Array(Type.Object(DefinitionKeyPayload, strict), { minItems: 1, maxItems: 201 }) }, strict),
+    result: Empty,
+  },
   'definition.abandon': {
     version: 1,
     scope: 'app',

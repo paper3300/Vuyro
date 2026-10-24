@@ -1,7 +1,7 @@
 import type { LogText, RunLogEntry } from '@vuyro/contracts';
 import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { errorText, formatTime } from '../format.ts';
-import { fullLogEntry, useRunLog } from '../queries.ts';
+import { fullLogEntry, LOG_KEEP, LOG_PAGE_SIZE, useRunLog, useRunLogPage } from '../queries.ts';
 import { buildLogRows, formatToolDuration, type LogRow } from '../run-log-model.ts';
 import { Button, Chip, ErrorNote, PlainText } from './ui.tsx';
 
@@ -156,6 +156,13 @@ function Row({ row, runId }: { row: LogRow; runId: string }) {
 }
 
 export function RunLog({ runId }: { runId: string }) {
+  const [paging, setPaging] = useState(false);
+  if (paging) return <RunLogPages runId={runId} onClose={() => { setPaging(false); }} />;
+  return <LiveRunLog runId={runId} onPages={() => { setPaging(true); }} />;
+}
+
+/** The newest entries, following the run as it goes (at most LOG_KEEP kept). */
+function LiveRunLog({ runId, onPages }: { runId: string; onPages: () => void }) {
   const log = useRunLog(runId);
   const rows = useMemo(() => buildLogRows(log.data?.entries ?? []), [log.data]);
   const [showRaw, setShowRaw] = useState(false);
@@ -189,6 +196,14 @@ export function RunLog({ runId }: { runId: string }) {
           </label>
         )}
       </div>
+      {(log.data.entries[0]?.revision ?? 1) > 1 && (
+        <p className="text-[11.5px] text-muted">
+          앞선 기록 {((log.data.entries[0]?.revision ?? 1) - 1).toLocaleString()}개는 화면에 두지 않습니다(최근 {LOG_KEEP.toLocaleString()}개만).{' '}
+          <button type="button" className="text-agent hover:underline" onClick={onPages}>
+            처음부터 페이지로 보기
+          </button>
+        </p>
+      )}
       {hidden > 0 && (
         <Button small kind="ghost" onClick={() => { setVisible(visible + ROWS_PER_STEP); }}>
           이전 항목 {Math.min(hidden, ROWS_PER_STEP)}개 더 보기 (남은 {hidden.toLocaleString()}개)
@@ -213,6 +228,39 @@ export function RunLog({ runId }: { runId: string }) {
           나머지 기록 더 불러오기
         </Button>
       )}
+    </section>
+  );
+}
+
+/** The whole log read again page by page from the start (not live); for runs longer than the screen keeps. */
+function RunLogPages({ runId, onClose }: { runId: string; onClose: () => void }) {
+  const [page, setPage] = useState(0);
+  const result = useRunLogPage(runId, page);
+  const rows = useMemo(() => buildLogRows(result.data?.entries ?? []), [result.data]);
+  const pages = Math.max(1, Math.ceil((result.data?.lastRevision ?? 0) / LOG_PAGE_SIZE));
+  return (
+    <section aria-label="실행 로그 페이지" className="flex min-h-0 flex-col gap-1.5">
+      <div className="flex flex-wrap items-center gap-2 text-[11.5px] text-muted">
+        <Button small kind="ghost" disabled={page === 0} onClick={() => { setPage(page - 1); }}>
+          이전
+        </Button>
+        <span>
+          {page + 1} / {pages} 페이지
+        </span>
+        <Button small kind="ghost" disabled={page + 1 >= pages} onClick={() => { setPage(page + 1); }}>
+          다음
+        </Button>
+        <span className="flex-1" />
+        <Button small kind="ghost" onClick={onClose}>
+          최근 기록으로
+        </Button>
+      </div>
+      <ErrorNote error={result.error === null ? undefined : errorText(result.error)} />
+      <ol aria-label="로그 항목" className="flex max-h-[520px] min-h-0 flex-col gap-1 overflow-y-auto pr-1">
+        {rows.map((row) => (
+          <Row key={row.key} row={row} runId={runId} />
+        ))}
+      </ol>
     </section>
   );
 }

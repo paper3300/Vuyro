@@ -29,7 +29,7 @@ import { canonicalJson, sha256Hex } from '../commands/fingerprint.ts';
 import { type CompiledNodeType, compileNodeType, compileWorkflow } from './compile.ts';
 import { workflowView } from '../daemon/workflow-view.ts';
 import { type DefinitionRow, definitionHash } from './definitions.ts';
-import { placeholdersIn, SecretScrubber, scrubNodeType, scrubTemplate } from './secrets.ts';
+import { placeholdersIn, remainingSecrets, SecretScrubber, scrubEnvelope, scrubNodeType, scrubTemplate } from './secrets.ts';
 
 /**
  * Exporting and importing definitions as JSON ([[공유·권한·BlackBoard 설계]] §1, [[명령·이벤트 계약]] §17).
@@ -88,7 +88,7 @@ function credentialsOf(requires: DefinitionEnvelope['requires'], added: readonly
 /** A definition with what the scrubber found named in `requires.credentials` (unchanged when it found nothing). */
 function withCredentials<T extends DefinitionEnvelope>(original: T, cleaned: T, found: readonly string[]): T {
   if (found.length === 0) return original;
-  return { ...cleaned, requires: { ...original.requires, credentials: credentialsOf(original.requires, found) } };
+  return { ...cleaned, requires: { ...cleaned.requires, credentials: credentialsOf(cleaned.requires, found) } };
 }
 
 /** `type → version` of the node types a template uses (the highest version when it uses several). */
@@ -105,8 +105,17 @@ function fileName(id: string, version: number): string {
 /** A node type for export, with what was replaced (secrets.ts). */
 export function redactNodeType(definition: NodeTypeDefinition, pointer = ''): { definition: NodeTypeDefinition; redacted: RedactedField[] } {
   const scrubber = new SecretScrubber();
-  const cleaned = scrubNodeType(definition, pointer, scrubber);
+  const cleaned = scrubEnvelope(scrubNodeType(definition, pointer, scrubber), pointer, `${definition.id}@${String(definition.version)}`, scrubber);
   return { definition: withCredentials(definition, cleaned, scrubber.credentials), redacted: scrubber.findings };
+}
+
+/** The last check before a document leaves: nothing in it (envelopes, embedded definitions, ids) still looks like a secret. */
+function checked<T>(document: T): T {
+  const left = remainingSecrets(document);
+  if (left.length > 0) {
+    throw new ExchangeError('invariant_violated', `could not replace a value that looks like a secret (${left.map((hit) => `${hit.path}: ${hit.looksLike}`).join(', ')}); change it in the definition first`);
+  }
+  return document;
 }
 
 /**
@@ -121,7 +130,7 @@ export async function exportDefinition(
   const found = await active(source, request.kind, request.id, request.version);
   if (found.kind === 'nodeType') {
     const { definition, redacted } = redactNodeType(found);
-    return { document: withChecksum(definition), fileName: fileName(found.id, found.version), redacted };
+    return { document: checked(withChecksum(definition)), fileName: fileName(found.id, found.version), redacted };
   }
   const template = found;
   const types: NodeTypeDefinition[] = [];
@@ -136,10 +145,12 @@ export async function exportDefinition(
     types.some((each) => each.id === type && each.version === version && each.content.params.some((spec) => spec.name === param && spec.secret === true));
   const embed = request.embedNodeTypes !== false;
   const scrubber = new SecretScrubber();
-  const content = scrubTemplate(template.content, embed ? '/content/content' : '/content', declared, scrubber);
+  const pointer = embed ? '/content' : '';
+  const content = scrubTemplate(template.content, `${pointer}/content`, declared, scrubber);
+  const envelope = scrubEnvelope({ ...template, content }, pointer, `${template.id}@${String(template.version)}`, scrubber);
   // Unchanged when nothing was found, so importing it here finds the same version.
-  const cleaned = withCredentials(template, { ...template, content }, scrubber.credentials);
-  if (!embed) return { document: withChecksum(cleaned), fileName: fileName(template.id, template.version), redacted: scrubber.findings };
+  const cleaned = withCredentials(template, envelope, scrubber.credentials);
+  if (!embed) return { document: checked(withChecksum(cleaned)), fileName: fileName(template.id, template.version), redacted: scrubber.findings };
   const redacted = [...scrubber.findings];
   const embedded = types.map((type, index) => {
     const result = redactNodeType(type, `/embedded/${String(index)}`);
@@ -153,14 +164,15 @@ export async function exportDefinition(
     kind: 'bundle',
     id: template.id,
     version: template.version,
-    name: template.name,
-    ...(template.description === undefined ? {} : { description: template.description }),
-    ...(template.author === undefined ? {} : { author: template.author }),
+    // The bundle repeats the template's (already scrubbed) name, description and author.
+    name: cleaned.name,
+    ...(cleaned.description === undefined ? {} : { description: cleaned.description }),
+    ...(cleaned.author === undefined ? {} : { author: cleaned.author }),
     requires: { nodeTypes: requiredNodeTypes(template.content), ...(allCredentials.length === 0 ? {} : { credentials: allCredentials }) },
     content: withChecksum(cleaned),
     embedded,
   };
-  return { document: { ...bundle, checksum: bundleHash(bundle) }, fileName: fileName(template.id, template.version), redacted };
+  return { document: checked({ ...bundle, checksum: bundleHash(bundle) }), fileName: fileName(template.id, template.version), redacted };
 }
 
 async function active(source: ExchangeSource, kind: DefinitionKind, id: string, version?: number): Promise<DefinitionEnvelope> {

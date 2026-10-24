@@ -89,6 +89,11 @@ describe('saving a JSON file', () => {
     const readOnly = fakes({ save: 'D:\\out.json', fail: 'write' });
     expect(await saveJsonFile(readOnly.dialogs, readOnly.files, { name: 'a.json', text: '{}' })).toMatchObject({ ok: false, error: { code: 'file_unwritable' } });
     expect(checkSaveFile({ name: '../a', text: '' })).toEqual({ ok: true, name: 'a.json', text: '' });
+    // The limit is in UTF-8 bytes: Korean text under the character count can be over it.
+    const korean = '가'.repeat(Math.floor(MAX_FILE_BYTES / 3) + 1);
+    expect(korean.length).toBeLessThan(MAX_FILE_BYTES);
+    expect(checkSaveFile({ name: 'a.json', text: korean })).toMatchObject({ ok: false, error: { code: 'file_too_large' } });
+    expect(checkSaveFile({ name: 'a.json', text: '가'.repeat(Math.floor(MAX_FILE_BYTES / 3)) })).toMatchObject({ ok: true });
   });
 });
 
@@ -97,5 +102,6 @@ describe('copying', () => {
     expect(checkCopyText({ text: '{}' })).toEqual({ ok: true, text: '{}' });
     for (const message of [null, [], { text: 1 }, {}]) expect(checkCopyText(message)).toMatchObject({ ok: false, error: { code: 'bridge_refused' } });
     expect(checkCopyText({ text: 'x'.repeat(MAX_FILE_BYTES + 1) })).toMatchObject({ ok: false, error: { code: 'file_too_large' } });
+    expect(checkCopyText({ text: '가'.repeat(Math.floor(MAX_FILE_BYTES / 3) + 1) })).toMatchObject({ ok: false, error: { code: 'file_too_large' } });
   });
 });

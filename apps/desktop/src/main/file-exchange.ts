@@ -57,7 +57,8 @@ export function checkSaveFile(message: unknown): { ok: true; name: string; text:
   if (typeof message !== 'object' || message === null || Array.isArray(message)) return failure('bridge_refused', 'malformed request');
   const { name, text } = message as { name?: unknown; text?: unknown };
   if (typeof text !== 'string') return failure('bridge_refused', 'text must be a string');
-  if (text.length > MAX_EXPORT_TEXT) return failure('file_too_large', '내보낼 내용이 너무 큽니다.');
+  // Bytes, not characters: Korean text is three bytes a character in the file.
+  if (Buffer.byteLength(text, 'utf8') > MAX_FILE_BYTES) return failure('file_too_large', '내보낼 내용이 너무 큽니다.');
   return { ok: true, name: safeFileName(name), text };
 }
 
@@ -79,6 +80,6 @@ export function checkCopyText(message: unknown): { ok: true; text: string } | { 
   if (typeof message !== 'object' || message === null || Array.isArray(message)) return failure('bridge_refused', 'malformed request');
   const { text } = message as { text?: unknown };
   if (typeof text !== 'string') return failure('bridge_refused', 'text must be a string');
-  if (text.length > MAX_EXPORT_TEXT) return failure('file_too_large', '복사할 내용이 너무 큽니다.');
+  if (Buffer.byteLength(text, 'utf8') > MAX_FILE_BYTES) return failure('file_too_large', '복사할 내용이 너무 큽니다.');
   return { ok: true, text };
 }

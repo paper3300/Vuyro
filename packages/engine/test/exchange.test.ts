@@ -1,11 +1,12 @@
 import { writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ExportBundle, ImportChoice, ImportPreview, NodeTypeDefinition, TemplateDefinition } from '@vuyro/contracts';
 import { MemoryFileSystem } from '../src/runtime/fs.ts';
 import { definitionHash, definitionPath } from '../src/workflow/definitions.ts';
 import { bundleHash, ExchangeError, exportDefinition, previewImport, redactNodeType } from '../src/workflow/exchange.ts';
 import { nextRequestId } from './helpers/engine-harness.ts';
-import { HUMAN, openWorkflowHarness, type WorkflowHarness } from './helpers/workflow-harness.ts';
+import { HUMAN, openWorkflowHarness, SYSTEM, type WorkflowHarness } from './helpers/workflow-harness.ts';
 
 /**
  * Sharing definitions as JSON (M6b): export leaves secrets out and says so; import reads untrusted text, shows what it
@@ -493,6 +494,144 @@ describe('saving an import (definition.import)', () => {
     await settled();
     expect(await status('myteam.build')).toEqual(['1:abandoned']);
     expect(await status('myteam/build')).toEqual(['1:abandoned']);
-    expect(await h.store.queryOne("SELECT reason FROM p_definitions WHERE id = 'myteam/build'")).toMatchObject({ reason: expect.stringMatching(/needs node type myteam\.build@1/) as string });
+    expect(await h.store.queryOne("SELECT reason FROM p_definitions WHERE id = 'myteam/build'")).toMatchObject({ reason: expect.stringMatching(/write failed for nodeType myteam\.build@1/) as string });
+  });
+});
+
+describe('secrets in envelopes (M6b re-review)', () => {
+  const github = `ghp_${'a1B2c3D4e5'.repeat(4)}`;
+  const slack = 'xoxb-123456789012-abcdef';
+
+  it('scans the whole exported document: envelope name, description, author and requires, also of embedded node types', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    await save({ ...buildType(), description: `Uses ${github} to pull`, author: `ops ${slack}`, requires: { plugins: { p4: `token ${github}` } } });
+    await save({ ...buildTemplate(), name: `Build flow ${slack}`, description: `Deploy key: ${github}` });
+    const result = await exportDefinition(h.registry, { kind: 'template', id: 'myteam/build' });
+    const text = json(result.document);
+    expect(text).not.toContain(github);
+    expect(text).not.toContain(slack);
+    const bundle = result.document as ExportBundle;
+    // The bundle repeats the scrubbed name and description, not the originals.
+    expect(bundle.name).toBe(bundle.content.name);
+    expect(bundle.description).toBe(bundle.content.description);
+    expect(bundle.name).toMatch(/^Build flow \$\{secret:/);
+    expect(result.redacted.filter((field) => field.reason === 'pattern').map((field) => field.path).sort()).toEqual(
+      ['/content/name', '/content/description', '/embedded/0/description', '/embedded/0/author', '/embedded/0/requires/plugins/p4'].sort(),
+    );
+    expect(bundle.checksum).toBe(bundleHash(bundle));
+    for (const embedded of bundle.embedded) expect(embedded.checksum).toBe(definitionHash(embedded));
+
+    const alone = await exportDefinition(h.registry, { kind: 'nodeType', id: 'myteam.build' });
+    expect(json(alone.document)).not.toContain(github);
+    expect(alone.redacted.filter((field) => field.reason === 'pattern').map((field) => field.path).sort()).toEqual(['/author', '/description', '/requires/plugins/p4']);
+    const plain = await exportDefinition(h.registry, { kind: 'template', id: 'myteam/build', embedNodeTypes: false });
+    expect(plain.redacted.filter((field) => field.reason === 'pattern').map((field) => field.path).sort()).toEqual(['/description', '/name']);
+  });
+
+  it('refuses to export when a secret-looking value sits where it cannot be replaced (an id)', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    const id = 'myteam/Zx9QvT3pL0mR7sYk2WnB8cJh5DfG1aUe';
+    await save(buildType());
+    await save({ ...buildTemplate(), id, content: { ...buildTemplate().content, id } });
+    const failure = exportDefinition(h.registry, { kind: 'template', id, embedNodeTypes: false });
+    await expect(failure).rejects.toMatchObject({ code: 'invariant_violated' });
+    await expect(failure).rejects.toThrow(/\/id: 긴 무작위 문자열/);
+  });
+});
+
+describe('writing an import: every file first, then one activation (M6b re-review)', () => {
+  const typeNamed = (id: string): NodeTypeDefinition => ({ ...buildType(), id, name: id, content: { ...buildType().content, type: id } });
+  const three = (): ExportBundle => {
+    const template: TemplateDefinition = {
+      ...buildTemplate(),
+      content: {
+        ...buildTemplate().content,
+        nodes: [
+          { id: 'a', type: 'myteam.one', version: 1 },
+          { id: 'b', type: 'myteam.two', version: 1 },
+          { id: 'c', type: 'myteam.three', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        edges: [
+          { from: { node: 'a', port: 'done' }, to: { node: 'b', port: 'in' } },
+          { from: { node: 'b', port: 'done' }, to: { node: 'c', port: 'in' } },
+          { from: { node: 'c', port: 'done' }, to: { node: 'end', port: 'in' } },
+        ],
+      },
+    };
+    return { vuyro: 'export', formatVersion: 1, kind: 'bundle', id: template.id, version: 1, name: template.name, content: template, embedded: [typeNamed('myteam.one'), typeNamed('myteam.two'), typeNamed('myteam.three')] };
+  };
+  const ids = ['myteam.one', 'myteam.two', 'myteam.three', 'myteam/build'];
+  const statuses = async () => {
+    const rows = await h.store.query<{ id: string; status: string }>("SELECT id, status FROM p_definitions WHERE id LIKE 'myteam%' ORDER BY id");
+    return Object.fromEntries(rows.map((row) => [row.id, row.status]));
+  };
+  async function settled(): Promise<void> {
+    for (let attempt = 0; attempt < 300; attempt++) {
+      if ((await h.store.query("SELECT id FROM p_definitions WHERE status = 'staged'")).length === 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error('definitions never settled');
+  }
+  const importAll = async () => {
+    const plan = await preview(json(three()));
+    expect(plan.canSave).toBe(true);
+    const response = await h.exec('definition.import', { items: plan.saves.map((each) => ({ definition: each.definition, ...(each.expect === undefined ? {} : { expect: each.expect }) })) }, HUMAN);
+    expect(response.ok).toBe(true);
+  };
+  const path = (kind: 'nodeType' | 'template', id: string) => definitionPath(h.registry.root, kind, id, 1);
+
+  for (const [what, kind, id] of [
+    ['the second node type', 'nodeType', 'myteam.two'],
+    ['the last item (the template)', 'template', 'myteam/build'],
+  ] as const) {
+    it(`a file that cannot be written (${what}) leaves nothing active and removes the files already written`, async () => {
+      const fs = new MemoryFileSystem();
+      h = await openWorkflowHarness({ noEngine: true, fs });
+      fs.failNext('rename', `${path(kind, id)}.tmp`);
+      await importAll();
+      await settled();
+      expect(await statuses()).toEqual(Object.fromEntries(ids.map((each) => [each, 'abandoned'])));
+      for (const each of ['myteam.one', 'myteam.two', 'myteam.three']) expect(await fs.exists(path('nodeType', each))).toBe(false);
+      expect(await fs.exists(path('template', 'myteam/build'))).toBe(false);
+      // Nothing of it can be used, and the same import can be tried again.
+      const { result: project } = await h.ok('project.create', { name: 'sample' });
+      expect((await h.exec('ticket.create', { projectId: (project as { projectId: string }).projectId, title: 'x', template: { id: 'myteam/build' } }, HUMAN)).ok).toBe(false);
+      await importAll();
+      await settled();
+      expect(await statuses()).toEqual(Object.fromEntries(ids.map((each) => [each, 'active'])));
+    });
+  }
+
+  it('activation is one commit: a file that does not match refuses all of them', async () => {
+    const fs = new MemoryFileSystem();
+    h = await openWorkflowHarness({ noEngine: true, fs });
+    h.writer.stop();
+    await importAll();
+    const bundle = three();
+    const keys = [...bundle.embedded, bundle.content].map((definition) => ({ kind: definition.kind, id: definition.id, version: 1, hash: definitionHash(definition) }));
+    for (const definition of bundle.embedded) {
+      await fs.mkdir(dirname(path('nodeType', definition.id)), { recursive: true });
+      await fs.writeFile(path('nodeType', definition.id), JSON.stringify(definition.id === 'myteam.three' ? { ...definition, name: 'changed' } : definition));
+    }
+    await fs.mkdir(dirname(path('template', 'myteam/build')), { recursive: true });
+    await fs.writeFile(path('template', 'myteam/build'), JSON.stringify(bundle.content));
+    const refused = await h.exec('definition.activateMany', { items: keys }, SYSTEM);
+    expect(refused).toMatchObject({ ok: false, error: { code: 'invariant_violated' } });
+    expect(await statuses()).toEqual(Object.fromEntries(ids.map((each) => [each, 'staged'])));
+    // With every file right, all become active together; people and agents may not activate.
+    await fs.writeFile(path('nodeType', 'myteam.three'), JSON.stringify(bundle.embedded[2]));
+    expect((await h.exec('definition.activateMany', { items: keys }, HUMAN)).ok).toBe(false);
+    expect((await h.exec('definition.activateMany', { items: keys }, SYSTEM)).ok).toBe(true);
+    expect(await statuses()).toEqual(Object.fromEntries(ids.map((each) => [each, 'active'])));
+  });
+
+  it('an import staged before a crash is finished together on the next start', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    h.writer.stop();
+    await importAll();
+    expect(await statuses()).toEqual(Object.fromEntries(ids.map((each) => [each, 'staged'])));
+    await h.restart({ noEngine: true });
+    expect(await statuses()).toEqual(Object.fromEntries(ids.map((each) => [each, 'active'])));
   });
 });

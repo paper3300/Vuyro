@@ -319,6 +319,7 @@ export class RpcConnection {
           ...(query.after === undefined ? {} : { after: query.after }),
           ...(query.limit === undefined ? {} : { limit: query.limit }),
           ...(query.textLimit === undefined ? {} : { textLimit: query.textLimit }),
+          ...(query.tail === undefined ? {} : { tail: query.tail }),
         });
         if (page === undefined) throw new RpcError(commandError('not_found', 'no such run'));
         return page;

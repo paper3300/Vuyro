@@ -24,8 +24,8 @@ const RUN = '0190aaaa-bbbb-7ccc-8ddd-000000000001';
 const laneRow = (nodeId: string, status: string, run = 1) => ({ nodeId, lane: 'main', laneGroup: null, run, status, executor: 'agent', runId: null, attempt: 1, pauseRequested: 0, supersededBy: null, waitingFor: null, updatedAt: 0 });
 const runRow = { runId: RUN, nodeId: 'spec', provider: 'claude', status: 'succeeded', model: 'small', startedAt: 0, settledAt: 1, terminalReason: null, tokensInput: 10, tokensCacheRead: 0, tokensCacheWrite: 0, tokensOutput: 5, costUsd: null, toolCalls: 1, toolErrors: 0 };
 
-function logPage(entries: RunLogEntry[], cursor: number, more = false): RunEventsResult {
-  return { run: { runId: RUN, ticketId: TICKET, nodeId: 'spec', provider: 'claude', status: 'running', model: null, startedAt: 0, settledAt: null }, entries, cursor, more };
+function logPage(entries: RunLogEntry[], cursor: number, more = false, lastRevision = cursor): RunEventsResult {
+  return { run: { runId: RUN, ticketId: TICKET, nodeId: 'spec', provider: 'claude', status: 'running', model: null, startedAt: 0, settledAt: null }, entries, cursor, more, lastRevision };
 }
 const entry = (revision: number, patch: Record<string, unknown>) => ({ revision, sequence: 100 + revision, at: 1000 * revision, ...patch }) as RunLogEntry;
 
@@ -156,14 +156,61 @@ describe('run log', () => {
       await client.invalidateQueries({ queryKey: ['runLog', RUN] });
     });
     expect(await screen.findByText('실행이 끝났습니다 (성공)')).toBeInTheDocument();
+    // It starts from the run's last entries, then reads only what came after.
     expect(calls.slice(0, 2)).toEqual([
-      { runId: RUN, after: 0, limit: 500 },
+      { runId: RUN, tail: 1000 },
       { runId: RUN, after: 2, limit: 500 },
     ]);
     expect(screen.getAllByText('실행 시작 (claude)')).toHaveLength(1);
     await userEvent.click(screen.getByRole('button', { name: '전체 불러오기 (9자)' }));
     expect(await screen.findByText('all of it')).toBeInTheDocument();
     expect(request).toHaveBeenCalledWith('query.runEvents', { runId: RUN, after: 1, limit: 1, textLimit: 1_048_576 });
+  });
+
+  it('keeps only the newest entries of a long run, and reads the rest again page by page', async () => {
+    const at = (from: number, count: number) => Array.from({ length: count }, (_, index) => entry(from + index, { kind: 'message', role: 'assistant', text: { text: `line ${String(from + index)}`, length: 9 } }));
+    const calls: Record<string, unknown>[] = [];
+    let live = 0;
+    installBridge({
+      'query.runEvents': (params) => {
+        const query = params as { tail?: number; after?: number; limit?: number };
+        calls.push(query);
+        if (query.tail !== undefined) return logPage(at(1001, 1000), 2000, false, 2000);
+        if (query.limit === 200) return logPage(at((query.after ?? 0) + 1, 200), (query.after ?? 0) + 200, true, 2600);
+        live += 1;
+        return logPage(at(2001, 500), 2500, false, 2500);
+      },
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <RunLog runId={RUN} />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText('line 2000')).toBeInTheDocument();
+    expect(screen.getByText(/앞선 기록 1,000개는 화면에 두지 않습니다/)).toBeInTheDocument();
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ['runLog', RUN] });
+    });
+    expect(await screen.findByText('line 2500')).toBeInTheDocument();
+    expect(live).toBe(1);
+    // At most 1000 kept: the oldest 500 of the first read are gone.
+    const kept = client.getQueryData<{ entries: RunLogEntry[] }>(['runLog', RUN])?.entries;
+    expect(kept).toHaveLength(1000);
+    expect(kept?.[0]?.revision).toBe(1501);
+    expect(screen.getByText(/앞선 기록 1,500개는/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: '처음부터 페이지로 보기' }));
+    expect(await screen.findByText('line 1')).toBeInTheDocument();
+    expect(screen.getByText('1 / 13 페이지')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: '다음' }));
+    expect(await screen.findByText('line 201')).toBeInTheDocument();
+    expect(calls.filter((call) => call.limit === 200)).toEqual([
+      { runId: RUN, after: 0, limit: 200 },
+      { runId: RUN, after: 200, limit: 200 },
+    ]);
+    await userEvent.click(screen.getByRole('button', { name: '최근 기록으로' }));
+    expect(await screen.findByText('line 2500')).toBeInTheDocument();
   });
 
   it('folds long text and draws only the latest rows of a long run', async () => {

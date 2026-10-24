@@ -169,3 +169,47 @@ export function scrubTemplate(spec: TemplateSpec, pointer: string, declared: (ty
 export function placeholdersIn(text: string): string[] {
   return [...new Set([...text.matchAll(/\$\{secret:([A-Za-z0-9_.@-]{1,120})\}/g)].map((match) => match[1] ?? ''))];
 }
+
+/** Envelope fields that identify or hold the definition; the rest (name, description, author, …) is text people wrote. */
+const STRUCTURAL = new Set(['vuyro', 'formatVersion', 'kind', 'id', 'version', 'checksum', 'content', 'embedded', 'requires']);
+
+/**
+ * The envelope around the content (M6b re-review): name, description, author and any other field are scanned like
+ * the content; in `requires`, everything but the credential names this export writes and the node type versions.
+ */
+export function scrubEnvelope<T extends { requires?: Readonly<Record<string, unknown>> }>(envelope: T, pointer: string, label: string, scrubber: SecretScrubber): T {
+  const result: Record<string, unknown> = { ...envelope };
+  for (const [key, value] of Object.entries(envelope)) {
+    if (STRUCTURAL.has(key)) continue;
+    result[key] = scrubber.scanValue(value, `${pointer}/${key}`, label, `${label}.${key}`);
+  }
+  if (envelope.requires !== undefined) {
+    const requires: Record<string, unknown> = { ...envelope.requires };
+    for (const [key, value] of Object.entries(envelope.requires)) {
+      if (key === 'credentials' || key === 'nodeTypes') continue;
+      requires[key] = scrubber.scanValue(value, `${pointer}/requires/${key}`, label, `${label}.requires.${key}`);
+    }
+    result.requires = requires;
+  }
+  return result as T;
+}
+
+/**
+ * What still looks like a secret anywhere in a finished document (outside placeholders): the last check before an
+ * export leaves. Identifiers are not rewritten (they hold the document together), so a hit there stops the export.
+ */
+export function remainingSecrets(value: unknown, path = ''): { path: string; looksLike: string }[] {
+  if (typeof value === 'string') {
+    const text = value.replace(/\$\{secret:[^}]*\}/g, ' ');
+    const hits: { path: string; looksLike: string }[] = [];
+    for (const pattern of TOKEN_PATTERNS) {
+      for (const match of text.matchAll(new RegExp(pattern.regex.source, pattern.regex.flags))) {
+        if (pattern.accept === undefined || pattern.accept(match[0])) hits.push({ path, looksLike: pattern.looksLike });
+      }
+    }
+    return hits;
+  }
+  if (Array.isArray(value)) return value.flatMap((item: unknown, index) => remainingSecrets(item, `${path}/${String(index)}`));
+  if (typeof value === 'object' && value !== null) return Object.entries(value).flatMap(([key, item]) => (key === 'checksum' ? [] : remainingSecrets(item, `${path}/${pointerEscape(key)}`)));
+  return [];
+}

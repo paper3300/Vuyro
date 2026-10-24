@@ -259,9 +259,14 @@ export function definitionAggregate(kind: DefinitionKind, id: string): string {
 
 /** The latest `definition.staged` event of a version, for recovery. */
 export function findStaged(events: readonly DomainEvent[], version: number, hash: string): DefinitionEnvelope | undefined {
+  return findStagedEvent(events, version, hash)?.data.definition;
+}
+
+/** The `definition.staged` event of a version (its content and the command that staged it). */
+export function findStagedEvent(events: readonly DomainEvent[], version: number, hash: string): Extract<DomainEvent, { type: 'definition.staged' }> | undefined {
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index];
-    if (event?.type === 'definition.staged' && event.data.version === version && event.data.hash === hash) return event.data.definition;
+    if (event?.type === 'definition.staged' && event.data.version === version && event.data.hash === hash) return event;
   }
   return undefined;
 }

@@ -294,43 +294,69 @@ function definitionTarget(payload: { kind: DefinitionKind; id: string }) {
   return { definition: definitionAggregate, aggregateId: definitionAggregateId(payload.kind, payload.id) };
 }
 
+type DefinitionKey = { kind: DefinitionKind; id: string; version: number; hash: string };
+
+/**
+ * Whether a staged version may become active: staged with this hash, its file in place with that hash (re-read,
+ * whoever asks), and for a template every node type it uses active or activated in the same commit (`together`).
+ */
+async function activationCheck(ctx: HandlerContext, payload: DefinitionKey, state: DefinitionState, together: ReadonlySet<string>): Promise<Failure | 'active' | 'ready'> {
+  const version = Object.hasOwn(state.versions, payload.version) ? state.versions[payload.version] : undefined;
+  if (version === undefined || version.hash !== payload.hash) return fail('not_found', `${payload.kind} ${payload.id}@${payload.version} with this hash was never staged`);
+  if (version.status === 'active') return 'active';
+  if (version.status === 'abandoned') return fail('invariant_violated', `${payload.kind} ${payload.id}@${payload.version} was abandoned`);
+  const fileHash = await ctx.definitions?.fileHash(payload.kind, payload.id, payload.version);
+  if (fileHash !== payload.hash) {
+    return fail('invariant_violated', `the file of ${payload.kind} ${payload.id}@${payload.version} does not match the staged hash`, { fileHash: fileHash ?? null });
+  }
+  // A template becomes usable only with its node types: one that could not be written keeps the template unusable.
+  if (payload.kind === 'template' && ctx.definitions !== undefined) {
+    const file = await ctx.definitions.readFile('template', payload.id, payload.version);
+    if (file.kind === 'template') {
+      for (const node of file.content.nodes) {
+        const key = nodeTypeKey(node.type, node.version);
+        if (together.has(key)) continue;
+        const type = await ctx.definitions.nodeType(node.type, node.version).catch(() => undefined);
+        if (type === undefined) return fail('invariant_violated', `template ${payload.id}@${payload.version} needs node type ${key}, which is not active`);
+      }
+    }
+  }
+  return 'ready';
+}
+
+const activated = (payload: DefinitionKey): NewEvent => ({ type: 'definition.activated', data: { kind: payload.kind, id: payload.id, version: payload.version, hash: payload.hash } });
+
 export const definitionActivate: CommandHandler<'definition.activate', DefinitionState> = {
   target: definitionTarget,
   scope: () => ({}),
   decide: async (ctx, payload, target) => {
     if (target === undefined) throw new Error('definition target not loaded');
-    const version = Object.hasOwn(target.state.versions, payload.version) ? target.state.versions[payload.version] : undefined;
-    if (version === undefined || version.hash !== payload.hash) return fail('not_found', `${payload.kind} ${payload.id}@${payload.version} with this hash was never staged`);
-    if (version.status === 'active') return { ok: true, appends: [], result: {} };
-    if (version.status === 'abandoned') return fail('invariant_violated', `${payload.kind} ${payload.id}@${payload.version} was abandoned`);
-    // Defense in depth: activation always re-reads the file, whoever asks.
-    const fileHash = await ctx.definitions?.fileHash(payload.kind, payload.id, payload.version);
-    if (fileHash !== payload.hash) {
-      return fail('invariant_violated', `the file of ${payload.kind} ${payload.id}@${payload.version} does not match the staged hash`, { fileHash: fileHash ?? null });
+    const check = await activationCheck(ctx, payload, target.state, new Set());
+    if (check === 'active') return { ok: true, appends: [], result: {} };
+    if (check !== 'ready') return check;
+    return { ok: true, appends: [{ aggregateType: 'definition', aggregateId: target.aggregateId, expectedRevision: target.revision, events: [activated(payload)] }], result: {} };
+  },
+};
+
+/** `definition.activateMany`: every version of one save or import, in one commit, or none. */
+export const definitionActivateMany: CommandHandler<'definition.activateMany', DefinitionState> = {
+  scope: () => ({}),
+  decide: async (ctx, payload) => {
+    const together = new Set(payload.items.filter((item) => item.kind === 'nodeType').map((item) => nodeTypeKey(item.id, item.version)));
+    const streams = new Map<string, { loaded: Loaded<DefinitionState>; events: NewEvent[] }>();
+    for (const item of payload.items) {
+      const aggregateId = definitionAggregateId(item.kind, item.id);
+      const entry = streams.get(aggregateId) ?? { loaded: await ctx.load(definitionAggregate, aggregateId), events: [] };
+      streams.set(aggregateId, entry);
+      const check = await activationCheck(ctx, item, entry.loaded.state, together);
+      if (check === 'active') continue;
+      if (check !== 'ready') return check;
+      entry.events.push(activated(item));
     }
-    // A template staged with the node types of its import becomes usable only once they are: if one of them could
-    // not be written, the template is abandoned too instead of becoming an active template nobody can run.
-    if (payload.kind === 'template' && ctx.definitions !== undefined) {
-      const file = await ctx.definitions.readFile('template', payload.id, payload.version);
-      if (file.kind === 'template') {
-        for (const node of file.content.nodes) {
-          const type = await ctx.definitions.nodeType(node.type, node.version).catch(() => undefined);
-          if (type === undefined) return fail('invariant_violated', `template ${payload.id}@${payload.version} needs node type ${nodeTypeKey(node.type, node.version)}, which is not active`);
-        }
-      }
-    }
-    return {
-      ok: true,
-      appends: [
-        {
-          aggregateType: 'definition',
-          aggregateId: target.aggregateId,
-          expectedRevision: target.revision,
-          events: [{ type: 'definition.activated', data: { kind: payload.kind, id: payload.id, version: payload.version, hash: payload.hash } }],
-        },
-      ],
-      result: {},
-    };
+    const appends: StreamAppend[] = [...streams.entries()]
+      .filter(([, entry]) => entry.events.length > 0)
+      .map(([aggregateId, entry]) => ({ aggregateType: 'definition', aggregateId, expectedRevision: entry.loaded.revision, events: entry.events }));
+    return { ok: true, appends, result: {} };
   },
 };
 

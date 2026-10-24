@@ -263,6 +263,11 @@ describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
     expect(first.more).toBe(true);
     const second = await ui.request<RunEventsResult>(RPC_METHODS.runEvents, { runId, after: first.cursor, limit: 100 });
     expect([...first.entries, ...second.entries].map((entry) => entry.revision)).toEqual(all.entries.map((entry) => entry.revision));
+    // The last events of a long run, where a screen starts; revisions number the pages.
+    const tail = await ui.request<RunEventsResult>(RPC_METHODS.runEvents, { runId, tail: 3 });
+    expect(tail.entries.map((entry) => entry.revision)).toEqual(all.entries.slice(-3).map((entry) => entry.revision));
+    expect(tail.lastRevision).toBe(all.entries.at(-1)?.revision);
+    expect(all.entries.map((entry) => entry.revision)).toEqual(Array.from({ length: all.entries.length }, (_, index) => index + 1));
     // One entry in full.
     const full = await ui.request<RunEventsResult>(RPC_METHODS.runEvents, { runId, after: (all.entries[4]?.revision ?? 1) - 1, limit: 1, textLimit: 1_048_576 });
     expect((full.entries[0] as { output: { text: string } }).output.text).toBe(long);

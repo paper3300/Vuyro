@@ -10,7 +10,8 @@ import type { TransportIdentity } from '../commands/caller.ts';
 import type { ActivityTracker } from '../runtime/activity.ts';
 import type { FileSystem } from '../runtime/fs.ts';
 import type { EventStore } from '../store/event-store.ts';
-import { type DefinitionRegistry, definitionAggregate, definitionHash, definitionPath, findStaged } from './definitions.ts';
+import { sha256Hex } from '../commands/fingerprint.ts';
+import { type DefinitionRegistry, definitionAggregate, definitionHash, definitionPath, findStagedEvent } from './definitions.ts';
 
 export interface DefinitionWriterOptions {
   readonly registry: DefinitionRegistry;
@@ -33,6 +34,8 @@ export interface ScanReport {
 }
 
 interface Staged {
+  /** The command that staged it: one save, or every definition of one import. */
+  readonly requestId?: string;
   readonly kind: DefinitionKind;
   readonly id: string;
   readonly version: number;
@@ -44,9 +47,11 @@ const SYSTEM: TransportIdentity = { kind: 'internal', component: 'definitions' }
 const TEMP_SUFFIX = '.tmp';
 
 /**
- * Writes staged definitions to their files and activates them, in that order:
- * temporary file → rename over the target → read back and compare the hash → `definition.activate`.
- * A failure abandons the version (`definition.abandon`) so the caller can save again.
+ * Writes staged definitions to their files and activates them, one command's definitions at a time and in two
+ * steps (M6b re-review): first every file (temporary file → rename over the target → read back and compare the hash),
+ * then one activation for all of them (`definition.activate` / `definition.activateMany`, a single commit). If any
+ * file cannot be written or the activation is refused, every version of that command is abandoned and the files it
+ * wrote are removed, so an import never leaves part of itself usable.
  */
 export class DefinitionWriter {
   private readonly options: DefinitionWriterOptions;
@@ -61,9 +66,8 @@ export class DefinitionWriter {
   /** Reacts to `definition.staged` events from now on. */
   start(): void {
     this.unsubscribe ??= this.options.store.subscribe((events) => {
-      for (const event of events) {
-        if (event.type === 'definition.staged') this.enqueue(stagedFrom(event));
-      }
+      const staged = events.filter((event): event is Extract<DomainEvent, { type: 'definition.staged' }> => event.type === 'definition.staged').map(stagedFrom);
+      for (const group of byRequest(staged)) this.enqueue(group);
     });
   }
 
@@ -112,17 +116,21 @@ export class DefinitionWriter {
   async recover(): Promise<{ activated: string[]; abandoned: string[] }> {
     const activated: string[] = [];
     const abandoned: string[] = [];
+    const staged: Staged[] = [];
     for (const row of await this.options.registry.rows('staged')) {
       const events = await this.options.store.readAggregate(definitionAggregate(row.kind, row.id));
-      const definition = findStaged(events, row.version, row.hash);
-      const label = `${row.kind} ${row.id}@${row.version}`;
-      if (definition === undefined) {
+      const event = findStagedEvent(events, row.version, row.hash);
+      if (event === undefined) {
         await this.abandon(row, 'staged content not found in the log');
-        abandoned.push(label);
+        abandoned.push(`${row.kind} ${row.id}@${String(row.version)}`);
         continue;
       }
-      const ok = await this.materialize({ ...row, definition });
-      (ok ? activated : abandoned).push(label);
+      staged.push(stagedFrom(event));
+    }
+    // Versions an import staged together are finished together, as when the engine had not stopped.
+    for (const group of byRequest(staged)) {
+      const ok = await this.materialize(group);
+      for (const each of group) (ok ? activated : abandoned).push(`${each.kind} ${each.id}@${String(each.version)}`);
     }
     return { activated, abandoned };
   }
@@ -160,52 +168,58 @@ export class DefinitionWriter {
     return { untracked, modified, missing, removedTemp };
   }
 
-  private enqueue(staged: Staged): void {
+  private enqueue(group: readonly Staged[]): void {
     const done = this.options.activity?.begin();
     this.chain = this.chain
-      .then(() => this.materialize(staged))
+      .then(() => this.materialize(group))
       .then(
         () => undefined,
         (error: unknown) => {
-          this.report(error, `materializing ${staged.kind} ${staged.id}@${staged.version}`);
+          this.report(error, `materializing ${group.map((each) => `${each.kind} ${each.id}@${String(each.version)}`).join(', ')}`);
         },
       )
       .finally(() => done?.());
   }
 
-  private async materialize(staged: Staged): Promise<boolean> {
+  /** Writes every file of the group, then activates them all in one command; on any failure abandons them all. */
+  private async materialize(group: readonly Staged[]): Promise<boolean> {
     const { registry, fs } = this.options;
-    const path = definitionPath(registry.root, staged.kind, staged.id, staged.version);
-    const current = await registry.fileHash(staged.kind, staged.id, staged.version);
-    if (current !== staged.hash) {
+    const written: string[] = [];
+    for (const staged of group) {
+      const path = definitionPath(registry.root, staged.kind, staged.id, staged.version);
+      const current = await registry.fileHash(staged.kind, staged.id, staged.version);
+      if (current === staged.hash) continue;
       const temp = `${path}${TEMP_SUFFIX}`;
       try {
         await fs.mkdir(dirname(path), { recursive: true });
         await fs.writeFile(temp, `${JSON.stringify(staged.definition, null, 2)}\n`);
         await fs.rename(temp, path);
+        written.push(path);
       } catch (error) {
         await fs.rm(temp, { force: true }).catch(() => undefined);
-        return this.fail(staged, `write failed: ${(error as Error).message}`);
+        return this.fail(group, written, `write failed for ${staged.kind} ${staged.id}@${String(staged.version)}: ${(error as Error).message}`);
       }
-      const written = await registry.fileHash(staged.kind, staged.id, staged.version);
-      if (written !== staged.hash) return this.fail(staged, `file hash ${written ?? 'unreadable'} does not match ${staged.hash}`);
+      const check = await registry.fileHash(staged.kind, staged.id, staged.version);
+      if (check !== staged.hash) return this.fail(group, written, `file hash of ${staged.kind} ${staged.id}@${String(staged.version)} is ${check ?? 'unreadable'}, not ${staged.hash}`);
     }
-    const response = await this.options.bus.execute(
-      {
-        requestId: `def-activate-${staged.hash.slice(7, 39)}-${staged.version}`,
-        type: 'definition.activate',
-        payload: { kind: staged.kind, id: staged.id, version: staged.version, hash: staged.hash },
-      },
-      SYSTEM,
-    );
-    if (!response.ok) return this.fail(staged, `activation refused: ${response.error.message}`);
-    this.settle(staged.hash, { ok: true });
+    const keys = group.map((staged) => ({ kind: staged.kind, id: staged.id, version: staged.version, hash: staged.hash }));
+    const [only] = keys;
+    const response =
+      keys.length === 1 && only !== undefined
+        ? await this.options.bus.execute({ requestId: `def-activate-${only.hash.slice(7, 39)}-${String(only.version)}`, type: 'definition.activate', payload: only }, SYSTEM)
+        : await this.options.bus.execute(
+            { requestId: `def-activate-many-${sha256Hex(keys.map((key) => `${key.hash}@${String(key.version)}`).join(',')).slice(0, 40)}`, type: 'definition.activateMany', payload: { items: keys } },
+            SYSTEM,
+          );
+    if (!response.ok) return this.fail(group, written, `activation refused: ${response.error.message}`);
+    for (const staged of group) this.settle(staged.hash, { ok: true });
     return true;
   }
 
-  private async fail(staged: Staged, reason: string): Promise<false> {
-    await this.abandon(staged, reason);
-    this.settle(staged.hash, { ok: false, reason });
+  private async fail(group: readonly Staged[], written: readonly string[], reason: string): Promise<false> {
+    for (const path of written) await this.options.fs.rm(path, { force: true }).catch(() => undefined);
+    for (const staged of group) await this.abandon(staged, reason);
+    for (const staged of group) this.settle(staged.hash, { ok: false, reason });
     return false;
   }
 
@@ -251,7 +265,17 @@ export class DefinitionWriter {
 
 function stagedFrom(event: Extract<DomainEvent, { type: 'definition.staged' }>): Staged {
   const { kind, id, version, hash, definition } = event.data;
-  return { kind, id, version, hash, definition };
+  return { ...(event.requestId === undefined ? {} : { requestId: event.requestId }), kind, id, version, hash, definition };
+}
+
+/** Staged versions grouped by the command that staged them (node types first in each group), in order. */
+function byRequest(staged: readonly Staged[]): Staged[][] {
+  const groups = new Map<string, Staged[]>();
+  staged.forEach((each, index) => {
+    const key = each.requestId ?? `#${String(index)}`;
+    groups.set(key, [...(groups.get(key) ?? []), each]);
+  });
+  return [...groups.values()].map((group) => [...group.filter((each) => each.kind === 'nodeType'), ...group.filter((each) => each.kind === 'template')]);
 }
 
 async function walk(fs: FileSystem, dir: string): Promise<string[]> {
