@@ -28,6 +28,7 @@ import {
   UnsubscribeParamsSchema,
   WorkspaceQuerySchema,
   WorktreeCleanupQuerySchema,
+  SharedNodesQuerySchema,
 } from '@vuyro/contracts';
 import type { CommandBus } from '../commands/command-bus.ts';
 import type { TransportIdentity } from '../commands/caller.ts';
@@ -291,6 +292,10 @@ export class RpcConnection {
       case RPC_METHODS.workspace: {
         const query = this.params(WorkspaceQuerySchema, params);
         return queries.workspace(query.projectId, { ...(query.ticketId === undefined ? {} : { ticketId: query.ticketId }), changes: query.changes ?? 'flagged', limit: query.limit ?? 200 });
+      }
+      case RPC_METHODS.sharedNodes: {
+        const query = this.params(SharedNodesQuerySchema, params);
+        return { sharedNodes: await queries.sharedNodes(query.projectId, query.name) };
       }
       case RPC_METHODS.worktreeCleanup: {
         const query = this.params(WorktreeCleanupQuerySchema, params);

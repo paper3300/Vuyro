@@ -214,6 +214,7 @@ export async function startEngineDaemon(options: EngineDaemonOptions = {}): Prom
       workspaces,
       ...(options.git === undefined ? {} : { git: options.git }),
       ...(watcher === null ? {} : { watcher }),
+      sharedLogs: { dir: paths.sharedLogs, fs },
     });
     await engine.start();
 

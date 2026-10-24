@@ -1,5 +1,6 @@
-import type { DomainEvent, PinnedTemplate, TicketStats, WorktreeCleanupCandidate } from '@vuyro/contracts';
+import type { DomainEvent, PinnedTemplate, SharedNodeView, TicketStats, WorktreeCleanupCandidate } from '@vuyro/contracts';
 import type { Clock } from '../runtime/clock.ts';
+import { currentDefinition, EMPTY_SHARED_NODE, evolveSharedNode, runningBatches } from '../shared/state.ts';
 import { computeTicketStats, type NodeKind } from '../stats/ticket-stats.ts';
 import type { EventStore } from '../store/event-store.ts';
 import type { DefinitionResolver } from '../workflow/definitions.ts';
@@ -110,6 +111,56 @@ export class EngineQueries {
     this.definitions = options.definitions;
     this.clock = options.clock;
     this.cleanup = options.cleanup;
+  }
+
+  /**
+   * A project's shared nodes (M5): definition, status, queue (in order), running and recent batches. Folded from each
+   * shared node's events, like the engine does.
+   */
+  async sharedNodes(projectId: string, name?: string): Promise<SharedNodeView[]> {
+    const rows = await this.store.query<{ aggregate_id: string }>(
+      `SELECT aggregate_id FROM p_shared_nodes WHERE project_id = ?${name === undefined ? '' : ' AND name = ?'} ORDER BY name`,
+      name === undefined ? [projectId] : [projectId, name],
+    );
+    const views: SharedNodeView[] = [];
+    for (const { aggregate_id: id } of rows) {
+      let state = EMPTY_SHARED_NODE;
+      for (const event of await this.store.readAggregate(id)) state = evolveSharedNode(state, event);
+      const definition = currentDefinition(state);
+      if (!state.exists || definition === undefined) continue;
+      const running = runningBatches(state);
+      const member = (entry: { ticketId: string; nodeId: string; lane: string; run: number }) => ({ ticketId: entry.ticketId, nodeId: entry.nodeId, lane: entry.lane, run: entry.run });
+      views.push({
+        projectId: state.projectId,
+        name: state.name,
+        label: definition.spec.label,
+        version: state.version,
+        spec: definition.spec,
+        status: state.blocked !== undefined ? 'blocked' : running.length > 0 ? 'running' : state.waiting !== undefined ? 'waiting' : 'idle',
+        ...(state.blocked === undefined ? {} : { blocked: { reason: state.blocked.reason, batch: state.blocked.batch, by: state.blocked.by.map(member) } }),
+        queue: state.queue.map((entry, index) => ({ ...member(entry), position: index + 1, queuedAt: entry.at, retry: entry.retry === true })),
+        running: running.map((batch) => ({
+          batch: batch.batch,
+          batchId: batch.batchId,
+          trigger: batch.trigger,
+          members: batch.members.map(member),
+          startedAt: batch.startedAt ?? 0,
+        })),
+        recent: [...state.recent].reverse().map((batch) => ({
+          batch: batch.batch,
+          batchId: batch.batchId,
+          trigger: batch.trigger,
+          members: batch.members.map(member),
+          startedAt: batch.startedAt ?? 0,
+          ...(batch.finishedAt === undefined ? {} : { finishedAt: batch.finishedAt }),
+          outcome: batch.outcome,
+          ...(batch.policy === undefined ? {} : { policy: batch.policy }),
+          failed: batch.failed.map((entry) => entry.ticketId),
+          ...(batch.errorFiles === undefined ? {} : { errorFiles: batch.errorFiles }),
+        })),
+      });
+    }
+    return views;
   }
 
   /** Worktrees a person may clean up, with what each still holds (ignored files included) and its fingerprint. */

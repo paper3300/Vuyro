@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { type ArtifactRef, type CommandResponse, type CommandType, type DomainEvent, type ExpressionContext, resolveTemplateValue } from '@vuyro/contracts';
 import { projectAggregate, type ProjectState } from '../commands/aggregates.ts';
@@ -75,7 +75,7 @@ export class SharedNodeScheduler {
         const state = await this.state(id);
         for (const batch of runningBatches(state)) {
           if (this.live.has(batchKey(id, batch.batch))) continue;
-          await this.command('finish', 'sharedNode.finish', { projectId: state.projectId, name: state.name, batch: batch.batch, result: { kind: 'interrupted', reason: 'the engine restarted while the batch ran' } }, id, batch.batch);
+          await this.command('recover', 'sharedNode.finish', { projectId: state.projectId, name: state.name, batch: batch.batch, result: { kind: 'interrupted', reason: 'the engine restarted while the batch ran' } }, id, batch.batch);
         }
       }
     });
@@ -103,22 +103,30 @@ export class SharedNodeScheduler {
 
   onEvents(events: readonly DomainEvent[]): void {
     if (this.stopped) return;
-    const projects = new Set<string>();
+    const released = new Set<string>();
+    const resumed = new Set<string>();
     for (const event of events) {
       if (event.aggregateType === 'shared') this.touch(event.aggregateId);
       // Released paths may be what a waiting batch needs.
-      else if (event.type === 'checkout.released') projects.add(event.data.projectId);
+      else if (event.type === 'checkout.released') released.add(event.data.projectId);
+      // A paused request that goes on keeps its place in the queue: it may complete a batch.
+      else if (event.type === 'node.resumed') resumed.add(event.aggregateId);
     }
-    if (projects.size > 0) {
-      this.enqueue(async () => {
-        for (const projectId of projects) {
-          const rows = await this.options.store.query<{ aggregate_id: string }>('SELECT aggregate_id FROM p_shared_nodes WHERE project_id = ?', [projectId]);
-          for (const { aggregate_id: id } of rows) {
-            if ((await this.state(id)).waiting !== undefined) this.touch(id);
-          }
+    if (released.size === 0 && resumed.size === 0) return;
+    this.enqueue(async () => {
+      const projects = new Map<string, (state: SharedNodeState) => boolean>();
+      for (const projectId of released) projects.set(projectId, (state) => state.waiting !== undefined);
+      for (const ticketId of resumed) {
+        const row = await this.options.store.queryOne<{ project_id: string }>('SELECT project_id FROM p_tickets WHERE ticket_id = ?', [ticketId]);
+        if (row !== undefined && !projects.has(row.project_id)) projects.set(row.project_id, (state) => state.queue.some((entry) => entry.ticketId === ticketId));
+      }
+      for (const [projectId, wanted] of projects) {
+        const rows = await this.options.store.query<{ aggregate_id: string }>('SELECT aggregate_id FROM p_shared_nodes WHERE project_id = ?', [projectId]);
+        for (const { aggregate_id: id } of rows) {
+          if (wanted(await this.state(id))) this.touch(id);
         }
-      });
-    }
+      }
+    });
   }
 
   private touch(id: string): void {
@@ -170,9 +178,10 @@ export class SharedNodeScheduler {
     const definition = Object.hasOwn(state.definitions, state.version) ? state.definitions[state.version] : undefined;
     if (state.blocked !== undefined || state.queue.length === 0 || definition === undefined) return;
     if (runningBatches(state).length >= definition.spec.maxConcurrent) return;
-    const revision = this.cache.get(id)?.revision ?? 0;
-    // The clock is part of the id: a `window` trigger asked again later is a new question.
-    const response = await this.command('start', 'sharedNode.start', { projectId: state.projectId, name: state.name }, id, revision, this.options.clock.now());
+    // Every attempt is a new question (its answer depends on the tickets, the ledger and the clock, not only on this
+    // aggregate), so it never gets an earlier "not yet" back. A start the engine resends after a crash is decided again
+    // from the state, which already holds the batch it started.
+    const response = await this.command('start', 'sharedNode.start', { projectId: state.projectId, name: state.name }, id, randomUUID());
     if (!response.ok) return;
     const result = response.result as { started: boolean; nextCheckAt?: number };
     // (A timer that fires after `stop` does nothing: `touch` checks.)

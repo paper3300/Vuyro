@@ -109,9 +109,40 @@ export function edits(file: string, text = 'changed'): DevStep {
   };
 }
 
+/** task (person) → build (request) → end: the request queues as soon as the person finishes the task. */
+export async function saveQuickFlow(h: WorkflowHarness, sharedNode = 'build', id = 'myteam/quick-flow'): Promise<void> {
+  await save(
+    h,
+    template(
+      id,
+      [
+        { id: 'task', type: 'vuyro.human-task', version: 1 },
+        { id: 'build', type: 'vuyro.shared-request', version: 1, params: { sharedNode } },
+        { id: 'end', type: 'vuyro.end', version: 1 },
+      ],
+      [edge('task', 'done', 'build'), edge('build', 'done', 'end')],
+    ),
+  );
+}
+
+/** Runs the engine until the virtual clock reaches `until` (timers due later stay pending). */
+export async function driveUntil(h: WorkflowHarness, until: number): Promise<void> {
+  for (let step = 0; step < 10_000; step++) {
+    await h.activity.idle();
+    const next = h.clock.nextDueAt();
+    if (next === undefined || next > until) {
+      if (h.clock.now() < until) await h.clock.advanceTo(until);
+      await h.activity.idle();
+      return;
+    }
+    await h.clock.advanceTo(next);
+  }
+  throw new Error('driveUntil: too many steps');
+}
+
 /** Creates a ticket of the build flow and finishes its person task, so its dev starts. */
-export async function startTicket(h: WorkflowHarness, projectId: string, title: string, extra: Record<string, unknown> = {}): Promise<string> {
-  const { ticketId } = (await h.ok('ticket.create', { projectId, title, template: { id: 'myteam/build-flow' }, ...extra })).result as { ticketId: string };
+export async function startTicket(h: WorkflowHarness, projectId: string, title: string, extra: Record<string, unknown> = {}, templateId = 'myteam/build-flow'): Promise<string> {
+  const { ticketId } = (await h.ok('ticket.create', { projectId, title, template: { id: templateId }, ...extra })).result as { ticketId: string };
   await h.ok('node.done', { ticketId, nodeId: 'task', port: 'done', data: { what: title } });
   return ticketId;
 }

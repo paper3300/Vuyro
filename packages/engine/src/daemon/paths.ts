@@ -11,6 +11,8 @@ export interface EnginePaths {
   readonly lock: string;
   readonly definitions: string;
   readonly log: string;
+  /** Output of shared nodes' batches (`<project>/<name>/<batchId>.log`), linked to every ticket of the batch. */
+  readonly sharedLogs: string;
   /** Git worktrees the engine makes in worktree mode. Short on purpose: Windows paths have a length limit. */
   readonly worktrees: string;
 }
@@ -30,6 +32,7 @@ export function enginePaths(dataDir: string): EnginePaths {
     lock: join(root, 'engine', 'engine.lock'),
     definitions: join(root, 'definitions'),
     log: join(root, 'logs', 'engine.log'),
+    sharedLogs: join(root, 'logs', 'shared'),
     worktrees: join(root, 'wt'),
   };
 }

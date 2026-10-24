@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { workspaceAggregateId } from '@vuyro/contracts';
+import { EngineQueries } from '../src/daemon/queries.ts';
 import { evolveLedger, EMPTY_LEDGER } from '../src/workspace/ledger.ts';
 import { currentExecution } from '../src/workflow/state.ts';
 import {
@@ -130,6 +131,14 @@ describe('shared node: three tickets, one build, blame and rebuild', { timeout: 
     // A's and C's build requests ran twice without failing; B's failed once.
     expect(currentExecution(await h.ticket(tickets.A ?? ''), 'build', 'main')?.run).toBe(1);
     expect(currentExecution(await h.ticket(tickets.B ?? ''), 'build', 'main')?.run).toBe(2);
-    expect(MINUTE).toBeGreaterThan(0);
+
+    // What screens and `vuyro shared show` read.
+    const [view] = await new EngineQueries({ store: h.store, definitions: h.registry, clock: h.clock }).sharedNodes(projectId);
+    expect(view).toMatchObject({ name: 'build', label: 'Build station', version: 1, status: 'idle', queue: [], running: [] });
+    expect(view?.recent.map((batch) => [batch.batchId, batch.outcome, batch.policy, batch.failed])).toEqual([
+      ['build-2', 'succeeded', undefined, []],
+      ['build-1', 'failed', 'blame', [tickets.B]],
+    ]);
+    expect((view?.recent[1]?.finishedAt ?? 0) - (view?.recent[1]?.startedAt ?? 0)).toBe(5 * MINUTE);
   });
 });

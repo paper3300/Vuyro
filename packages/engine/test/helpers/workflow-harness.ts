@@ -38,6 +38,8 @@ export interface WorkflowHarnessOptions {
   readonly watcher?: FileWatcher;
   /** The user's Codex folder the engine checks for hooks. Default: an empty folder name under the harness's temp dir. */
   readonly codexHome?: string;
+  /** Where shared nodes write batch logs (M5). Default: not written. */
+  readonly sharedLogs?: WorkflowEngineOptions['sharedLogs'];
 }
 
 export interface WorkflowHarness {
@@ -113,6 +115,7 @@ export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}):
           ...(options.agentEnv === undefined ? {} : { agentEnv: options.agentEnv }),
           ...(options.git === undefined ? {} : { git: options.git }),
           ...(options.watcher === undefined ? {} : { watcher: options.watcher }),
+          ...(options.sharedLogs === undefined ? {} : { sharedLogs: options.sharedLogs }),
           // Never the developer's own Codex folder: its hooks.json would turn the Codex checkout hook off.
           codexHome: options.codexHome ?? join(temp.dir, 'codex-home'),
           workspaces,

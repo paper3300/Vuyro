@@ -89,7 +89,28 @@ describe('vuyro command envelopes', () => {
     expect(engine.sent[0]?.envelope).toMatchObject({ type: 'ticket.create', payload: { projectId: 'P', title: 'Notepad', template: { id: 'vuyro/ai-sdlc', version: 1 } } });
   });
 
+  it('shared define takes a spec or its export envelope; run and unblock name the shared node (M5)', async () => {
+    const spec = { name: 'build', label: 'Build', node: { type: 'vuyro.script', version: 1 }, batchTrigger: { count: 3 }, maxConcurrent: 1, onBatchFailure: 'blame' };
+    writeFileSync(join(dir, 'shared.json'), JSON.stringify({ vuyro: 'export', formatVersion: 1, kind: 'sharedNode', id: 'build', version: 1, name: 'Build', content: spec }));
+    const engine = fakeEngine();
+    const human = { env: { VUYRO_HUMAN_CREDENTIAL: 'vhc_secret' }, cwd: dir, connect: engine.connect };
+    expect(await runCli(['shared', 'define', '--project', 'P', '@shared.json', '--json'], io(), human)).toBe(0);
+    expect(await runCli(['shared', 'define', '--project', 'P', JSON.stringify(spec), '--json'], io(), human)).toBe(0);
+    await runCli(['shared', 'run', 'build', '--project', 'P', '--json'], io(), human);
+    await runCli(['shared', 'unblock', 'build', '--project', 'P', '--json'], io(), human);
+    expect(engine.sent.map((entry) => [entry.envelope.type, entry.envelope.payload])).toEqual([
+      ['sharedNode.define', { projectId: 'P', spec }],
+      ['sharedNode.define', { projectId: 'P', spec }],
+      ['sharedNode.run', { projectId: 'P', name: 'build' }],
+      ['sharedNode.unblock', { projectId: 'P', name: 'build' }],
+    ]);
+    await runCli(['shared', 'show', '--project', 'P', 'build', '--json'], io(), human);
+    expect(engine.requests.at(-1)?.method).toBe('query.sharedNodes');
+  });
+
   it.each([
+    [['shared', 'run', '--project', 'P'], "give the shared node's name"],
+    [['shared', 'other'], "expected 'define', 'show', 'run' or 'unblock'"],
     [['node', 'done', '--port', 'done'], '--ticket is required'],
     [['node', 'done', '--ticket', 'T', '--node', 'n', '--port', 'done', '--data', '{bad'], 'not valid JSON'],
     [['artifact', 'add', 'slot', '--ticket', 'T', '--node', 'n', '--kind', 'file'], '--uri is required'],

@@ -70,6 +70,10 @@ Workspace (Vuyro's own checkout ledger; nothing is locked in git or Perforce)
   workspace show --project <id> [--ticket <id>] [--all]   Held entries, refusals, flagged changes, worktrees
   workspace cleanup --project <id> [--ticket <id>]        Worktrees left for you, with everything they still hold
   workspace cleanup --project <id> --remove <key> --fingerprint <fp> [--no-wait]   Remove one exactly as it was shown
+  shared define --project <id> <json|@file>   Define a shared node (its spec, or a 'sharedNode' export envelope)
+  shared show --project <id> [<name>]         Shared nodes: status, queue, running and recent batches
+  shared run <name> --project <id>            Start a batch now with what is queued (a person)
+  shared unblock <name> --project <id>        Let a blocked shared node start batches again (a person)
   hook pretooluse [--provider claude|codex]   The automatic checkout hook (run by the agent CLI)
   mcp                          Serve the node agent's report tools over stdio MCP (started by the agent CLI)
   events [--after <sequence>] [--follow]
@@ -141,6 +145,8 @@ export async function runCli(argv: readonly string[], io: CliIo, options: CliOpt
         return await checkoutCommand(ctx, sub);
       case 'workspace':
         return await workspaceCommand(ctx, sub);
+      case 'shared':
+        return await sharedCommand(ctx, sub);
       case 'hook':
         return await hookCommand(ctx, sub);
       case 'mcp':
@@ -546,6 +552,74 @@ async function definitionCommand(ctx: Context, sub: string | undefined): Promise
   const result = (await execute(ctx, type, { definition })) as { id: string; version: number; status: string };
   print(ctx, result, () => [`${result.id}@${result.version}: ${result.status}`]);
   return EXIT.ok;
+}
+
+interface SharedView {
+  name: string;
+  label: string;
+  status: string;
+  blocked?: { reason: string; batch: number; by: { ticketId: string }[] };
+  queue: { ticketId: string; nodeId: string; position: number; retry: boolean }[];
+  running: { batchId: string; members: { ticketId: string }[] }[];
+  recent: { batchId: string; outcome?: string; policy?: string; failed?: string[]; errorFiles?: string[] }[];
+}
+
+/** `vuyro shared`: shared nodes of a project (M5), their queue and batches. */
+async function sharedCommand(ctx: Context, sub: string | undefined): Promise<number> {
+  const name = ctx.args.positionals[2];
+  switch (sub) {
+    case 'define': {
+      onlyFlags(ctx.args, ['project']);
+      const projectId = requireFlag(ctx.args, 'project');
+      if (name === undefined || name === '') throw new UsageError('shared define: give the spec as JSON or @file');
+      const text = name.startsWith('@') ? readFileSync(resolve(ctx.cwd, name.slice(1)), 'utf8') : name;
+      let parsed: { kind?: unknown; content?: unknown };
+      try {
+        parsed = JSON.parse(text) as { kind?: unknown; content?: unknown };
+      } catch (error) {
+        throw new UsageError(`shared define: not valid JSON (${(error as Error).message})`);
+      }
+      // The export envelope of a shared node carries the spec as its content.
+      const spec = parsed.kind === 'sharedNode' ? parsed.content : parsed;
+      const result = (await execute(ctx, 'sharedNode.define', { projectId, spec })) as { name: string; version: number; warnings: string[] };
+      print(ctx, result, () => [`${result.name}: version ${result.version}`, ...result.warnings.map((warning) => `  warning: ${warning}`)]);
+      return EXIT.ok;
+    }
+    case 'show': {
+      onlyFlags(ctx.args, ['project']);
+      const projectId = requireFlag(ctx.args, 'project');
+      const { sharedNodes } = await withClient(ctx, (client) =>
+        client.request<{ sharedNodes: SharedView[] }>(RPC_METHODS.sharedNodes, { projectId, ...(name === undefined ? {} : { name }) }),
+      );
+      print(ctx, { sharedNodes }, () =>
+        sharedNodes.length === 0
+          ? ['No shared nodes.']
+          : sharedNodes.flatMap((node) => [
+              `${node.name} (${node.label}): ${node.status}${node.blocked === undefined ? '' : ` — ${node.blocked.reason} by ${node.blocked.by.map((entry) => entry.ticketId).join(', ') || 'an interrupted batch'} (batch ${node.blocked.batch})`}`,
+              ...node.running.map((batch) => `  running ${batch.batchId}: ${batch.members.map((member) => member.ticketId).join(', ')}`),
+              ...node.queue.map((entry) => `  ${entry.position}. ${entry.ticketId} ${entry.nodeId}${entry.retry ? ' (again)' : ''}`),
+              ...node.recent.slice(0, 5).map((batch) => `  ${batch.batchId}: ${batch.outcome ?? '?'}${batch.policy === undefined ? '' : ` (${batch.policy}${(batch.failed ?? []).length === 0 ? '' : `: ${(batch.failed ?? []).join(', ')}`})`}`),
+            ]),
+      );
+      return EXIT.ok;
+    }
+    case 'run':
+    case 'unblock': {
+      onlyFlags(ctx.args, ['project']);
+      const projectId = requireFlag(ctx.args, 'project');
+      if (name === undefined || name === '') throw new UsageError(`shared ${sub}: give the shared node's name`);
+      if (sub === 'run') {
+        const result = (await execute(ctx, 'sharedNode.run', { projectId, name })) as { started: boolean; batch?: number; reason?: string };
+        print(ctx, result, () => [result.started ? `Started batch ${String(result.batch)}.` : `Not started: ${result.reason ?? 'nothing to run'}`]);
+        return result.started ? EXIT.ok : EXIT.refused;
+      }
+      const result = (await execute(ctx, 'sharedNode.unblock', { projectId, name })) as { unblocked: boolean };
+      print(ctx, result, () => [result.unblocked ? 'Unblocked.' : 'It was not blocked.']);
+      return EXIT.ok;
+    }
+    default:
+      throw new UsageError("shared: expected 'define', 'show', 'run' or 'unblock'");
+  }
 }
 
 async function appCommand(ctx: Context, sub: string | undefined): Promise<number> {
