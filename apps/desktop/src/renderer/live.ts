@@ -24,6 +24,8 @@ export function queryKeysFor(events: EventsMessage['events']): string[][] {
       add(['ticketStats', event.aggregateId]);
       add(['artifacts', event.aggregateId]);
       add(['board']);
+      // Request nodes join and leave shared node queues through ticket events.
+      add(['sharedNodes']);
     } else if (aggregateType === 'run') {
       // Run events carry the run id; the stats and boards that count tokens and tool calls change.
       add(['ticketStats']);
@@ -32,6 +34,8 @@ export function queryKeysFor(events: EventsMessage['events']): string[][] {
     } else if (aggregateType === 'project') {
       add(['projects']);
       add(['board']);
+    } else if (aggregateType === 'shared') {
+      add(['sharedNodes']);
     } else if (aggregateType === 'definition') {
       add(['templates']);
       add(['board']);

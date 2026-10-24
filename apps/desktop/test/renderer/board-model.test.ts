@@ -104,6 +104,6 @@ describe('words and numbers', () => {
       { sequence: 2, type: 'project.created', aggregateId: 'p1', aggregateType: 'project', data: {} },
       { sequence: 3, type: 'command.denied', aggregateId: 'a1', aggregateType: 'audit', data: {} },
     ]);
-    expect(keys).toEqual([['ticket', 't1'], ['ticketStats', 't1'], ['artifacts', 't1'], ['board'], ['projects']]);
+    expect(keys).toEqual([['ticket', 't1'], ['ticketStats', 't1'], ['artifacts', 't1'], ['board'], ['sharedNodes'], ['projects']]);
   });
 });

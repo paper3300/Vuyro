@@ -18,6 +18,23 @@ export function isTrustedSender(url: string | undefined): boolean {
   }
 }
 
+/** The frame that sent an IPC message, as Electron describes it (WebFrameMain ids). */
+export interface FrameRef {
+  readonly processId: number;
+  readonly routingId: number;
+  readonly url: string;
+}
+
+/**
+ * The sender must be the window's main frame showing our page: not a sub-frame (the page has none, but an injected
+ * one must not get the bridge) and not a frame that was destroyed or navigated away.
+ */
+export function isTrustedFrame(sender: FrameRef | null | undefined, mainFrame: FrameRef | null | undefined): boolean {
+  if (sender === null || sender === undefined || mainFrame === null || mainFrame === undefined) return false;
+  if (sender.processId !== mainFrame.processId || sender.routingId !== mainFrame.routingId) return false;
+  return isTrustedSender(sender.url);
+}
+
 const refused = (message: string): BridgeError => ({ code: 'bridge_refused', message, retryable: false });
 
 export type CheckedRequest = { readonly ok: true; readonly method: RendererMethod; readonly params: unknown } | { readonly ok: false; readonly error: BridgeError };

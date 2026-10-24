@@ -21,6 +21,8 @@ export class FakeEngine {
   failLaunch: Error | undefined;
   runningJobs = 0;
   shutdowns = 0;
+  /** The next N `events.subscribe` requests fail (the connection stays up). */
+  failSubscriptions = 0;
   private nextCredential = 1;
 
   append(type: string, aggregateId = 'ticket-1', aggregateType = 'ticket'): Event {
@@ -117,6 +119,10 @@ export class FakeLink implements EngineLink {
 
   subscribe(afterSequence: number, onEvents: (events: EventBatch) => void): Promise<{ unsubscribe(): Promise<void> }> {
     if (this.closed) return Promise.reject(new Error('the connection was closed'));
+    if (this.engine.failSubscriptions > 0) {
+      this.engine.failSubscriptions -= 1;
+      return Promise.reject(new Error('subscription refused'));
+    }
     const id = this.nextSubscription++;
     const entry = { last: afterSequence, onEvents };
     this.subscriptions.set(id, entry);

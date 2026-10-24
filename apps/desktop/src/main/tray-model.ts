@@ -50,9 +50,10 @@ export type QuitOutcome = 'cancelled' | 'quit-with-engine' | 'quit-engine-kept';
  */
 export async function quitForGood(deps: QuitDeps): Promise<QuitOutcome> {
   const running = await deps.running();
-  if (running !== undefined && running > 0) {
+  // Not knowing is not "nothing runs": ask then too (검수 반영).
+  if (running === undefined || running > 0) {
     const ok = await deps.confirm({
-      message: `실행 중인 작업 ${running}개가 있습니다. 완전히 종료할까요?`,
+      message: running === undefined ? '실행 중인 작업이 있는지 확인하지 못했습니다. 완전히 종료할까요?' : `실행 중인 작업 ${running}개가 있습니다. 완전히 종료할까요?`,
       detail: '엔진도 함께 멈춥니다. 실행 중이던 에이전트는 취소되고, 다음에 Vuyro를 시작하면 다시 줄을 섭니다.',
     });
     if (!ok) return 'cancelled';

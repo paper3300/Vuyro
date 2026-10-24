@@ -1,12 +1,13 @@
 import { useQueryClient } from '@tanstack/react-query';
 import type { ItemView, NodeStats, ReviewView, TicketStats, WorkflowView } from '@vuyro/contracts';
 import { useEffect, useState } from 'react';
-import { execute } from '../api.ts';
+import { ApiError, execute } from '../api.ts';
 import { stageHint } from '../board-model.ts';
 import { causeLabel, errorText, formatDuration, formatTime, formatTokens, shortId, statusLabel, supersedeLabel } from '../format.ts';
 import { useArtifacts, useTicket, useTicketStats } from '../queries.ts';
 import { useCanWrite, useUi } from '../store.ts';
 import type { ExecutionRow, LaneRow, TicketDetail as Detail, WaitReason } from '../types.ts';
+import { SharedNodes } from './SharedNodes.tsx';
 import { Button, Chip, ErrorNote, JsonBlock, PlainText, statusTone } from './ui.tsx';
 
 /**
@@ -47,6 +48,7 @@ export function TicketDetailView({ ticketId, onClose }: { ticketId: string; onCl
   const detail = useTicket(ticketId);
   const open = detail.data?.ticket.status === 'open';
   const stats = useTicketStats(ticketId, open);
+  const [notice, setNotice] = useState<string>();
   if (detail.error !== null) return <div className="p-6"><ErrorNote error={errorText(detail.error)} /></div>;
   if (detail.data === undefined) return <p className="p-6 text-muted">불러오는 중…</p>;
   const data = detail.data;
@@ -70,8 +72,23 @@ export function TicketDetailView({ ticketId, onClose }: { ticketId: string; onCl
         </Button>
       </header>
       <StatsSummary stats={stats.data} workflow={workflow} />
-      <Reviews detail={data} />
-      <Holdups detail={data} />
+      {notice !== undefined && (
+        <div role="alert" className="flex items-center gap-3 rounded-lg border border-human/30 bg-human/10 px-3 py-2 text-[13px] text-human">
+          <span className="flex-1">{notice}</span>
+          <Button
+            small
+            kind="ghost"
+            onClick={() => {
+              setNotice(undefined);
+            }}
+          >
+            닫기
+          </Button>
+        </div>
+      )}
+      <SharedNodes projectId={ticket.projectId} ticketId={ticket.ticketId} />
+      <Reviews detail={data} onStale={setNotice} />
+      <Holdups detail={data} onStale={setNotice} />
       <NodeTable detail={data} stats={stats.data} />
       <Artifacts ticketId={ticketId} workflow={workflow} />
     </div>
@@ -113,19 +130,26 @@ function StatsSummary({ stats, workflow }: { stats: TicketStats | undefined; wor
   );
 }
 
-function Reviews({ detail }: { detail: Detail }) {
+function Reviews({ detail, onStale }: { detail: Detail; onStale: (notice: string) => void }) {
   if (detail.reviews.length === 0) return null;
   return (
     <section aria-label="사람 차례" className="flex flex-col gap-3">
       <h3 className="font-bold text-human">지금 사람 차례 ({detail.reviews.length})</h3>
       {detail.reviews.map((review) => (
-        <ReviewCard key={`${review.nodeId}/${review.lane}/${review.run}`} ticketId={detail.ticket.ticketId} review={review} workflow={detail.workflow} />
+        <ReviewCard key={`${review.nodeId}/${review.lane}/${review.run}`} ticketId={detail.ticket.ticketId} review={review} workflow={detail.workflow} onStale={onStale} />
       ))}
     </section>
   );
 }
 
-function useCommand(ticketId: string) {
+/** Shown above the detail when a decision was refused because the screen was behind (the card it came from is gone). */
+export const STALE_NOTICE = '그 사이 다른 실행으로 바뀌어 반영하지 않았습니다. 화면을 새로 고쳤으니 다시 확인하세요.';
+
+/**
+ * Sends a person's command. Commands carry the execution the screen showed (`run`); when the engine refuses because
+ * the lane moved on (`revision_conflict`), the ticket is fetched again and the person is told.
+ */
+function useCommand(ticketId: string, onStale: (notice: string) => void) {
   const client = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
@@ -137,7 +161,9 @@ function useCommand(ticketId: string) {
       await client.invalidateQueries({ queryKey: ['ticket', ticketId] });
       return true;
     } catch (failure) {
-      setError(errorText(failure));
+      if (failure instanceof ApiError && failure.code === 'revision_conflict') onStale(STALE_NOTICE);
+      else setError(errorText(failure));
+      await client.invalidateQueries({ queryKey: ['ticket', ticketId] });
       return false;
     } finally {
       setBusy(false);
@@ -146,12 +172,12 @@ function useCommand(ticketId: string) {
   return { busy, error, run };
 }
 
-export function ReviewCard({ ticketId, review, workflow }: { ticketId: string; review: ReviewView; workflow: WorkflowView | undefined }) {
+export function ReviewCard({ ticketId, review, workflow, onStale }: { ticketId: string; review: ReviewView; workflow: WorkflowView | undefined; onStale: (notice: string) => void }) {
   const canWrite = useCanWrite();
-  const { busy, error, run } = useCommand(ticketId);
+  const { busy, error, run } = useCommand(ticketId, onStale);
   const [text, setText] = useState('');
   const node = workflow?.nodes.find((each) => each.id === review.nodeId);
-  const target = { ticketId, nodeId: review.nodeId, lane: review.lane };
+  const target = { ticketId, nodeId: review.nodeId, lane: review.lane, run: review.run };
   const comment = text.trim() === '' ? {} : { comment: text.trim() };
   const disabled = !canWrite || busy;
   const why = canWrite ? undefined : '권한을 연결해야 할 수 있습니다';
@@ -285,9 +311,9 @@ const WAIT_TEXT: Readonly<Record<WaitReason['kind'], string>> = {
 };
 
 /** What holds the ticket up besides people: failures, stale results, pauses and claims, with what to press. */
-function Holdups({ detail }: { detail: Detail }) {
+function Holdups({ detail, onStale }: { detail: Detail; onStale: (notice: string) => void }) {
   const canWrite = useCanWrite();
-  const { busy, error, run } = useCommand(detail.ticket.ticketId);
+  const { busy, error, run } = useCommand(detail.ticket.ticketId, onStale);
   const reasons = (detail.waitingFor ?? []).filter((reason) => reason.status !== 'review');
   const lanes = new Map(detail.lanes.map((lane) => [`${lane.nodeId}/${lane.lane}`, lane]));
   if (detail.ticket.status !== 'open') return null;
@@ -302,7 +328,7 @@ function Holdups({ detail }: { detail: Detail }) {
       <ul className="flex flex-col gap-1.5">
         {reasons.map((reason) => {
           const lane = lanes.get(`${reason.nodeId}/${reason.lane}`);
-          const target = { ticketId: detail.ticket.ticketId, nodeId: reason.nodeId, lane: reason.lane };
+          const target = { ticketId: detail.ticket.ticketId, nodeId: reason.nodeId, lane: reason.lane, run: reason.run };
           return (
             <li key={`${reason.nodeId}/${reason.lane}/${reason.run}`} className="flex items-center gap-3 rounded-lg border border-line bg-white px-3 py-2">
               <span className="font-semibold">

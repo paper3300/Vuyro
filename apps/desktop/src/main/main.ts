@@ -6,7 +6,7 @@ import { BRIDGE_CHANNELS, type ConnectionState } from '../shared/bridge.ts';
 import { APP_INDEX, APP_SCHEME, appResponseHeaders, resolveAppFile } from './app-protocol.ts';
 import { EngineConnection } from './engine-connection.ts';
 import { engineConnector } from './engine-connector.ts';
-import { checkRendererRequest, checkSubscribe, isTrustedSender } from './ipc-policy.ts';
+import { checkRendererRequest, checkSubscribe, isTrustedFrame } from './ipc-policy.ts';
 import { quitForGood, trayItems, trayTooltip } from './tray-model.ts';
 import { mainWindowOptions } from './window-options.ts';
 
@@ -136,7 +136,13 @@ function requestQuit(): void {
 }
 
 function registerIpc(): void {
-  const trusted = (event: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent): boolean => isTrustedSender(event.senderFrame?.url);
+  const trusted = (event: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent): boolean => {
+    try {
+      return isTrustedFrame(event.senderFrame, event.sender.mainFrame);
+    } catch {
+      return false; // A frame that went away while the message was in flight.
+    }
+  };
   const refusal = { ok: false, error: { code: 'bridge_refused', message: 'untrusted sender', retryable: false } } as const;
   ipcMain.handle(BRIDGE_CHANNELS.request, async (event, message: unknown) => {
     if (!trusted(event)) return refusal;

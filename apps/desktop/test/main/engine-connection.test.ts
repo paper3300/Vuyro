@@ -130,6 +130,25 @@ describe('engine connection', () => {
     expect(seen).toEqual([1, 2, 3, 4]);
   });
 
+  it('a subscription that fails to start on a live connection is tried again with backoff', async () => {
+    const { engine, scheduler, connection, errors } = setup();
+    await connection.start();
+    engine.append('a');
+    engine.failSubscriptions = 2;
+    const { seen } = collect(connection, 0);
+    await settle();
+    expect(seen).toEqual([]);
+    expect(errors).toEqual(['subscription refused']);
+    await scheduler.advance(100);
+    expect(seen).toEqual([]);
+    await scheduler.advance(1000);
+    expect(seen).toEqual([1]);
+    engine.append('b');
+    await settle();
+    expect(seen).toEqual([1, 2]);
+    expect([...engine.links][0]?.subscriptionCount).toBe(1);
+  });
+
   it('backs off between failed attempts and reports a launch that fails', async () => {
     const { engine, scheduler, connection, errors } = setup((fake) => {
       fake.failLaunch = new Error('Node 24를 찾지 못했습니다.');

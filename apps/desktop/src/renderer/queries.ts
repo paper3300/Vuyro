@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import type { BoardResult, TemplateSummary, TicketStats } from '@vuyro/contracts';
+import type { BoardResult, SharedNodeView, TemplateSummary, TicketStats } from '@vuyro/contracts';
 import { call } from './api.ts';
 import { useUi } from './store.ts';
 import type { ArtifactRow, ProjectRow, TicketDetail } from './types.ts';
@@ -44,6 +44,15 @@ export function useTicketStats(ticketId: string | undefined, open: boolean) {
     queryFn: () => call<TicketStats>('query.ticketStats', { ticketId }),
     // Open intervals end at `asOf`; refresh so running time keeps counting.
     refetchInterval: open ? 5000 : false,
+  });
+}
+
+export function useSharedNodes(projectId: string | undefined) {
+  const enabled = useConnected() && projectId !== undefined;
+  return useQuery({
+    queryKey: ['sharedNodes', projectId],
+    enabled,
+    queryFn: async () => (await call<{ sharedNodes: SharedNodeView[] }>('query.sharedNodes', { projectId })).sharedNodes,
   });
 }
 

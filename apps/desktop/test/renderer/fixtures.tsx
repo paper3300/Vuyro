@@ -106,7 +106,7 @@ export function installBridge(handlers: Partial<Record<RendererMethod, Handler>>
       const envelope = params as { type: string; payload: unknown; requestId: string };
       commands.push({ type: envelope.type, payload: envelope.payload });
       const answer = handlers['command.execute']?.(params);
-      if (answer instanceof Error) return Promise.resolve({ ok: false, error: { code: 'invariant_violated', message: answer.message, retryable: false } });
+      if (answer instanceof Error) return Promise.resolve({ ok: false, error: { code: (answer as Error & { code?: string }).code ?? 'invariant_violated', message: answer.message, retryable: false } });
       return Promise.resolve({ ok: true, value: { ok: true, result: answer ?? {} } });
     }
     const handler = handlers[method];

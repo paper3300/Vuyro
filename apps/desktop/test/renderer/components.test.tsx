@@ -4,7 +4,8 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { Board } from '../../src/renderer/components/Board.tsx';
 import { ConnectionBanner } from '../../src/renderer/components/ConnectionBanner.tsx';
 import { NewTicketDialog } from '../../src/renderer/components/NewTicketDialog.tsx';
-import { TicketDetailView } from '../../src/renderer/components/TicketDetail.tsx';
+import { SharedNodes } from '../../src/renderer/components/SharedNodes.tsx';
+import { STALE_NOTICE, TicketDetailView } from '../../src/renderer/components/TicketDetail.tsx';
 import { useUi } from '../../src/renderer/store.ts';
 import { SDLC, TEMPLATE, boardTicket, installBridge, lane, renderWithClient, setConnection, ticketDetail, ticketStats } from './fixtures.tsx';
 
@@ -155,11 +156,11 @@ describe('ticket detail', () => {
     await userEvent.type(within(card).getByLabelText('의견'), 'Add undo');
     await userEvent.click(within(card).getByRole('button', { name: '반려' }));
     await waitFor(() => {
-      expect(commands).toEqual([{ type: 'node.reject', payload: { ticketId: approval.ticket.ticketId, nodeId: 'specApproval', lane: 'main', comment: 'Add undo' } }]);
+      expect(commands).toEqual([{ type: 'node.reject', payload: { ticketId: approval.ticket.ticketId, nodeId: 'specApproval', lane: 'main', run: 1, comment: 'Add undo' } }]);
     });
     await userEvent.click(within(card).getByRole('button', { name: '승인' }));
     await waitFor(() => {
-      expect(commands.at(-1)).toEqual({ type: 'node.approve', payload: { ticketId: approval.ticket.ticketId, nodeId: 'specApproval', lane: 'main' } });
+      expect(commands.at(-1)).toEqual({ type: 'node.approve', payload: { ticketId: approval.ticket.ticketId, nodeId: 'specApproval', lane: 'main', run: 1 } });
     });
   });
 
@@ -169,7 +170,7 @@ describe('ticket detail', () => {
     await userEvent.type(within(card).getByLabelText('요약'), '메모장 앱 아이디어');
     await userEvent.click(within(card).getByRole('button', { name: '완료' }));
     await waitFor(() => {
-      expect(commands).toEqual([{ type: 'node.done', payload: { ticketId: approval.ticket.ticketId, nodeId: 'brainstorming', lane: 'main', port: 'done', summary: '메모장 앱 아이디어' } }]);
+      expect(commands).toEqual([{ type: 'node.done', payload: { ticketId: approval.ticket.ticketId, nodeId: 'brainstorming', lane: 'main', run: 1, port: 'done', summary: '메모장 앱 아이디어' } }]);
     });
   });
 
@@ -199,9 +200,28 @@ describe('ticket detail', () => {
     await userEvent.click(within(holdups).getByRole('button', { name: '재개' }));
     await waitFor(() => {
       expect(commands).toEqual([
-        { type: 'node.retry', payload: { ticketId: detail.ticket.ticketId, nodeId: 'dev', lane: '1' } },
-        { type: 'node.resume', payload: { ticketId: detail.ticket.ticketId, nodeId: 'dev', lane: '2' } },
+        { type: 'node.retry', payload: { ticketId: detail.ticket.ticketId, nodeId: 'dev', lane: '1', run: 1 } },
+        { type: 'node.resume', payload: { ticketId: detail.ticket.ticketId, nodeId: 'dev', lane: '2', run: 2 } },
       ]);
+    });
+  });
+
+  it('a decision refused because the screen was behind refreshes the ticket and says so', async () => {
+    let fetched = 0;
+    const second = ticketDetail({ reviews: approval.reviews.map((review) => ({ ...review, run: 2 })) });
+    installBridge({
+      'query.ticket': () => (++fetched === 1 ? approval : second),
+      'query.ticketStats': () => stats,
+      'query.artifacts': () => ({ artifacts: [] }),
+      'query.sharedNodes': () => ({ sharedNodes: [] }),
+      'command.execute': () => Object.assign(new Error('lane main of node specApproval is on execution 2 now, not 1'), { code: 'revision_conflict' }),
+    });
+    renderWithClient(<TicketDetailView ticketId={approval.ticket.ticketId} onClose={() => undefined} />);
+    const card = await screen.findByRole('article', { name: 'Spec approval 승인' });
+    await userEvent.click(within(card).getByRole('button', { name: '승인' }));
+    expect(await screen.findByText(STALE_NOTICE)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(fetched).toBeGreaterThan(1);
     });
   });
 
@@ -239,5 +259,56 @@ describe('connection banner', () => {
     expect(screen.getByRole('status')).toHaveTextContent('엔진 연결이 끊겼습니다.');
     await userEvent.click(screen.getByRole('button', { name: '지금 다시 시도' }));
     expect(retry).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('shared nodes', () => {
+  const blocked = {
+    projectId: 'p1',
+    name: 'build',
+    label: 'Unreal 빌드',
+    version: 1,
+    spec: {},
+    status: 'blocked' as const,
+    blocked: { reason: 'blamed', batch: 4, by: [{ ticketId: '0190aaaa-bbbb-7ccc-8ddd-eeeeeeaaaaaa', nodeId: 'build', lane: 'main', run: 1 }] },
+    queue: [
+      { ticketId: '0190aaaa-bbbb-7ccc-8ddd-eeeeeebbbbbb', nodeId: 'build', lane: 'main', run: 1, position: 1, queuedAt: 0, retry: true },
+      { ticketId: '0190aaaa-bbbb-7ccc-8ddd-eeeeeecccccc', nodeId: 'build', lane: 'main', run: 1, position: 2, queuedAt: 0, retry: true },
+    ],
+    running: [],
+    recent: [{ batch: 4, batchId: 'b4', trigger: 'count', members: [], startedAt: 0, finishedAt: 10, outcome: 'failed' as const, errorFiles: ['Source/Inventory.cpp'] }],
+  };
+  const idle = { ...blocked, name: 'lint', label: '린트', status: 'idle' as const, blocked: undefined, queue: [], recent: [] };
+
+  it('shows why a shared node is blocked, by which ticket, how many wait, and unblocks it as the person', async () => {
+    const { commands } = installBridge({ 'query.sharedNodes': () => ({ sharedNodes: [blocked, idle] }), 'command.execute': () => ({ unblocked: true }) });
+    renderWithClient(<SharedNodes projectId="p1" />);
+    const card = await screen.findByRole('article', { name: '공유 노드 Unreal 빌드' });
+    expect(card).toHaveTextContent('막힘');
+    expect(card).toHaveTextContent('빌드가 깨졌고 원인으로 추정한 티켓이 고쳐질 때까지 멈췄습니다. (묶음 #4)');
+    expect(card).toHaveTextContent('대기 요청 2건');
+    expect(card).toHaveTextContent('오류 파일 Source/Inventory.cpp');
+    expect(screen.getByRole('article', { name: '공유 노드 린트' })).toHaveTextContent('대기 중');
+    await userEvent.click(within(card).getByRole('button', { name: 'T-aaaaaa' }));
+    expect(useUi.getState().ticketId).toBe('0190aaaa-bbbb-7ccc-8ddd-eeeeeeaaaaaa');
+    await userEvent.click(within(card).getByRole('button', { name: '풀기' }));
+    await waitFor(() => {
+      expect(commands).toEqual([{ type: 'sharedNode.unblock', payload: { projectId: 'p1', name: 'build' } }]);
+    });
+  });
+
+  it('in a ticket, shows only the shared nodes it waits on or is blamed by, with its place in the queue', async () => {
+    installBridge({ 'query.sharedNodes': () => ({ sharedNodes: [blocked, idle] }) });
+    renderWithClient(<SharedNodes projectId="p1" ticketId="0190aaaa-bbbb-7ccc-8ddd-eeeeeecccccc" />);
+    const card = await screen.findByRole('article', { name: '공유 노드 Unreal 빌드' });
+    expect(card).toHaveTextContent('이 티켓은 2번째');
+    expect(screen.queryByRole('article', { name: '공유 노드 린트' })).toBeNull();
+  });
+
+  it('cannot unblock without the person credential', async () => {
+    setConnection({ phase: 'connected', access: 'read-only' });
+    installBridge({ 'query.sharedNodes': () => ({ sharedNodes: [blocked] }) });
+    renderWithClient(<SharedNodes projectId="p1" />);
+    expect(await screen.findByRole('button', { name: '풀기' })).toBeDisabled();
   });
 });

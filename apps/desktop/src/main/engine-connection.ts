@@ -76,6 +76,8 @@ interface Subscriber {
   /** Which link the handle belongs to; a stale handle from an old link is ignored. */
   link: EngineLink | undefined;
   closed: boolean;
+  /** Subscribe attempts that failed in a row on the current link. */
+  failures: number;
 }
 
 const OFFLINE: BridgeError = { code: 'engine_offline', message: '엔진에 연결되어 있지 않습니다.', retryable: true };
@@ -153,7 +155,7 @@ export class EngineConnection {
 
   /** Every event after `afterSequence`, in order, then live, across reconnects. Returns the unsubscribe. */
   subscribe(afterSequence: number, listener: (events: EventBatch) => void): () => void {
-    const subscriber: Subscriber = { last: afterSequence, listener, handle: undefined, link: undefined, closed: false };
+    const subscriber: Subscriber = { last: afterSequence, listener, handle: undefined, link: undefined, closed: false, failures: 0 };
     this.subscribers.add(subscriber);
     if (this.link !== undefined) void this.attach(subscriber, this.link);
     return () => {
@@ -323,9 +325,17 @@ export class EngineConnection {
         return;
       }
       subscriber.handle = handle;
+      subscriber.failures = 0;
     } catch (error) {
-      // The link is going away; the next one attaches again from `last`.
-      if (this.link === link) this.onError(error instanceof Error ? error : new Error(String(error)), 'event subscription');
+      // A link that is going away: the next one attaches again from `last`. One that stays: try again with backoff,
+      // or the screen would stop hearing events while the connection looks fine (검수 반영).
+      if (stale(subscriber, link) || this.link !== link) return;
+      this.onError(error instanceof Error ? error : new Error(String(error)), 'event subscription');
+      const wait = this.backoffMs[Math.min(subscriber.failures, this.backoffMs.length - 1)] ?? 1000;
+      subscriber.failures += 1;
+      this.scheduler.setTimeout(() => {
+        if (this.link === link && !subscriber.closed && subscriber.handle === undefined) void this.attach(subscriber, link);
+      }, wait);
     }
   }
 
@@ -337,6 +347,7 @@ export class EngineConnection {
       if (subscriber.link === link) {
         subscriber.handle = undefined;
         subscriber.link = undefined;
+        subscriber.failures = 0;
       }
     }
   }

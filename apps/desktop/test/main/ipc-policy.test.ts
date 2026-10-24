@@ -1,7 +1,7 @@
 import { join, resolve, sep } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { APP_INDEX, appResponseHeaders, CONTENT_SECURITY_POLICY, resolveAppFile } from '../../src/main/app-protocol.ts';
-import { checkRendererRequest, checkSubscribe, isTrustedSender } from '../../src/main/ipc-policy.ts';
+import { checkRendererRequest, checkSubscribe, isTrustedFrame, isTrustedSender } from '../../src/main/ipc-policy.ts';
 import { RENDERER_METHODS } from '../../src/shared/bridge.ts';
 
 /** What the main process lets the page do (Electron security checklist: validate senders and IPC arguments). */
@@ -16,6 +16,17 @@ describe('IPC from the page', () => {
     expect(isTrustedSender('about:blank')).toBe(false);
     expect(isTrustedSender(undefined)).toBe(false);
     expect(isTrustedSender('not a url')).toBe(false);
+  });
+
+  it('trusts only the main frame of the window, showing our page', () => {
+    const main = { processId: 7, routingId: 1, url: APP_INDEX };
+    expect(isTrustedFrame(main, main)).toBe(true);
+    expect(isTrustedFrame({ ...main }, main)).toBe(true);
+    expect(isTrustedFrame({ ...main, routingId: 2 }, main)).toBe(false); // a sub-frame
+    expect(isTrustedFrame({ ...main, processId: 8 }, main)).toBe(false);
+    expect(isTrustedFrame({ ...main, url: 'https://example.com/' }, { ...main, url: 'https://example.com/' })).toBe(false);
+    expect(isTrustedFrame(null, main)).toBe(false);
+    expect(isTrustedFrame(main, undefined)).toBe(false);
   });
 
   it('allows reads and commands, nothing that belongs to the main process', () => {

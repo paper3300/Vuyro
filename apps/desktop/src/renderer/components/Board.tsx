@@ -10,6 +10,7 @@ import { errorText, formatDuration, formatTokens, shortId, statusLabel, totalTok
 import { useBoard } from '../queries.ts';
 import { useCanWrite, useUi } from '../store.ts';
 import { NewTicketDialog } from './NewTicketDialog.tsx';
+import { SharedNodes } from './SharedNodes.tsx';
 import { Button, Chip, ErrorNote, TONE_BAR, statusTone } from './ui.tsx';
 
 /** "All templates" in the filter: columns become the ticket's state. */
@@ -86,6 +87,9 @@ export function Board({ projectId }: { projectId: string }) {
           <ErrorNote error={errorText(board.error)} />
         </div>
       )}
+      <div className="px-7 pt-3 empty:hidden">
+        <SharedNodes projectId={projectId} />
+      </div>
       {hidden > 0 && <p className="px-7 pt-2 text-[12px] text-muted">다른 템플릿의 티켓 {hidden}건은 이 보드에 없습니다. 「전체」로 모두 볼 수 있습니다.</p>}
       <BoardColumns columns={columns} workflows={data?.workflows ?? {}} projectId={projectId} />
       {creating && (
