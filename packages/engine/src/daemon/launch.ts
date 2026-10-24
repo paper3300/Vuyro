@@ -14,8 +14,14 @@ export interface LaunchOptions {
   readonly pipePath?: string;
   /** The app's UI credential, written to the daemon's stdin (the app is the launcher). */
   readonly uiCredential?: string;
-  /** How long to wait for the engine to answer. Default 20 s. */
+  /** How long to wait for the engine to answer. Default `ENGINE_READY_TIMEOUT_MS`. */
   readonly readyTimeoutMs?: number;
+  /**
+   * Takes the spawned process's handle right after the spawn, before the engine answers. Whoever takes it owns the
+   * process from then on: a launch that fails (no answer in time, an unexpected error) leaves it to them. Without an
+   * owner the launch ends the process itself when it fails.
+   */
+  readonly onSpawn?: (child: LaunchedChild) => void;
   readonly env?: Readonly<Record<string, string | undefined>>;
   /** Client kind for the readiness check. */
   readonly client?: ClientKind;
@@ -30,6 +36,16 @@ export interface LaunchOptions {
   readonly entryPath?: string;
 }
 
+/** How long a launch waits for the engine to answer by default. */
+export const ENGINE_READY_TIMEOUT_MS = 20_000;
+
+/** The process a launch spawned, through its own handle (never a bare pid that another process may have taken over). */
+export interface LaunchedChild {
+  readonly pid: number | undefined;
+  /** Ends it, unless it already exited (then the handle reaches nothing). False when there was nothing to end. */
+  stop(): boolean;
+}
+
 export interface LaunchResult {
   /** The engine that answers (this launch's process, or one that was already running). */
   readonly pid: number;
@@ -37,11 +53,6 @@ export interface LaunchResult {
   readonly started: boolean;
   readonly pipePath: string;
   readonly dataDir: string;
-  /**
-   * Ends the process this launch spawned, through its own child handle (never a bare pid that another process may
-   * have taken over). Does nothing once it has exited. False when there was nothing to end.
-   */
-  stop(): boolean;
 }
 
 /** Ends a spawned process through its handle, unless it already exited (then the handle no longer reaches anything). */
@@ -77,20 +88,26 @@ export async function launchEngineDaemon(options: LaunchOptions = {}): Promise<L
     child.stdin?.end(`${options.uiCredential}\n`);
   }
   child.unref();
-  const deadline = Date.now() + (options.readyTimeoutMs ?? 20_000);
+  options.onSpawn?.({ pid: child.pid, stop: () => stopChild(child) });
+  // A launch that fails must not leave a process nobody can reach: its owner ends it, or the launch does.
+  const failed = (error: Error): Error => {
+    if (options.onSpawn === undefined) stopChild(child);
+    return error;
+  };
+  const deadline = Date.now() + (options.readyTimeoutMs ?? ENGINE_READY_TIMEOUT_MS);
   for (;;) {
     try {
       const client = await EngineClient.connect({ client: options.client ?? 'cli', dataDir: location.dataDir, pipePath: location.pipePath, timeoutMs: 2000 });
       try {
         const { pid } = await client.request<{ pid: number }>(RPC_METHODS.status, {});
-        return { pid, started: pid === child.pid, pipePath: location.pipePath, dataDir: location.dataDir, stop: () => stopChild(child) };
+        return { pid, started: pid === child.pid, pipePath: location.pipePath, dataDir: location.dataDir };
       } finally {
         client.close();
       }
     } catch (error) {
-      if (!(error instanceof EngineUnavailableError)) throw error;
+      if (!(error instanceof EngineUnavailableError)) throw failed(error as Error);
       if (exited !== undefined) throw new EngineUnavailableError(`the engine exited during startup (code ${String(exited)}); see ${location.dataDir}\\logs\\engine.log`);
-      if (Date.now() > deadline) throw new EngineUnavailableError('the engine did not answer in time');
+      if (Date.now() > deadline) throw failed(new EngineUnavailableError('the engine did not answer in time'));
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }

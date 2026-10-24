@@ -36,15 +36,21 @@ export class EngineConnectError extends Error {
   }
 }
 
+/** A process a launch spawned, reached through its own handle (never a bare pid another process may have taken over). */
+export interface LaunchedChild {
+  /** Ends it, unless it already exited (then the handle reaches nothing). False when there was nothing to end. */
+  stop(): boolean;
+}
+
 export interface EngineConnector {
   /** Connects to the running engine; throws EngineConnectError. Without a credential the session is read-only. */
   connect(uiCredential: string | undefined): Promise<EngineLink>;
   /**
    * Starts an engine with this credential (stdin). `started` = false when another engine already served the data.
-   * `stop` ends the process this launch spawned through its own child handle (never a bare pid another process may
-   * have taken over); it does nothing once that process has exited.
+   * `onSpawn` receives the spawned process's handle right after the spawn, before the engine answers: from then on the
+   * connection owns that process, also when the launch fails (no answer in time, an error).
    */
-  launch(uiCredential: string): Promise<{ readonly started: boolean; readonly pid: number; stop(): boolean }>;
+  launch(uiCredential: string, onSpawn: (child: LaunchedChild) => void): Promise<{ readonly started: boolean; readonly pid: number }>;
   /** A fresh UI credential (`vuc_…`, at least 32 characters). */
   newCredential(): string;
 }
@@ -104,10 +110,11 @@ export class EngineConnection {
   private stopped = false;
   /** Quitting for good: never reconnect or start an engine again, whatever happens to the link meanwhile. */
   private quitting = false;
-  /** An engine this app started and has not reached yet: how to end its process. */
-  private unreachedLaunch: (() => boolean) | undefined;
-  /** Ending that engine, once the person quits (awaited before the app exits). */
-  private quitCleanup: Promise<void> | undefined;
+  /** The engine process this app spawned and does not talk to yet: owned from the spawn until a link reaches it. */
+  private ownChild: LaunchedChild | undefined;
+  /** `endOwnEngine` at work, and the process it is ending. */
+  private ending: Promise<void> | undefined;
+  private endingChild: LaunchedChild | undefined;
   private startedByApp = false;
 
   constructor(options: EngineConnectionOptions) {
@@ -144,13 +151,16 @@ export class EngineConnection {
   beginQuit(): void {
     this.quitting = true;
     this.clearRetry();
-    // An attempt still under way stops its engine itself (through the link, or here once it fails).
-    if (this.establishing === undefined) this.stopUnreachedLaunch();
+    this.update({ quitting: true });
+    // An attempt still under way ends its own engine when it is over (the same clean-up, `endOwnEngine`).
+    if (this.establishing === undefined) void this.endOwnEngine();
   }
 
   /**
-   * Waits until what quitting set off is over: an attempt still under way and the ending of an engine this app started
-   * but never reached. The app exits only after this (or after `timeoutMs`), so that work is not cut off.
+   * Waits until what quitting set off is over: an attempt still under way (a launch waits for its engine up to its own
+   * time limit) and the clean-up of an engine this app spawned. Pass more than the launch's time limit. When the wait
+   * runs out, the process this app spawned and does not talk to is ended through its handle, and the answer is
+   * 'timeout' (the app tells the person).
    */
   async whenQuitSettled(timeoutMs: number): Promise<'settled' | 'timeout'> {
     let timer: unknown;
@@ -161,13 +171,19 @@ export class EngineConnection {
     });
     const work = (async (): Promise<'settled'> => {
       for (;;) {
-        const pending = this.establishing ?? this.quitCleanup;
+        const pending = this.establishing ?? this.ending;
         if (pending === undefined) return 'settled';
         await pending.catch(() => undefined);
       }
     })();
     try {
-      return await Promise.race([work, timeout]);
+      const outcome = await Promise.race([work, timeout]);
+      if (outcome === 'timeout') {
+        for (const child of [this.ownChild, this.endingChild]) this.endChild(child);
+        this.ownChild = undefined;
+        this.endingChild = undefined;
+      }
+      return outcome;
     } finally {
       this.scheduler.clearTimeout(timer);
     }
@@ -275,18 +291,15 @@ export class EngineConnection {
     try {
       const { link, launched } = await this.open();
       if (this.isStopped()) {
-        // An engine this attempt started while the person was quitting: stop it again instead of leaving it behind.
-        if (this.isQuitting() && launched && link.hello.identity === 'ui') {
-          this.unreachedLaunch = undefined;
-          await link.request('engine.shutdown', {}).catch(() => undefined);
-        }
-        link.close();
+        // An engine this attempt started while the person was quitting: end it over the link just made.
+        if (this.isQuitting() && launched) await this.endOwnEngine(link);
+        else link.close();
         return;
       }
       this.adopt(link);
     } catch (error) {
       // Started an engine, could not reach it, and the person is quitting: nothing will come back to it.
-      if (this.isQuitting()) this.stopUnreachedLaunch();
+      if (this.isQuitting()) await this.endOwnEngine();
       this.onError(error instanceof Error ? error : new Error(String(error)), 'engine connection');
       const message = error instanceof Error ? error.message : String(error);
       this.update({ phase: this.state.phase === 'launching' ? 'failed' : 'offline', access: 'none', message });
@@ -311,9 +324,19 @@ export class EngineConnection {
     // Read after the await: the person may have chosen to quit meanwhile.
     if (this.isQuitting()) throw new Error('the app is quitting: no engine is started');
     this.update({ phase: 'launching' });
-    const launched = await this.connector.launch(credential);
+    let launched: { readonly started: boolean; readonly pid: number };
+    try {
+      launched = await this.connector.launch(credential, (child) => {
+        this.ownChild = child;
+      });
+    } catch (error) {
+      // A launch that failed (no answer in time, an error) may leave its process running: the same clean-up as quitting.
+      await this.endOwnEngine();
+      throw error;
+    }
     this.startedByApp = launched.started;
-    if (launched.started) this.unreachedLaunch = () => launched.stop();
+    // Another engine already served the data: the spawned process gives up by itself, and that engine is not ours.
+    if (!launched.started) this.ownChild = undefined;
     try {
       return { link: await this.connector.connect(credential), launched: launched.started };
     } catch (error) {
@@ -325,7 +348,8 @@ export class EngineConnection {
 
   private adopt(link: EngineLink): void {
     this.link = link;
-    this.unreachedLaunch = undefined;
+    // Reached: from now on the link is how it stops (engine.shutdown), never its process handle.
+    this.ownChild = undefined;
     this.attempt = 0;
     const access = link.hello.identity === 'ui' ? 'write' : 'read-only';
     link.onClose(() => {
@@ -403,40 +427,56 @@ export class EngineConnection {
     }
   }
 
-  private stopUnreachedLaunch(): void {
-    const end = this.unreachedLaunch;
-    this.unreachedLaunch = undefined;
-    if (end === undefined) return;
-    this.quitCleanup = this.endUnreached(end).finally(() => {
-      this.quitCleanup = undefined;
+  /**
+   * The one clean-up for the engine process this app spawned and does not talk to: after a launch that failed (no
+   * answer in time, an error), and when the app quits. It asks the engine to shut down (over `link`, or one more
+   * connection); only an engine nobody can reach is ended, through its own handle. Committed records survive that, but
+   * work in progress (files being changed, an agent's child processes) is not cleaned up (L-22).
+   */
+  private endOwnEngine(link?: EngineLink): Promise<void> {
+    const child = this.ownChild;
+    this.ownChild = undefined;
+    if (child === undefined) {
+      link?.close();
+      return Promise.resolve();
+    }
+    this.endingChild = child;
+    const ending: Promise<void> = this.askOrEnd(child, link).finally(() => {
+      if (this.ending !== ending) return;
+      this.ending = undefined;
+      this.endingChild = undefined;
     });
+    this.ending = ending;
+    return ending;
   }
 
-  /**
-   * One more try to reach the engine and ask it to shut down. Ending its process is only for an engine nobody can talk
-   * to: committed records survive that, but work in progress (files being changed, an agent's child processes) is not
-   * cleaned up (L-22).
-   */
-  private async endUnreached(end: () => boolean): Promise<void> {
-    let link: EngineLink | undefined;
-    try {
-      link = await this.connector.connect(this.credential);
-    } catch {
-      link = undefined;
+  private async askOrEnd(child: LaunchedChild, link: EngineLink | undefined): Promise<void> {
+    let reached = link;
+    if (reached === undefined) {
+      try {
+        reached = await this.connector.connect(this.credential);
+      } catch {
+        reached = undefined;
+      }
     }
-    if (link !== undefined) {
+    if (reached?.hello.identity === 'ui') {
       try {
         // Once it answers it stops itself, even if the pipe closes before the reply: never end it then.
-        await link.request('engine.shutdown', {}).catch(() => undefined);
+        await reached.request('engine.shutdown', {}).catch(() => undefined);
       } finally {
-        link.close();
+        reached.close();
       }
       return;
     }
+    reached?.close();
+    if (this.endingChild === child) this.endChild(child);
+  }
+
+  private endChild(child: LaunchedChild | undefined): void {
     try {
-      end();
+      child?.stop();
     } catch (error) {
-      this.onError(error instanceof Error ? error : new Error(String(error)), 'ending an unreached engine');
+      this.onError(error instanceof Error ? error : new Error(String(error)), 'ending the engine process');
     }
   }
 

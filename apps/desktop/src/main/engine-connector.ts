@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { EngineClient, EngineRequestError, EngineUnavailableError, launchEngineDaemon } from '@vuyro/engine';
+import { ENGINE_READY_TIMEOUT_MS, EngineClient, EngineRequestError, EngineUnavailableError, launchEngineDaemon } from '@vuyro/engine';
 import { EngineConnectError, type EngineConnector, type EngineLink } from './engine-connection.ts';
 
 /**
@@ -42,7 +42,7 @@ export function engineConnector(options: EngineConnectorOptions = {}): EngineCon
         throw error;
       }
     },
-    async launch(uiCredential) {
+    async launch(uiCredential, onSpawn) {
       const nodePath = options.nodePath ?? findNode(env, existsSync, options.bundledNode);
       const entryPath = options.entryPath ?? nonEmpty(env.VUYRO_ENGINE_ENTRY);
       const launched = await launchEngineDaemon({
@@ -52,9 +52,13 @@ export function engineConnector(options: EngineConnectorOptions = {}): EngineCon
         nodePath,
         cliEntry: options.cliEntry ?? bundledCliEntry(),
         ...(entryPath === undefined ? {} : { entryPath }),
+        readyTimeoutMs: ENGINE_READY_TIMEOUT_MS,
+        // The connection owns the spawned process from here on, also when the launch fails (L-22).
+        onSpawn: (child) => {
+          onSpawn({ stop: () => child.stop() });
+        },
       });
-      // `stop` ends the spawned child through its handle (L-22): never a bare pid.
-      return { started: launched.started, pid: launched.pid, stop: () => launched.stop() };
+      return { started: launched.started, pid: launched.pid };
     },
   };
 }

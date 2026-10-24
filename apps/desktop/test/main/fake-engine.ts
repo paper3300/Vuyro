@@ -21,6 +21,10 @@ export class FakeEngine {
   failLaunch: Error | undefined;
   /** The next N connects to a running engine fail as if it did not answer (an engine that started but is not reachable). */
   connectFailures = 0;
+  /** The process the last launch spawned still runs (its handle can end it). */
+  childAlive = false;
+  /** The next launch spawns its process but never sees it answer. */
+  launchTimesOut = false;
   /** Pids of launched engines ended through their handle (`stop`). */
   readonly killed: number[] = [];
   /** When set, `launch` waits for it (a launch still on its way). */
@@ -43,16 +47,9 @@ export class FakeEngine {
   /** The engine process dies: every link closes, credentials are forgotten. */
   crash(): void {
     this.running = false;
+    this.childAlive = false;
     this.known.clear();
     for (const link of [...this.links]) link.cut(new Error('engine gone'));
-  }
-
-  /** The handle of a launched engine: ends it only while it still runs (a handle of an exited process reaches nothing). */
-  endLaunched(pid: number): boolean {
-    if (!this.running) return false;
-    this.killed.push(pid);
-    this.crash();
-    return true;
   }
 
   issueCredential(): string {
@@ -79,20 +76,33 @@ export class FakeEngine {
         this.links.add(link);
         return Promise.resolve(link);
       },
-      launch: async (credential) => {
+      launch: async (credential, onSpawn) => {
         this.launches.push(credential);
+        if (this.failLaunch !== undefined) throw this.failLaunch; // nothing was spawned
+        this.childAlive = true;
+        onSpawn({
+          stop: () => {
+            if (!this.childAlive) return false;
+            this.killed.push(1);
+            this.crash();
+            return true;
+          },
+        });
         if (this.launchGate !== undefined) await this.launchGate;
-        if (this.failLaunch !== undefined) return Promise.reject(this.failLaunch);
+        // Spawned but never answered in time: the process may still run (the connection owns it).
+        if (this.launchTimesOut) throw new Error('the engine did not answer in time');
         if (this.launchRace) {
           this.running = true;
-          return Promise.resolve({ started: false, pid: 2, stop: () => false });
+          this.childAlive = false;
+          return { started: false, pid: 2 };
         }
         if (!this.running) {
           this.running = true;
           this.known.add(credential);
-          return Promise.resolve({ started: true, pid: 1, stop: () => this.endLaunched(1) });
+          return { started: true, pid: 1 };
         }
-        return Promise.resolve({ started: false, pid: 1, stop: () => false });
+        this.childAlive = false;
+        return { started: false, pid: 1 };
       },
     };
   }

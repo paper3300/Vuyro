@@ -46,8 +46,8 @@ function open(entryPath?: string) {
   const connection = new EngineConnection({
     connector: {
       ...base,
-      launch: async (credential) => {
-        const result = await base.launch(credential);
+      launch: async (credential, onSpawn) => {
+        const result = await base.launch(credential, onSpawn);
         launched.add(result.pid);
         return result;
       },

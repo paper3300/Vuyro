@@ -90,6 +90,8 @@ export interface ConnectionState {
   readonly lastSequence?: number;
   /** Agents and scripts running now (polled). */
   readonly running?: number;
+  /** The person chose to quit for good: the app is stopping the engine and will exit. */
+  readonly quitting?: boolean;
 }
 
 /** A batch of engine events for one renderer subscription (DomainEvent objects as the engine sent them). */

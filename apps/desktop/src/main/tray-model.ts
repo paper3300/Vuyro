@@ -12,6 +12,8 @@ export type TrayItem =
   | { readonly kind: 'separator' };
 
 export function trayItems(state: ConnectionState): TrayItem[] {
+  // While quitting there is nothing left to choose: the app exits once the engine is stopped.
+  if (state.quitting === true) return [{ kind: 'info', label: QUITTING }];
   return [
     { kind: 'action', id: 'open', label: '창 열기' },
     { kind: 'info', label: runningLabel(state) },
@@ -25,8 +27,10 @@ export function runningLabel(state: ConnectionState): string {
   return `실행 중 작업: ${state.running ?? 0}개`;
 }
 
+const QUITTING = '종료 중…';
+
 export function trayTooltip(state: ConnectionState): string {
-  return `Vuyro · ${runningLabel(state)}`;
+  return `Vuyro · ${state.quitting === true ? QUITTING : runningLabel(state)}`;
 }
 
 export interface QuitDeps {
@@ -40,8 +44,11 @@ export interface QuitDeps {
   /** Tells the person something (no answer needed). */
   notify(message: { readonly message: string; readonly detail: string }): Promise<void>;
   shutdownEngine(): Promise<BridgeResult<unknown>>;
-  /** Waits (bounded) for what quitting set off in the connection: an attempt under way, ending an engine it started. */
-  settleConnection(): Promise<void>;
+  /**
+   * Waits (bounded) for what quitting set off in the connection: a launch under way, ending an engine it spawned.
+   * 'timeout' = the wait ran out and that process was ended through its handle.
+   */
+  settleConnection(): Promise<'settled' | 'timeout'>;
   exitApp(): void;
 }
 
@@ -52,6 +59,17 @@ export type QuitOutcome = 'cancelled' | 'quit-with-engine' | 'quit-engine-kept';
  * again the next time it starts (명령·이벤트 계약 §11 "멈추기"). With work running the person confirms first.
  * When the engine cannot be stopped from here (no UI session, or no engine), only the app quits and the person is told.
  */
+/** Exits once the connection has settled; a wait that ran out is told (an engine process was ended, L-22). */
+async function exit(deps: QuitDeps): Promise<void> {
+  if ((await deps.settleConnection()) === 'timeout') {
+    await deps.notify({
+      message: '엔진 정리를 기다리다 시간이 지났습니다.',
+      detail: '앱이 띄운 엔진 프로세스를 끝냈습니다. 기록된 작업은 다음에 Vuyro를 시작하면 다시 줄을 섭니다. 진행 중이던 파일 변경은 직접 확인하세요.',
+    });
+  }
+  deps.exitApp();
+}
+
 export async function quitForGood(deps: QuitDeps): Promise<QuitOutcome> {
   const running = await deps.running();
   // Not knowing is not "nothing runs": ask then too (검수 반영).
@@ -71,18 +89,15 @@ export async function quitForGood(deps: QuitDeps): Promise<QuitOutcome> {
         detail: '이 앱은 엔진을 멈출 권한이 없습니다(다른 곳에서 시작한 엔진). 터미널에서 `vuyro engine stop`으로 멈출 수 있습니다.',
       });
     }
-    await deps.settleConnection();
-    deps.exitApp();
+    await exit(deps);
     return 'quit-engine-kept';
   }
   const stopped = await deps.shutdownEngine();
   if (!stopped.ok) {
     await deps.notify({ message: '엔진을 멈추지 못했습니다.', detail: `${stopped.error.message} 앱만 종료합니다.` });
-    await deps.settleConnection();
-    deps.exitApp();
+    await exit(deps);
     return 'quit-engine-kept';
   }
-  await deps.settleConnection();
-  deps.exitApp();
+  await exit(deps);
   return 'quit-with-engine';
 }

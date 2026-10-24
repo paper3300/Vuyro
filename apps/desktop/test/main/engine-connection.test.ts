@@ -255,9 +255,7 @@ describe('engine connection', () => {
         });
       },
       shutdownEngine: () => connection.shutdownEngine(),
-      settleConnection: async () => {
-        await connection.whenQuitSettled(10_000);
-      },
+      settleConnection: () => connection.whenQuitSettled(10_000),
       exitApp: () => {
         exited = true;
         connection.stop();
@@ -373,19 +371,92 @@ describe('engine connection', () => {
     expect(engine.running).toBe(false);
   });
 
-  it('does not wait for ever: a launch that never finishes lets the app exit after the time limit', async () => {
-    const { scheduler, connection } = setup((fake) => {
+  it('does not wait for ever: a launch that never finishes is ended through its handle when the wait runs out', async () => {
+    const { engine, scheduler, connection } = setup((fake) => {
       fake.launchGate = new Promise<void>(() => undefined);
     });
     void connection.start();
     await settle();
+    // Owned from the spawn on, before the engine answered.
+    expect(engine.childAlive).toBe(true);
     connection.beginQuit();
     let settled: string | undefined;
     void connection.whenQuitSettled(10_000).then((outcome) => (settled = outcome));
     await scheduler.advance(9_000);
     expect(settled).toBeUndefined();
+    expect(engine.killed).toEqual([]);
     await scheduler.advance(1_000);
     expect(settled).toBe('timeout');
+    expect(engine.killed).toEqual([1]);
+    expect(engine.childAlive).toBe(false);
+  });
+
+  it('a launch that times out ends the process it spawned (the same clean-up), and a later attempt launches again', async () => {
+    const { engine, scheduler, connection } = setup((fake) => {
+      fake.launchTimesOut = true;
+    });
+    await connection.start();
+    expect(connection.current).toMatchObject({ phase: 'failed', message: 'the engine did not answer in time' });
+    // Nothing answered the last try either: ended through its handle, not left running.
+    expect(engine.killed).toEqual([1]);
+    expect(engine.childAlive).toBe(false);
+    engine.launchTimesOut = false;
+    await scheduler.advance(100);
+    expect(engine.launches).toHaveLength(2);
+    expect(connection.current).toMatchObject({ phase: 'connected', access: 'write' });
+  });
+
+  it('quitting during a launch that then times out: the app waits for it, and its process is ended once', async () => {
+    let open: () => void = () => undefined;
+    const { engine, connection } = setup((fake) => {
+      fake.launchGate = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+      fake.launchTimesOut = true;
+    });
+    void connection.start();
+    await settle();
+    connection.beginQuit();
+    let settled: string | undefined;
+    void connection.whenQuitSettled(30_000).then((outcome) => (settled = outcome));
+    await settle();
+    expect(settled).toBeUndefined();
+    expect(engine.killed).toEqual([]);
+    open();
+    await settle();
+    expect(settled).toBe('settled');
+    expect(engine.killed).toEqual([1]);
+    expect(engine.launches).toHaveLength(1);
+  });
+
+  it('quitting during a launch that succeeds: the new engine is asked over the link, never ended', async () => {
+    let open: () => void = () => undefined;
+    const { engine, connection } = setup((fake) => {
+      fake.launchGate = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+    });
+    void connection.start();
+    await settle();
+    connection.beginQuit();
+    const settled = connection.whenQuitSettled(30_000);
+    open();
+    expect(await settled).toBe('settled');
+    await new Promise((resolve) => setTimeout(resolve, 10)); // the fake engine stops on a real timer after it answers
+    expect(engine.shutdowns).toBe(1);
+    expect(engine.killed).toEqual([]);
+    expect(engine.running).toBe(false);
+  });
+
+  it('quitting after the connection is made: the link stops the engine, the handle is no longer held', async () => {
+    const { engine, connection } = setup();
+    await connection.start();
+    connection.beginQuit();
+    expect(connection.current.quitting).toBe(true);
+    expect((await connection.shutdownEngine()).ok).toBe(true);
+    expect(await connection.whenQuitSettled(30_000)).toBe('settled');
+    expect(engine.shutdowns).toBe(1);
+    expect(engine.killed).toEqual([]);
   });
 
 

@@ -16,6 +16,12 @@ describe('tray menu', () => {
     expect(trayTooltip(state)).toBe('Vuyro · 실행 중 작업: 3개');
   });
 
+  it('while quitting it says so and offers nothing else', () => {
+    const state: ConnectionState = { phase: 'connected', access: 'write', running: 2, quitting: true };
+    expect(trayItems(state)).toEqual([{ kind: 'info', label: '종료 중…' }]);
+    expect(trayTooltip(state)).toBe('Vuyro · 종료 중…');
+  });
+
   it('says when there is no engine to count', () => {
     expect(trayItems({ phase: 'offline', access: 'none' })[1]).toEqual({ kind: 'info', label: '엔진 연결 안 됨' });
     expect(trayItems({ phase: 'launching', access: 'none' })[1]).toEqual({ kind: 'info', label: '엔진 시작 중' });
@@ -23,7 +29,7 @@ describe('tray menu', () => {
   });
 });
 
-function deps(options: { running: number | undefined; access: ConnectionState['access']; answer?: boolean; shutdown?: BridgeResult<unknown> }) {
+function deps(options: { running: number | undefined; access: ConnectionState['access']; answer?: boolean; shutdown?: BridgeResult<unknown>; settle?: 'settled' | 'timeout' }) {
   const calls: string[] = [];
   const questions: string[] = [];
   const notices: string[] = [];
@@ -52,7 +58,7 @@ function deps(options: { running: number | undefined; access: ConnectionState['a
     },
     settleConnection: () => {
       calls.push('settle');
-      return Promise.resolve();
+      return Promise.resolve(options.settle ?? 'settled');
     },
     exitApp: () => {
       calls.push('exit');
@@ -102,6 +108,13 @@ describe('quitting for good', () => {
     const offline = deps({ running: undefined, access: 'none', answer: true });
     expect(await quitForGood(offline.quit)).toBe('quit-engine-kept');
     expect(offline.calls).toEqual(['running', 'confirm', 'beginQuit', 'settle', 'exit']);
+  });
+
+  it('when the wait for the engine runs out, the person is told before the app exits', async () => {
+    const { quit, calls, notices } = deps({ running: 0, access: 'write', settle: 'timeout' });
+    expect(await quitForGood(quit)).toBe('quit-with-engine');
+    expect(calls).toEqual(['running', 'beginQuit', 'shutdown', 'settle', 'notify', 'exit']);
+    expect(notices).toEqual(['엔진 정리를 기다리다 시간이 지났습니다.']);
   });
 
   it('when the engine refuses to stop, the person is told and the app still quits', async () => {

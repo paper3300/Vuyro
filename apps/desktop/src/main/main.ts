@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, protocol, session, Tray, type WebContents } from 'electron';
-import { isRepositoryTop } from '@vuyro/engine';
+import { ENGINE_READY_TIMEOUT_MS, isRepositoryTop } from '@vuyro/engine';
 import { BRIDGE_CHANNELS, type ConnectionState } from '../shared/bridge.ts';
 import { APP_INDEX, APP_SCHEME, appResponseHeaders, resolveAppFile } from './app-protocol.ts';
 import { EngineConnection } from './engine-connection.ts';
@@ -133,9 +133,8 @@ function requestQuit(): void {
       await ask({ type: 'info', title: 'Vuyro', message, detail, buttons: ['확인'] });
     },
     shutdownEngine: () => connection.shutdownEngine(),
-    settleConnection: async () => {
-      await connection.whenQuitSettled(10_000);
-    },
+    // A launch under way waits up to its own limit for the engine; wait longer, then the handle ends it (L-22).
+    settleConnection: () => connection.whenQuitSettled(ENGINE_READY_TIMEOUT_MS + 10_000),
     exitApp: () => {
       connection.stop();
       tray?.destroy();

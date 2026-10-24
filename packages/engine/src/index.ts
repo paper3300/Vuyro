@@ -77,7 +77,7 @@ export { parseDuration } from './workflow/duration.ts';
 export { startEngineDaemon, engineVersion } from './daemon/daemon.ts';
 export { type ShimSecurity, VuyroShims } from './daemon/vuyro-shims.ts';
 export type { EngineDaemon, EngineDaemonOptions } from './daemon/daemon.ts';
-export { daemonEntryPath, launchEngineDaemon } from './daemon/launch.ts';
+export { daemonEntryPath, ENGINE_READY_TIMEOUT_MS, launchEngineDaemon, type LaunchedChild } from './daemon/launch.ts';
 export type { LaunchOptions, LaunchResult } from './daemon/launch.ts';
 export { defaultDataDir, defaultPipePath, enginePaths } from './daemon/paths.ts';
 export type { EnginePaths } from './daemon/paths.ts';
