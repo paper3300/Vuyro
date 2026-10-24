@@ -97,7 +97,7 @@ export { bindDescendantsToProcess, DataDirectoryLockedError, lockDataDirectory }
 // M4: workspaces and the internal checkout ledger.
 export { WorkspaceCoordinator, codexProjectHooks } from './workspace/coordinator.ts';
 export type { MergeAgentRequest, Prepared, PrepareTarget, WorkspaceCoordinatorOptions } from './workspace/coordinator.ts';
-export { GitClient, GitError, gitEnvironment, isRepositoryTop, nodeGitExec } from './workspace/git.ts';
+export { GIT_LOCATION_VARIABLES, GitClient, GitError, gitEnvironment, isRepositoryTop, nodeGitExec } from './workspace/git.ts';
 export type { GitExec, GitResult, StatusEntry } from './workspace/git.ts';
 export { laneWorktree, locate, ticketKey, ticketWorktree } from './workspace/layout.ts';
 export type { LayoutOptions, Location, WorktreeName } from './workspace/layout.ts';

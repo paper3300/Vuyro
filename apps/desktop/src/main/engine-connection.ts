@@ -39,15 +39,14 @@ export class EngineConnectError extends Error {
 export interface EngineConnector {
   /** Connects to the running engine; throws EngineConnectError. Without a credential the session is read-only. */
   connect(uiCredential: string | undefined): Promise<EngineLink>;
-  /** Starts an engine with this credential (stdin). `started` = false when another engine already served the data. */
-  launch(uiCredential: string): Promise<{ readonly started: boolean; readonly pid: number }>;
+  /**
+   * Starts an engine with this credential (stdin). `started` = false when another engine already served the data.
+   * `stop` ends the process this launch spawned through its own child handle (never a bare pid another process may
+   * have taken over); it does nothing once that process has exited.
+   */
+  launch(uiCredential: string): Promise<{ readonly started: boolean; readonly pid: number; stop(): boolean }>;
   /** A fresh UI credential (`vuc_…`, at least 32 characters). */
   newCredential(): string;
-  /**
-   * Ends an engine this app started (`launch` said `started`) but never reached, when the app quits for good: there
-   * is no link to ask it to shut down, and leaving it would keep it running with nobody to stop it.
-   */
-  stopLaunched(pid: number): void;
 }
 
 export interface Scheduler {
@@ -105,8 +104,10 @@ export class EngineConnection {
   private stopped = false;
   /** Quitting for good: never reconnect or start an engine again, whatever happens to the link meanwhile. */
   private quitting = false;
-  /** An engine this app started and has not reached yet (its pid). */
-  private unreachedLaunch: number | undefined;
+  /** An engine this app started and has not reached yet: how to end its process. */
+  private unreachedLaunch: (() => boolean) | undefined;
+  /** Ending that engine, once the person quits (awaited before the app exits). */
+  private quitCleanup: Promise<void> | undefined;
   private startedByApp = false;
 
   constructor(options: EngineConnectionOptions) {
@@ -145,6 +146,31 @@ export class EngineConnection {
     this.clearRetry();
     // An attempt still under way stops its engine itself (through the link, or here once it fails).
     if (this.establishing === undefined) this.stopUnreachedLaunch();
+  }
+
+  /**
+   * Waits until what quitting set off is over: an attempt still under way and the ending of an engine this app started
+   * but never reached. The app exits only after this (or after `timeoutMs`), so that work is not cut off.
+   */
+  async whenQuitSettled(timeoutMs: number): Promise<'settled' | 'timeout'> {
+    let timer: unknown;
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = this.scheduler.setTimeout(() => {
+        resolve('timeout');
+      }, timeoutMs);
+    });
+    const work = (async (): Promise<'settled'> => {
+      for (;;) {
+        const pending = this.establishing ?? this.quitCleanup;
+        if (pending === undefined) return 'settled';
+        await pending.catch(() => undefined);
+      }
+    })();
+    try {
+      return await Promise.race([work, timeout]);
+    } finally {
+      this.scheduler.clearTimeout(timer);
+    }
   }
 
   /** Tries again now instead of waiting for the next retry. */
@@ -287,7 +313,7 @@ export class EngineConnection {
     this.update({ phase: 'launching' });
     const launched = await this.connector.launch(credential);
     this.startedByApp = launched.started;
-    if (launched.started) this.unreachedLaunch = launched.pid;
+    if (launched.started) this.unreachedLaunch = () => launched.stop();
     try {
       return { link: await this.connector.connect(credential), launched: launched.started };
     } catch (error) {
@@ -378,13 +404,39 @@ export class EngineConnection {
   }
 
   private stopUnreachedLaunch(): void {
-    const pid = this.unreachedLaunch;
+    const end = this.unreachedLaunch;
     this.unreachedLaunch = undefined;
-    if (pid === undefined) return;
+    if (end === undefined) return;
+    this.quitCleanup = this.endUnreached(end).finally(() => {
+      this.quitCleanup = undefined;
+    });
+  }
+
+  /**
+   * One more try to reach the engine and ask it to shut down. Ending its process is only for an engine nobody can talk
+   * to: committed records survive that, but work in progress (files being changed, an agent's child processes) is not
+   * cleaned up (L-22).
+   */
+  private async endUnreached(end: () => boolean): Promise<void> {
+    let link: EngineLink | undefined;
     try {
-      this.connector.stopLaunched(pid);
+      link = await this.connector.connect(this.credential);
+    } catch {
+      link = undefined;
+    }
+    if (link !== undefined) {
+      try {
+        // Once it answers it stops itself, even if the pipe closes before the reply: never end it then.
+        await link.request('engine.shutdown', {}).catch(() => undefined);
+      } finally {
+        link.close();
+      }
+      return;
+    }
+    try {
+      end();
     } catch (error) {
-      this.onError(error instanceof Error ? error : new Error(String(error)), 'stopping an unreached engine');
+      this.onError(error instanceof Error ? error : new Error(String(error)), 'ending an unreached engine');
     }
   }
 

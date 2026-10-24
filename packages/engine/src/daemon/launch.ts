@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { agentEnvironment } from '@vuyro/agent-adapters';
 import { type ClientKind, RPC_METHODS } from '@vuyro/contracts';
@@ -37,6 +37,17 @@ export interface LaunchResult {
   readonly started: boolean;
   readonly pipePath: string;
   readonly dataDir: string;
+  /**
+   * Ends the process this launch spawned, through its own child handle (never a bare pid that another process may
+   * have taken over). Does nothing once it has exited. False when there was nothing to end.
+   */
+  stop(): boolean;
+}
+
+/** Ends a spawned process through its handle, unless it already exited (then the handle no longer reaches anything). */
+export function stopChild(child: ChildProcess): boolean {
+  if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return false;
+  return child.kill();
 }
 
 /**
@@ -72,7 +83,7 @@ export async function launchEngineDaemon(options: LaunchOptions = {}): Promise<L
       const client = await EngineClient.connect({ client: options.client ?? 'cli', dataDir: location.dataDir, pipePath: location.pipePath, timeoutMs: 2000 });
       try {
         const { pid } = await client.request<{ pid: number }>(RPC_METHODS.status, {});
-        return { pid, started: pid === child.pid, pipePath: location.pipePath, dataDir: location.dataDir };
+        return { pid, started: pid === child.pid, pipePath: location.pipePath, dataDir: location.dataDir, stop: () => stopChild(child) };
       } finally {
         client.close();
       }

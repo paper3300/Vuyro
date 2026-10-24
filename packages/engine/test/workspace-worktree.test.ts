@@ -1,11 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { workspaceAggregateId } from '@vuyro/contracts';
 import { EngineQueries } from '../src/daemon/queries.ts';
 import type { ScriptedSession } from '../src/workflow/scripted-agent.ts';
 import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
-import { isRepositoryTop } from '../src/workspace/git.ts';
+import { gitEnvironment, isRepositoryTop, nodeGitExec } from '../src/workspace/git.ts';
 import { laneWorktree, ticketWorktree } from '../src/workspace/layout.ts';
 import { CLI } from './helpers/engine-harness.ts';
 import { openWorkflowHarness, SYSTEM, type WorkflowHarness } from './helpers/workflow-harness.ts';
@@ -279,7 +279,7 @@ describe('worktree mode', { timeout: 120_000 }, () => {
     expect(existsSync(ticketTree.path)).toBe(false);
   });
 
-  it('worktree mode outside a git repository fails the node with the reason', async () => {
+  it('worktree mode on a folder that stopped being a git repository fails the node with the reason', async () => {
     const seen: ScriptedSession['request'][] = [];
     h = await openWorkflowHarness({
       behavior: (s) => {
@@ -293,8 +293,11 @@ describe('worktree mode', { timeout: 120_000 }, () => {
         workspaceMode: 'worktree',
       }),
     );
-    const projectId = await projectAt(h, h.dir);
+    // A repository when the ticket was made (ticket.create checks it), gone by the time the node runs.
+    const repo = gitRepo(join(h.dir, 'was-a-repo'));
+    const projectId = await projectAt(h, repo);
     const ticketId = await ticketIn(h, projectId, 'myteam/one');
+    rmSync(join(repo, '.git'), { recursive: true, force: true });
     await h.drive();
     expect(await h.status(ticketId, 'plan')).toBe('failed');
     expect(currentExecution(await h.ticket(ticketId), 'plan', 'main')?.output?.items[0]?.summary).toContain('needs a git repository');
@@ -400,5 +403,48 @@ describe('worktree mode', { timeout: 120_000 }, () => {
     expect(await refused({ root: fake, settings: { workspaceMode: 'shared' } })).toBe('ok');
     const configured = (await h.store.readAggregate(projectId)).filter((event) => event.type === 'project.configured');
     expect(configured).toHaveLength(4);
+  });
+  it('inherited GIT_DIR, GIT_WORK_TREE and the like do not reach git: the folder the engine names is the one asked', async () => {
+    h = await openWorkflowHarness({ behavior: () => Promise.resolve(undefined) });
+    const repo = gitRepo(join(h.dir, 'repo'));
+    const plain = join(h.dir, 'plain');
+    mkdirSync(plain);
+    const inherited = { ...process.env, GIT_DIR: join(repo, '.git'), GIT_WORK_TREE: plain, GIT_INDEX_FILE: join(repo, '.git', 'index'), GIT_CEILING_DIRECTORIES: h.dir, git_common_dir: join(repo, '.git') };
+    const env = gitEnvironment(inherited);
+    for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CEILING_DIRECTORIES', 'git_common_dir']) expect(env, name).not.toHaveProperty(name);
+    expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+    // With them, git would call the plain folder the top of a repository.
+    expect(await isRepositoryTop(plain, nodeGitExec({ env: inherited }))).toBe(false);
+    expect(await isRepositoryTop(repo, nodeGitExec({ env: inherited }))).toBe(true);
+  });
+
+  it("worktree mode inherited from the app layer is checked too, when the project is configured and when a ticket is made", async () => {
+    h = await openWorkflowHarness({ behavior: () => Promise.resolve(undefined) });
+    const repo = gitRepo(join(h.dir, 'repo'));
+    const plain = join(h.dir, 'plain');
+    mkdirSync(plain);
+    await save(h, template('myteam/one', [{ id: 'plan', type: 'vuyro.agent', version: 1, params: { instructions: 'plan' } }, { id: 'end', type: 'vuyro.end', version: 1 }], [edge('plan', 'done', 'end')]));
+    await save(
+      h,
+      template('myteam/wt', [{ id: 'plan', type: 'vuyro.agent', version: 1, params: { instructions: 'plan' } }, { id: 'end', type: 'vuyro.end', version: 1 }], [edge('plan', 'done', 'end')], { workspaceMode: 'worktree' }),
+    );
+    const code = (response: { ok: boolean; error?: { code: string } } | undefined) => (response?.ok === false ? response.error?.code : 'ok');
+    const { projectId } = (await h.ok('project.create', { name: 'sample' })).result as { projectId: string };
+    await h.ok('project.configure', { projectId, root: plain });
+    const ticket = async (templateId: string) => code(await h?.exec('ticket.create', { projectId, title: 't', template: { id: templateId } }));
+    // A template that chooses worktree mode, on a folder that is not a repository.
+    expect(await ticket('myteam/wt')).toBe('validation_failed');
+    expect(await ticket('myteam/one')).toBe('ok');
+    // The app layer says worktree: the project's folder must be a repository now.
+    await h.ok('app.configure', { settings: { workspaceMode: 'worktree' } });
+    expect(await ticket('myteam/one')).toBe('validation_failed');
+    expect(code(await h.exec('project.configure', { projectId, root: plain }))).toBe('validation_failed');
+    expect(code(await h.exec('project.configure', { projectId, settings: { onConflict: 'warn' } }))).toBe('validation_failed');
+    // The project's own layer can choose shared; or the folder can be a repository.
+    expect(code(await h.exec('project.configure', { projectId, settings: { workspaceMode: 'shared' } }))).toBe('ok');
+    expect(await ticket('myteam/one')).toBe('ok');
+    expect(code(await h.exec('project.configure', { projectId, root: repo, settings: {} }))).toBe('ok');
+    expect(await ticket('myteam/one')).toBe('ok');
+    expect(await ticket('myteam/wt')).toBe('ok');
   });
 });

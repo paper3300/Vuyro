@@ -20,6 +20,7 @@ import { locate, type Location } from '../workspace/layout.ts';
 import { entriesOf, findConflicts, holderKey, keptSignature, type LedgerEntry, type LedgerState, type PathRequest, sameHolder, warnKey } from '../workspace/ledger.ts';
 import { insideRoot, isPattern, matches, normalizeRelative, pathKey } from '../workspace/paths.ts';
 import type { WorkspaceServices } from '../workspace/services.ts';
+import { mergeSettings } from '../workspace/settings.ts';
 import { appSettingsAggregate, type AppSettingsState, projectAggregate, type ProjectState, type TicketState, ticketAggregate, workspaceAggregate } from './aggregates.ts';
 import type { CommandTarget } from './authorize.ts';
 import type { CommandHandler, HandlerContext, Loaded } from './handlers.ts';
@@ -66,13 +67,18 @@ export const projectConfigure: CommandHandler<'project.configure', ProjectState>
 
 /**
  * Worktree mode needs the project folder to be a git repository's own folder (D-072): checked when the change touches
- * the folder or the settings, against the folder and mode the project has after it.
+ * the folder or the settings, against the folder the project has after it and its effective mode (the app layer it
+ * inherits, then its own).
  */
 async function worktreeNeedsRepository(ctx: HandlerContext, payload: CommandPayload<'project.configure'>, state: ProjectState): Promise<Failure | undefined> {
   if (payload.root === undefined && payload.settings === undefined) return undefined;
-  const settings = payload.settings ?? state.settings;
-  if (settings?.workspaceMode !== 'worktree') return undefined;
-  const root = payload.root === undefined ? state.root : (payload.root ?? undefined);
+  const app = await ctx.load(appSettingsAggregate, APP_SETTINGS_AGGREGATE_ID);
+  if (mergeSettings(app.state.settings, payload.settings ?? state.settings).workspaceMode !== 'worktree') return undefined;
+  return repositoryFor(ctx, payload.root === undefined ? state.root : (payload.root ?? undefined));
+}
+
+/** The folder worktree mode needs: there, and a git repository's own folder. */
+export async function repositoryFor(ctx: HandlerContext, root: string | undefined): Promise<Failure | undefined> {
   if (root === undefined) return fail('validation_failed', 'worktree mode needs a project folder that is a git repository');
   if (!(await servicesOf(ctx).isGitRepository(root))) return fail('validation_failed', `worktree mode needs a git repository, and ${root} is not the top folder of one`);
   return undefined;

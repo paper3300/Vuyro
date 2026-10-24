@@ -49,12 +49,32 @@ export class GitError extends Error {
 
 const MAX_BUFFER = 64 * 1024 * 1024;
 
+/**
+ * Variables that move where git finds the repository, its index or its objects. Inherited from whoever started the
+ * engine (a terminal inside another repository, a git hook), they would point every engine git call, and the "is this a
+ * repository" check, somewhere other than the folder the engine names. The engine always names the folder (`cwd`).
+ */
+export const GIT_LOCATION_VARIABLES: readonly string[] = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_COMMON_DIR',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_CEILING_DIRECTORIES',
+  'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+  'GIT_NAMESPACE',
+  'GIT_PREFIX',
+  'GIT_IMPLICIT_WORK_TREE',
+];
+
 /** Environment for git: no prompts, no optional locks (status must not write the index), stable output. */
 export function gitEnvironment(base: Readonly<Record<string, string | undefined>> = process.env): Record<string, string> {
   const env: Record<string, string> = {};
+  const location = new Set(GIT_LOCATION_VARIABLES);
   for (const [name, value] of Object.entries(base)) {
-    // The engine's own variables never reach git (or the hooks a repository might run).
-    if (value !== undefined && !/^vuyro_/i.test(name)) env[name] = value;
+    // The engine's own variables never reach git (or the hooks a repository might run), nor ones that relocate the repository.
+    if (value !== undefined && !/^vuyro_/i.test(name) && !location.has(name.toUpperCase())) env[name] = value;
   }
   env.GIT_TERMINAL_PROMPT = '0';
   env.GIT_OPTIONAL_LOCKS = '0';

@@ -40,6 +40,8 @@ export interface QuitDeps {
   /** Tells the person something (no answer needed). */
   notify(message: { readonly message: string; readonly detail: string }): Promise<void>;
   shutdownEngine(): Promise<BridgeResult<unknown>>;
+  /** Waits (bounded) for what quitting set off in the connection: an attempt under way, ending an engine it started. */
+  settleConnection(): Promise<void>;
   exitApp(): void;
 }
 
@@ -69,15 +71,18 @@ export async function quitForGood(deps: QuitDeps): Promise<QuitOutcome> {
         detail: '이 앱은 엔진을 멈출 권한이 없습니다(다른 곳에서 시작한 엔진). 터미널에서 `vuyro engine stop`으로 멈출 수 있습니다.',
       });
     }
+    await deps.settleConnection();
     deps.exitApp();
     return 'quit-engine-kept';
   }
   const stopped = await deps.shutdownEngine();
   if (!stopped.ok) {
     await deps.notify({ message: '엔진을 멈추지 못했습니다.', detail: `${stopped.error.message} 앱만 종료합니다.` });
+    await deps.settleConnection();
     deps.exitApp();
     return 'quit-engine-kept';
   }
+  await deps.settleConnection();
   deps.exitApp();
   return 'quit-with-engine';
 }

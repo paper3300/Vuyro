@@ -28,13 +28,13 @@ import {
   WorkflowDraft,
 } from '../workflow/machine.ts';
 import { locate } from '../workspace/layout.ts';
-import { mergingJoins, nodeSettings } from '../workspace/settings.ts';
+import { effectiveSettings, mergeSettings, mergingJoins, nodeSettings } from '../workspace/settings.ts';
 import { ACTIVE_STATUSES, currentExecution, EMPTY_TICKET, type Execution, execution, laneOf, nodeProgress } from '../workflow/state.ts';
 import { type DefinitionState, definitionAggregate, runAggregate, type TicketState, ticketAggregate } from './aggregates.ts';
 import type { CommandTarget } from './authorize.ts';
 import type { CommandHandler, Decision, HandlerContext, Loaded } from './handlers.ts';
 import { issueRunToken } from './run-token.ts';
-import { checkoutAcquire, checkoutRelease, claimItems, decideClaims, holderOf, preemptionAppends, servicesOf } from './workspace-handlers.ts';
+import { checkoutAcquire, checkoutRelease, claimItems, decideClaims, holderOf, preemptionAppends, repositoryFor, servicesOf } from './workspace-handlers.ts';
 
 /**
  * Handlers of the workflow commands (M2): definitions, node results, approvals, and the engine's
@@ -437,6 +437,14 @@ export async function createTicketEvents(
   if (loaded === undefined) {
     const version = payload.template.version === undefined ? '' : `@${payload.template.version}`;
     return fail('not_found', `template ${payload.template.id}${version} is not active`);
+  }
+  // Any node that would run in worktree mode (app → project → template → node) needs the folder to be a repository.
+  const worktree = [...loaded.workflow.nodes.values()].some(
+    (node) => effectiveSettings(mergeSettings(workspace?.settings, loaded.workflow.template.settings, node.instance.settings)).workspaceMode === 'worktree',
+  );
+  if (worktree) {
+    const refusal = await repositoryFor(ctx, workspace?.root);
+    if (refusal !== undefined) return refusal;
   }
   const draft = new WorkflowDraft(ticketId, EMPTY_TICKET, loaded.workflow);
   draft.emit({ type: 'ticket.created', data: { ...base, template: loaded.pin } });

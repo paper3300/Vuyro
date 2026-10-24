@@ -21,7 +21,7 @@ export class FakeEngine {
   failLaunch: Error | undefined;
   /** The next N connects to a running engine fail as if it did not answer (an engine that started but is not reachable). */
   connectFailures = 0;
-  /** Pids passed to `stopLaunched`. */
+  /** Pids of launched engines ended through their handle (`stop`). */
   readonly killed: number[] = [];
   /** When set, `launch` waits for it (a launch still on its way). */
   launchGate: Promise<void> | undefined;
@@ -45,6 +45,14 @@ export class FakeEngine {
     this.running = false;
     this.known.clear();
     for (const link of [...this.links]) link.cut(new Error('engine gone'));
+  }
+
+  /** The handle of a launched engine: ends it only while it still runs (a handle of an exited process reaches nothing). */
+  endLaunched(pid: number): boolean {
+    if (!this.running) return false;
+    this.killed.push(pid);
+    this.crash();
+    return true;
   }
 
   issueCredential(): string {
@@ -71,24 +79,20 @@ export class FakeEngine {
         this.links.add(link);
         return Promise.resolve(link);
       },
-      stopLaunched: (pid) => {
-        this.killed.push(pid);
-        this.crash();
-      },
       launch: async (credential) => {
         this.launches.push(credential);
         if (this.launchGate !== undefined) await this.launchGate;
         if (this.failLaunch !== undefined) return Promise.reject(this.failLaunch);
         if (this.launchRace) {
           this.running = true;
-          return Promise.resolve({ started: false, pid: 2 });
+          return Promise.resolve({ started: false, pid: 2, stop: () => false });
         }
         if (!this.running) {
           this.running = true;
           this.known.add(credential);
-          return Promise.resolve({ started: true, pid: 1 });
+          return Promise.resolve({ started: true, pid: 1, stop: () => this.endLaunched(1) });
         }
-        return Promise.resolve({ started: false, pid: 1 });
+        return Promise.resolve({ started: false, pid: 1, stop: () => false });
       },
     };
   }

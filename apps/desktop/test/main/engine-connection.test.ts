@@ -255,6 +255,9 @@ describe('engine connection', () => {
         });
       },
       shutdownEngine: () => connection.shutdownEngine(),
+      settleConnection: async () => {
+        await connection.whenQuitSettled(10_000);
+      },
       exitApp: () => {
         exited = true;
         connection.stop();
@@ -307,38 +310,84 @@ describe('engine connection', () => {
     expect(engine.links.size).toBe(0);
   });
 
-  it('an engine it started but could not reach is ended when the person quits, and nothing starts again', async () => {
+  it('an engine it started but cannot reach at all is ended through its launch handle when the person quits', async () => {
     const { engine, scheduler, connection } = setup((fake) => {
-      fake.connectFailures = 1;
+      fake.connectFailures = 10;
     });
     await connection.start();
     expect(engine.launches).toHaveLength(1);
     expect(connection.current.phase).toBe('failed');
     connection.beginQuit();
+    expect(await connection.whenQuitSettled(10_000)).toBe('settled');
+    // One more try to reach it first; ended only because nothing answered.
     expect(engine.killed).toEqual([1]);
+    expect(engine.shutdowns).toBe(0);
     expect(engine.running).toBe(false);
     await scheduler.advance(60_000);
     expect(engine.launches).toHaveLength(1);
   });
 
-  it('quitting while that engine is still being reached: the attempt ends it once it fails', async () => {
+  it('one that answers the last try is asked to shut down, never ended', async () => {
+    const { engine, connection } = setup((fake) => {
+      fake.connectFailures = 1;
+    });
+    await connection.start();
+    connection.beginQuit();
+    expect(await connection.whenQuitSettled(10_000)).toBe('settled');
+    expect(engine.shutdowns).toBe(1);
+    expect(engine.killed).toEqual([]);
+  });
+
+  it('one that already exited is left alone: its handle reaches nothing', async () => {
+    const { engine, connection } = setup((fake) => {
+      fake.connectFailures = 10;
+    });
+    await connection.start();
+    engine.crash();
+    connection.beginQuit();
+    expect(await connection.whenQuitSettled(10_000)).toBe('settled');
+    expect(engine.killed).toEqual([]);
+  });
+
+  it('quitting while that engine is still being reached: the app waits for the attempt to end it', async () => {
     let open: () => void = () => undefined;
     const { engine, connection } = setup((fake) => {
       fake.launchGate = new Promise<void>((resolve) => {
         open = resolve;
       });
-      fake.connectFailures = 1;
+      fake.connectFailures = 10;
     });
-    const starting = connection.start();
+    void connection.start();
     await settle();
     connection.beginQuit();
     // The attempt is under way: it, not beginQuit, decides (it may still reach the engine and stop it properly).
+    let settled: string | undefined;
+    void connection.whenQuitSettled(10_000).then((outcome) => (settled = outcome));
+    await settle();
+    expect(settled).toBeUndefined();
     expect(engine.killed).toEqual([]);
     open();
-    await starting;
+    await settle();
+    expect(settled).toBe('settled');
     expect(engine.killed).toEqual([1]);
     expect(engine.running).toBe(false);
   });
+
+  it('does not wait for ever: a launch that never finishes lets the app exit after the time limit', async () => {
+    const { scheduler, connection } = setup((fake) => {
+      fake.launchGate = new Promise<void>(() => undefined);
+    });
+    void connection.start();
+    await settle();
+    connection.beginQuit();
+    let settled: string | undefined;
+    void connection.whenQuitSettled(10_000).then((outcome) => (settled = outcome));
+    await scheduler.advance(9_000);
+    expect(settled).toBeUndefined();
+    await scheduler.advance(1_000);
+    expect(settled).toBe('timeout');
+  });
+
 
   it('an engine it started and reached later is stopped through the link, not ended', async () => {
     const { engine, scheduler, connection } = setup((fake) => {

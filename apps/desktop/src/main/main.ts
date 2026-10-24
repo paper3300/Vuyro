@@ -133,6 +133,9 @@ function requestQuit(): void {
       await ask({ type: 'info', title: 'Vuyro', message, detail, buttons: ['확인'] });
     },
     shutdownEngine: () => connection.shutdownEngine(),
+    settleConnection: async () => {
+      await connection.whenQuitSettled(10_000);
+    },
     exitApp: () => {
       connection.stop();
       tray?.destroy();
