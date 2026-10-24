@@ -1,0 +1,38 @@
+{
+  "vuyro": "export",
+  "formatVersion": 1,
+  "kind": "nodeType",
+  "id": "vuyro.shared-request",
+  "version": 1,
+  "name": "Shared node request",
+  "author": "Vuyro",
+  "content": {
+    "type": "vuyro.shared-request",
+    "version": 1,
+    "label": "Shared node request",
+    "description": "Queues this ticket's work for a shared node of the project (a build, a test run, a deploy) and waits for this ticket's share of the batch result. 'done': the batch succeeded. 'error': the batch failed and this ticket is to blame (or the request could not be served); its data has 'errorsForThisTicket'.",
+    "completion": "shared",
+    "inputs": [{ "name": "in", "label": "Request" }],
+    "outputs": [
+      {
+        "name": "done",
+        "label": "Batch succeeded",
+        "artifacts": [{ "slot": "log", "kinds": ["file"] }]
+      },
+      {
+        "name": "error",
+        "label": "Batch failed",
+        "artifacts": [{ "slot": "log", "kinds": ["file"] }]
+      }
+    ],
+    "params": [
+      {
+        "name": "sharedNode",
+        "label": "Shared node",
+        "description": "Name of the project's shared node to queue for.",
+        "required": true,
+        "schema": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$" }
+      }
+    ]
+  }
+}

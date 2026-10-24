@@ -37,7 +37,9 @@ export interface Execution {
   readonly attempts: number;
   /** Automatic restarts so far (engine restart, cancelled without a pause). Bounded by MAX_AUTOMATIC_ATTEMPTS. */
   readonly requeues: number;
-  readonly executor?: 'agent' | 'script' | 'merge';
+  readonly executor?: 'agent' | 'script' | 'merge' | 'shared';
+  /** A request node's batch (executor 'shared', M5): the shared node and batch it runs in. */
+  readonly batch?: { readonly sharedNode: string; readonly batch: number; readonly batchId: string };
   /** Agent runs of this execution, oldest first. The last one is current. */
   readonly runIds: readonly string[];
   /** What the agent submitted with `node.done` (applied when its run settles). */
@@ -300,6 +302,7 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEven
           status: 'running',
           attempts: data.attempt,
           executor: data.executor,
+          batch: data.batch,
           runIds: data.runId === undefined ? current.runIds : [...current.runIds, data.runId],
           resumeFromRunId: undefined,
           merge: undefined,
@@ -360,6 +363,7 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEven
           ...current,
           status: 'queued',
           pauseClaim: undefined,
+          batch: undefined,
           requeues: current.requeues + 1,
           submitted: undefined,
           resumeFromRunId: event.data.resumeFromRunId,

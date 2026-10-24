@@ -5,8 +5,6 @@ import {
   type CommandResponse,
   type CommandType,
   type DomainEvent,
-  resolveTemplateValue,
-  stringifyValue,
 } from '@vuyro/contracts';
 import type { CommandBus } from '../commands/command-bus.ts';
 import type { TransportIdentity } from '../commands/caller.ts';
@@ -20,10 +18,13 @@ import { GitClient } from '../workspace/git.ts';
 import type { WorkspaceServices } from '../workspace/services.ts';
 import { mergingJoins } from '../workspace/settings.ts';
 import type { FileWatcher } from '../workspace/watcher.ts';
-import type { CompiledNode, CompiledWorkflow } from './compile.ts';
+import type { FileSystem } from '../runtime/fs.ts';
+import { SharedNodeScheduler } from '../shared/scheduler.ts';
+import { type CompiledNode, type CompiledWorkflow, SHARED_NODE_PARAM } from './compile.ts';
 import { executionContext } from './context.ts';
 import type { DefinitionResolver } from './definitions.ts';
 import { agentPrompt } from './prompt.ts';
+import { resolveScript, startScript } from './script-runner.ts';
 import { currentExecution, EMPTY_TICKET, evolveTicket, type Execution, nodeProgress, type TicketWorkflow } from './state.ts';
 
 export interface WorkflowEngineOptions {
@@ -64,6 +65,8 @@ export interface WorkflowEngineOptions {
   readonly watcher?: FileWatcher;
   /** The user's Codex folder, read for the checkout hook's safety check. Default `CODEX_HOME`, else `~/.codex`. */
   readonly codexHome?: string;
+  /** Where shared nodes write each batch's output (M5). Default: not written (the tickets get its tail). */
+  readonly sharedLogs?: { readonly dir: string; readonly fs: FileSystem };
   readonly reportError?: (error: Error, context: string) => void;
 }
 
@@ -93,8 +96,6 @@ interface LiveExecution {
 }
 
 const SYSTEM: TransportIdentity = { kind: 'internal', component: 'workflow' };
-const STDOUT_LIMIT = 1_048_576;
-const STDERR_LIMIT = 65_536;
 const INHERITED_ENV = ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'LANG'];
 
 function defaultScriptEnv(): Record<string, string> {
@@ -125,12 +126,16 @@ export class WorkflowEngine {
   readonly activity: ActivityTracker;
   /** The engine's file and git work for workspaces (M4). */
   readonly workspaces: WorkspaceCoordinator;
+  /** Shared nodes' batches (M5). */
+  readonly shared: SharedNodeScheduler;
   private readonly options: WorkflowEngineOptions;
   private readonly maxConcurrent: number;
   private readonly scriptEnv: Readonly<Record<string, string>>;
   private readonly live = new Map<string, LiveExecution>();
   private readonly tickets = new Map<string, { revision: number; state: TicketWorkflow }>();
   private readonly scheduled = new Set<string>();
+  /** Requests known to be in their shared node's queue (or batch), so ticks do not ask again. */
+  private readonly enqueued = new Set<string>();
   private chain: Promise<void> = Promise.resolve();
   private unsubscribe: (() => void) | undefined;
   private stopped = false;
@@ -154,6 +159,19 @@ export class WorkflowEngine {
         this.report(error, context);
       },
     });
+    this.shared = new SharedNodeScheduler({
+      bus: options.bus,
+      store: options.store,
+      definitions: options.definitions,
+      clock: options.clock,
+      processRunner: options.processRunner,
+      activity: this.activity,
+      scriptEnv: this.scriptEnv,
+      ...(options.sharedLogs === undefined ? {} : { logs: options.sharedLogs }),
+      reportError: (error, context) => {
+        this.report(error, context);
+      },
+    });
   }
 
   /** Settles runs orphaned by a previous engine, then picks up every ticket with work left. */
@@ -162,11 +180,14 @@ export class WorkflowEngine {
     this.unsubscribe ??= this.options.store.subscribe((events) => {
       this.onEvents(events);
       this.workspaces.onEvents(events);
+      this.shared.onEvents(events);
     });
     await this.activity.track(async () => {
       await settleOrphanedRuns(this.options.bus, this.options.store);
       // Entries of executions that ended while the engine was down go; spaces are checked for unwatched changes.
       await this.workspaces.recover();
+      // Batches that ran when the engine stopped are interrupted; the queues go on.
+      await this.shared.start();
       await this.scheduleWaiting(true);
     });
   }
@@ -175,14 +196,15 @@ export class WorkflowEngine {
   stop(options: { cancelRunning?: boolean } = {}): void {
     this.stopped = true;
     this.workspaces.stop();
+    this.shared.stop(options);
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     if (options.cancelRunning === true) for (const live of this.live.values()) this.cancel(live);
   }
 
-  /** Executions running in this process right now. */
+  /** Executions and shared-node batches running in this process right now. */
   get running(): number {
-    return this.live.size;
+    return this.live.size + this.shared.running;
   }
 
   idle(): Promise<void> {
@@ -252,6 +274,10 @@ export class WorkflowEngine {
       this.report(error, `loading the workflow of ticket ${ticketId}`);
       return;
     }
+    // Request nodes (M5): a queued request joins its shared node's queue; the batch decides when it runs.
+    for (const node of workflow.nodes.values()) {
+      if (node.completion === 'shared') await this.enqueueRequests(ticketId, state, node);
+    }
     const merging = mergingJoins(state, workflow);
     for (const node of workflow.nodes.values()) {
       if (node.completion !== 'agent' && node.completion !== 'script' && !merging.has(node.id)) continue;
@@ -266,6 +292,20 @@ export class WorkflowEngine {
           this.launch(ticketId, state, workflow, node, exec);
         }
       }
+    }
+  }
+
+  private async enqueueRequests(ticketId: string, state: TicketWorkflow, node: CompiledNode): Promise<void> {
+    const revision = this.tickets.get(ticketId)?.revision ?? 0;
+    for (const lane of nodeProgress(state, node.id).laneOrder) {
+      const exec = currentExecution(state, node.id, lane);
+      if (exec?.status !== 'queued') continue;
+      const key = keyOf(ticketId, node.id, lane, exec.run);
+      if (this.enqueued.has(key)) continue;
+      const payload = { projectId: state.projectId, name: node.params[SHARED_NODE_PARAM], ticketId, nodeId: node.id, lane, run: exec.run };
+      // The revision is part of the id: a request that was not queued yet (paused) is asked again once it is.
+      const response = await this.command('shared-enqueue', 'sharedNode.enqueue', payload, ticketId, node.id, lane, exec.run, revision);
+      if (response.ok && (response.result as { queued: boolean }).queued) this.enqueued.add(key);
     }
   }
 
@@ -542,45 +582,23 @@ export class WorkflowEngine {
       return;
     }
     const context = executionContext(state, workflow, ticketId, node, { ...exec, attempts: attempt });
-    const program = stringifyValue(resolveTemplateValue(script.program, context));
-    const args = script.args.flatMap((arg) => {
-      const value = resolveTemplateValue(arg, context);
-      return Array.isArray(value) ? value.map((item) => stringifyValue(item)) : [stringifyValue(value)];
-    });
-    const env: Record<string, string> = { ...this.scriptEnv };
-    for (const [name, value] of script.env) env[name] = stringifyValue(resolveTemplateValue(value, context));
-    const cwd =
-      script.cwd === undefined
-        ? (prepared.cwd ?? this.options.workspace?.({ ticketId, projectId: state.projectId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt }))
-        : stringifyValue(resolveTemplateValue(script.cwd, context));
-    if (program === '') {
+    const invocation = resolveScript(script, context, this.scriptEnv);
+    if (invocation.program === '') {
       await this.afterRun(target);
       await finish({ exitCode: null, error: 'the program resolved to an empty string' });
       return;
     }
-    const child = this.options.processRunner.spawn({ command: program, args, env, ...(cwd === undefined || cwd === '' ? {} : { cwd }) });
-    let timedOut = false;
+    const cwd = prepared.cwd ?? this.options.workspace?.({ ticketId, projectId: state.projectId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt });
+    const child = startScript(this.options.processRunner, this.options.clock, invocation, cwd);
     live.cancel = () => {
-      child.kill('SIGKILL');
+      child.kill();
     };
-    if (live.cancelled) child.kill('SIGKILL');
-    const timer = this.options.clock.setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
-    }, script.timeoutMs);
+    if (live.cancelled) child.kill();
     endSpan();
-    const [stdout, stderr, exit] = await Promise.all([collect(child.stdout, STDOUT_LIMIT), collect(child.stderr, STDERR_LIMIT), child.exited]);
-    this.options.clock.clearTimeout(timer);
+    const exit = await child.exited;
     await this.activity.track(async () => {
       await this.afterRun(target);
-      await finish({
-        exitCode: exit.code,
-        signal: exit.signal,
-        ...(timedOut ? { timedOut: true } : {}),
-        ...(exit.error === undefined ? {} : { error: `could not start '${program}': ${exit.error.message}` }),
-        stdout,
-        stderr,
-      });
+      await finish({ ...exit });
     });
   }
 
@@ -603,14 +621,4 @@ export class WorkflowEngine {
     if (this.options.reportError !== undefined) this.options.reportError(failed, context);
     else process.stderr.write(`[vuyro] ${context}: ${failed.message}\n`);
   }
-}
-
-async function collect(chunks: AsyncIterable<string>, limit: number): Promise<string> {
-  let text = '';
-  for await (const chunk of chunks) {
-    text += chunk;
-    // Keep the tail: the last line is where a JSON result is.
-    if (text.length > limit * 2) text = text.slice(-limit);
-  }
-  return text.length > limit ? text.slice(-limit) : text;
 }

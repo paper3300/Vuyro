@@ -21,6 +21,7 @@ export * from './principal.ts';
 export * from './providers.ts';
 export * from './rpc.ts';
 export * from './schema.ts';
+export * from './shared.ts';
 export * from './usage.ts';
 export * from './workflow.ts';
 export * from './workspace.ts';

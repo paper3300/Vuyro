@@ -3,8 +3,10 @@ import { CommandErrorSchema } from './errors.ts';
 import { CHECKOUT_RELEASE_REASONS, EXECUTION_FIELDS, LaneSchema, OBSERVATION_FIELDS, RUN_SETTLE_FIELDS, TicketPriority } from './events.ts';
 import { ArtifactRefSchema, ItemRefSchema, PORT_PATTERN, SLOT_PATTERN } from './handoff.ts';
 import { IdSchema, NodeIdSchema, RequestIdSchema } from './ids.ts';
+import { SharedNodeSpecSchema } from './node-type.ts';
 import { PermissionRuleSchema } from './permission.ts';
 import { AGENT_PROVIDERS } from './providers.ts';
+import { BatchInterruptedSchema, BatchScriptResultSchema, SharedNodeFields, SharedNodeNameSchema } from './shared.ts';
 import {
   DEFINITION_ID_PATTERN,
   DEFINITION_KINDS,
@@ -285,6 +287,78 @@ export const COMMAND_CATALOG = {
       'Remove a worktree the engine left for a person (query.worktreeCleanup shows it), with exactly the content shown: the fingerprint must still match when the engine removes it.',
     payload: Type.Object({ projectId: IdSchema, key: Type.String({ minLength: 1, maxLength: 230 }), fingerprint: HashSchema }, strict),
     result: Type.Object({ requested: Type.Boolean() }, strict),
+  },
+  'sharedNode.define': {
+    version: 1,
+    scope: 'project',
+    category: 'definition',
+    access: { nodeAgent: 'deny' },
+    summary:
+      "Define (or redefine) a shared node of a project: the node type it runs once per batch, its triggers, the paths it protects while running and how a failed batch is settled.",
+    payload: Type.Object({ projectId: IdSchema, spec: SharedNodeSpecSchema }, strict),
+    result: Type.Object(
+      {
+        name: SharedNodeNameSchema,
+        version: Type.Integer({ minimum: 1 }),
+        /** Parts of the spec this engine accepts but does not act on yet (e.g. `schedule`). */
+        warnings: Type.Array(Type.String({ maxLength: 1024 }), { maxItems: 64 }),
+      },
+      strict,
+    ),
+  },
+  'sharedNode.run': {
+    version: 1,
+    scope: 'project',
+    category: 'node',
+    access: { nodeAgent: 'deny' },
+    summary: "Start a batch now with what is queued (the 'manual' trigger). Protected paths held by others are overlapped, not waited for.",
+    payload: Type.Object(SharedNodeFields, strict),
+    result: Type.Object({ started: Type.Boolean(), batch: Type.Optional(Type.Integer({ minimum: 1 })), reason: Type.Optional(Type.String({ maxLength: 4096 })) }, strict),
+  },
+  'sharedNode.unblock': {
+    version: 1,
+    scope: 'project',
+    category: 'node',
+    access: { nodeAgent: 'deny' },
+    summary: 'Let a blocked shared node start batches again (the blame was wrong, or a person handled an interrupted batch).',
+    payload: Type.Object(SharedNodeFields, strict),
+    result: Type.Object({ unblocked: Type.Boolean() }, strict),
+  },
+  'sharedNode.enqueue': {
+    version: 1,
+    scope: 'node',
+    category: 'node',
+    access: { nodeAgent: 'deny', systemOnly: true },
+    summary: "Put a queued request node's execution in its shared node's queue (or fail it when the request cannot be served).",
+    payload: Type.Object({ ...SharedNodeFields, ...EXECUTION_FIELDS }, strict),
+    result: Type.Object({ queued: Type.Boolean(), reason: Type.Optional(Type.String({ maxLength: 4096 })) }, strict),
+  },
+  'sharedNode.start': {
+    version: 1,
+    scope: 'project',
+    category: 'node',
+    access: { nodeAgent: 'deny', systemOnly: true },
+    summary: 'Start a batch if a trigger is met (count, window, afterPrevious, or requests put back by a failed batch).',
+    payload: Type.Object(SharedNodeFields, strict),
+    result: Type.Object(
+      {
+        started: Type.Boolean(),
+        batch: Type.Optional(Type.Integer({ minimum: 1 })),
+        reason: Type.Optional(Type.String({ maxLength: 4096 })),
+        /** When the `window` trigger will be met (epoch ms), if nothing else starts it first. */
+        nextCheckAt: Type.Optional(Type.Integer({ minimum: 0 })),
+      },
+      strict,
+    ),
+  },
+  'sharedNode.finish': {
+    version: 1,
+    scope: 'project',
+    category: 'node',
+    access: { nodeAgent: 'deny', systemOnly: true },
+    summary: "Apply the end of a batch: every member ticket's share of the result, or the failure policy.",
+    payload: Type.Object({ ...SharedNodeFields, batch: Type.Integer({ minimum: 1 }), result: Type.Union([BatchScriptResultSchema, BatchInterruptedSchema]) }, strict),
+    result: Empty,
   },
   'workspace.record': {
     version: 1,

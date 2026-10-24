@@ -848,7 +848,61 @@ const workspace: Projector = {
   },
 };
 
-export const BUILTIN_PROJECTORS: readonly Projector[] = [projects, tickets, nodes, runs, permissions, audit, definitions, workspace];
+/**
+ * Shared nodes (M5): which exist in which project, and how busy they are. The queue and batches themselves are read by
+ * folding the shared node's aggregate (`query.sharedNodes`).
+ */
+const shared: Projector = {
+  name: 'shared',
+  version: 1,
+  tables: ['p_shared_nodes'],
+  ddl: [
+    `CREATE TABLE p_shared_nodes (
+      aggregate_id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      label TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      queued INTEGER NOT NULL DEFAULT 0,
+      running INTEGER NOT NULL DEFAULT 0,
+      blocked TEXT,
+      last_batch INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    ) STRICT`,
+    'CREATE INDEX p_shared_nodes_by_project ON p_shared_nodes (project_id, name)',
+  ],
+  apply(event) {
+    const touch = (set: string, params: readonly (string | number | null)[]): SqliteStatement[] => [
+      { sql: `UPDATE p_shared_nodes SET ${set}, updated_at = ? WHERE aggregate_id = ?`, params: [...params, event.timestamp, event.aggregateId] },
+    ];
+    switch (event.type) {
+      case 'sharedNode.defined':
+        return [
+          {
+            sql: `INSERT INTO p_shared_nodes (aggregate_id, project_id, name, label, version, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+                  ON CONFLICT (aggregate_id) DO UPDATE SET label = excluded.label, version = excluded.version, updated_at = excluded.updated_at`,
+            params: [event.aggregateId, event.data.projectId, event.data.name, event.data.spec.label, event.data.version, event.timestamp],
+          },
+        ];
+      case 'sharedNode.requestQueued':
+        return touch('queued = queued + 1 - ?', [event.data.replaces?.length ?? 0]);
+      case 'sharedNode.requestDropped':
+        return touch('queued = MAX(0, queued - ?)', [event.data.requests.length]);
+      case 'sharedNode.batchStarted':
+        return touch('queued = MAX(0, queued - ?), running = running + 1, last_batch = MAX(last_batch, ?)', [event.data.members.length, event.data.batch]);
+      case 'sharedNode.batchFinished':
+        return touch('queued = queued + ?, running = MAX(0, running - 1)', [event.data.requeued.length]);
+      case 'sharedNode.blocked':
+        return touch('blocked = ?', [event.data.reason]);
+      case 'sharedNode.unblocked':
+        return touch('blocked = NULL', []);
+      default:
+        return [];
+    }
+  },
+};
+
+export const BUILTIN_PROJECTORS: readonly Projector[] = [projects, tickets, nodes, runs, permissions, audit, definitions, workspace, shared];
 
 /** Identifies the projection set; a mismatch with the stored value triggers a rebuild. */
 export function projectionVersion(projectors: readonly Projector[]): string {

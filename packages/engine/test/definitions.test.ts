@@ -60,6 +60,7 @@ describe('definition files', () => {
       'nodeType:vuyro.join:active',
       'nodeType:vuyro.review-agent:active',
       'nodeType:vuyro.script:active',
+      'nodeType:vuyro.shared-request:active',
       'template:vuyro/ai-sdlc:active',
     ]);
     const template = await builtinTemplate();
@@ -142,7 +143,7 @@ describe('definition files', () => {
     expect(JSON.stringify(failure.error.details)).toMatch(/myteam.task@1 is not available/);
   });
 
-  it("rejects node types this engine cannot run (fail closed on 'shared')", async () => {
+  it("rejects request nodes ('shared') without the ports and the shared node param the engine needs (M5)", async () => {
     h = await openWorkflowHarness({ noEngine: true });
     const definition: DefinitionEnvelope = {
       vuyro: 'export',
@@ -155,6 +156,9 @@ describe('definition files', () => {
     };
     const failure = expectFailure(await h.writer.save(definition, HUMAN, nextRequestId()), 'validation_failed');
     expect(failure.error.message).toMatch(/not valid/);
+    const issues = JSON.stringify(failure.error.details);
+    expect(issues).toMatch(/missing 'error'/);
+    expect(issues).toMatch(/required string param 'sharedNode'/);
   });
 
   it('abandons a version whose file cannot be written, and the same save works afterwards', async () => {

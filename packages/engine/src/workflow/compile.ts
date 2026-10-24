@@ -13,6 +13,8 @@ import {
   referencedNodes,
   SchemaReferenceError,
   type SchemaValidator,
+  SHARED_NODE_NAME_PATTERN,
+  type SharedNodeSpec,
   type TemplateEdge,
   type TemplateNode,
   type TemplateSpec,
@@ -112,6 +114,10 @@ export interface CompiledWorkflow {
   readonly ends: readonly string[];
   readonly warnings: readonly DefinitionIssue[];
 }
+
+/** The param of a request node (`completion: 'shared'`) naming its shared node, and the ports it finishes through. */
+export const SHARED_NODE_PARAM = 'sharedNode';
+export const SHARED_REQUEST_PORTS = ['done', 'error'] as const;
 
 /** Roots usable in prompts, params and script fields. `params` is not available inside params. */
 const RUN_ROOTS: readonly ExpressionRoot[] = ['input', 'inputs', 'nodes', 'params', 'ticket', 'node', 'feedback'];
@@ -216,10 +222,21 @@ export function compileNodeType(spec: NodeTypeSpec, validator: SchemaValidator):
         issues.add('/outputs', "join nodes finish through a 'done' port");
       }
       break;
-    case 'shared':
-      // Fail closed: an engine that cannot run shared nodes must not accept a definition that needs them.
-      issues.add('/completion', "'shared' nodes are not supported by this engine yet (M5)");
+    case 'shared': {
+      // A request node (M5): it queues its ticket's work for a shared node of the project and waits for its share.
+      if (spec.prompt !== undefined) issues.add('/prompt', 'only agent nodes have a prompt');
+      if (spec.script !== undefined) issues.add('/script', 'only script nodes have a script');
+      for (const port of SHARED_REQUEST_PORTS) {
+        if (!spec.outputs.some((output) => output.name === port)) issues.add('/outputs', `request nodes finish through '${SHARED_REQUEST_PORTS.join("' and '")}' ports (missing '${port}')`);
+      }
+      const param = spec.params.find((entry) => entry.name === SHARED_NODE_PARAM);
+      if (param === undefined || param.required !== true || param.schema.type !== 'string') {
+        issues.add('/params', `request nodes need a required string param '${SHARED_NODE_PARAM}' (the shared node's name)`);
+      }
+      // What a batch protects is the shared node's `protect`, held while the batch runs.
+      if ((spec.claims ?? []).length > 0) issues.add('/claims', "request nodes take no claims (the shared node's 'protect' covers the batch)");
       break;
+    }
   }
   if (issues.list.length > 0) return { issues: issues.list };
   return {
@@ -392,6 +409,12 @@ export function compileWorkflow(
         issues.add(`${at}/params/provider`, `unknown agent provider ${JSON.stringify(provider)}`);
       }
     }
+    if (type.spec.completion === 'shared') {
+      const name = params.params[SHARED_NODE_PARAM];
+      if (typeof name !== 'string' || !new RegExp(SHARED_NODE_NAME_PATTERN).test(name)) {
+        issues.add(`${at}/params/${SHARED_NODE_PARAM}`, 'must name a shared node (letters, digits, _ and -; no expressions)');
+      }
+    }
     if (node.review === 'human' && (type.spec.completion === 'human' || type.spec.completion === 'join')) {
       issues.add(`${at}/review`, `a review gate applies to agent and script nodes, not ${type.spec.completion} nodes`);
     }
@@ -497,6 +520,50 @@ export function compileWorkflow(
     });
   }
   return { workflow: { template, nodes, edges: marked, entries, ends, warnings }, issues: [] };
+}
+
+/**
+ * The node a shared node runs once per batch (M5): its node type with the spec's params, as a node without edges.
+ * Its id is the shared node's name. In this version it must be a script node (agents in a batch are after MVP).
+ * Expressions see `input`/`inputs` (every request's items), `params` and `node` (with the batch); there are no
+ * `nodes.<id>` to read.
+ */
+export function compileSharedNode(spec: SharedNodeSpec, type: CompiledNodeType, validator: SchemaValidator): { node?: CompiledNode; issues: DefinitionIssue[] } {
+  const issues = new Issues();
+  if (type.spec.completion !== 'script') issues.add('/node/type', `a shared node runs a script node type in this version (${type.key} is ${type.spec.completion})`);
+  const instance: TemplateNode = { id: spec.name, type: spec.node.type, version: spec.node.version, ...(spec.node.params === undefined ? {} : { params: spec.node.params }) };
+  const ports = compilePorts(instance, type.spec, validator, '/node', issues);
+  const params = compileParams(instance, type.spec, validator, '/node', issues);
+  const expressions = [...params.expressions];
+  if (type.script !== undefined) {
+    const { script } = type;
+    for (const parsed of [script.program, ...script.args, ...script.env.map(([, value]) => value), ...(script.cwd === undefined ? [] : [script.cwd])]) {
+      expressions.push(...templateExpressions(parsed));
+    }
+  }
+  for (const id of referencedNodes(expressions)) issues.add('/node', `a batch has no node '${id}' to read (expressions may use input, inputs, params and node)`);
+  if (spec.requestSchema !== undefined) issues.schema('/requestSchema', validator, spec.requestSchema);
+  spec.protect?.forEach((claim, index) => {
+    if (normalizeRelative(claim.path) === undefined) issues.add(`/protect/${index}/path`, 'a protected path must stay inside the workspace (relative, no ..)');
+  });
+  if (issues.list.length > 0) return { issues: issues.list };
+  return {
+    node: {
+      id: spec.name,
+      label: spec.label,
+      instance,
+      type,
+      completion: type.spec.completion,
+      review: 'none',
+      params: params.params,
+      paramTemplates: params.templates,
+      inputs: ports.inputs,
+      outputs: ports.outputs,
+      incoming: [],
+      outgoing: new Map(),
+    },
+    issues: [],
+  };
 }
 
 /** Edges that close a cycle in a depth-first walk from the entry nodes (then from any node not reached). */

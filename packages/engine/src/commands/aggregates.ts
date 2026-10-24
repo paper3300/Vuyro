@@ -1,5 +1,6 @@
 import type { DefinitionKind, DomainEvent, RunOutcome, WatchSettings, WorkspaceSettings } from '@vuyro/contracts';
 import { EMPTY_TICKET, evolveTicket, type TicketWorkflow } from '../workflow/state.ts';
+import { EMPTY_SHARED_NODE, evolveSharedNode, type SharedNodeState } from '../shared/state.ts';
 import { EMPTY_LEDGER, evolveLedger, type LedgerState } from '../workspace/ledger.ts';
 
 /**
@@ -63,6 +64,13 @@ export const workspaceAggregate: AggregateDefinition<LedgerState> = {
   type: 'workspace',
   initial: EMPTY_LEDGER,
   evolve: evolveLedger,
+};
+
+/** A shared node of a project (`shared:<projectId>:<name>`, M5; see shared/state.ts). */
+export const sharedNodeAggregate: AggregateDefinition<SharedNodeState> = {
+  type: 'shared',
+  initial: EMPTY_SHARED_NODE,
+  evolve: evolveSharedNode,
 };
 
 /** The ticket and its workflow progress (see workflow/state.ts). */

@@ -3,7 +3,7 @@ import { ArtifactRefSchema, HandoffItemSchema, NodeRunOutputSchema, PORT_PATTERN
 import { AggregateIdSchema, IdSchema, NodeIdSchema, RequestIdSchema } from './ids.ts';
 import { PermissionRuleSchema } from './permission.ts';
 import { AuthorizationSchema, PrincipalSchema } from './principal.ts';
-import { CLAIM_CONFLICT_POLICIES } from './node-type.ts';
+import { CLAIM_CONFLICT_POLICIES, SharedNodeSpecSchema } from './node-type.ts';
 import { AGENT_PROVIDERS } from './providers.ts';
 import { CostSchema, TokenUsageSchema } from './usage.ts';
 import {
@@ -28,6 +28,16 @@ import {
   TicketWorkspaceSchema,
   WorktreeSchema,
 } from './workspace.ts';
+import {
+  APPLIED_BATCH_POLICIES,
+  BATCH_TRIGGERS,
+  BatchOutcomeSchema,
+  PinnedNodeTypeSchema,
+  SHARED_BLOCK_REASONS,
+  SharedNodeFields,
+  SharedNodeNameSchema,
+  SharedRequestSchema,
+} from './shared.ts';
 
 /**
  * Event envelope. Every state change is one of these, appended to the log and never changed.
@@ -314,15 +324,18 @@ export const EVENT_CATALOG = {
   },
   'node.started': {
     aggregateType: 'ticket',
-    // v2: the 'merge' executor (a join merging worktree branches, M4). v1 data is valid v2 data.
-    version: 2,
+    // v2: the 'merge' executor (a join merging worktree branches, M4). v3: the 'shared' executor (a request node whose
+    // batch started, M5). Older data is valid newer data.
+    version: 3,
     schema: Type.Object(
       {
         ...EXECUTION_FIELDS,
         /** 1, 2, … per execution (a restart after an engine crash is a new attempt). */
         attempt: Type.Integer({ minimum: 1 }),
-        executor: Type.Union([Type.Literal('agent'), Type.Literal('script'), Type.Literal('merge')]),
+        executor: Type.Union([Type.Literal('agent'), Type.Literal('script'), Type.Literal('merge'), Type.Literal('shared')]),
         runId: Type.Optional(RunId),
+        /** `shared`: the batch the request runs in. */
+        batch: Type.Optional(Type.Object({ sharedNode: SharedNodeNameSchema, batch: Type.Integer({ minimum: 1 }), batchId: Type.String({ minLength: 1, maxLength: 128 }) }, strict)),
       },
       strict,
     ),
@@ -772,6 +785,129 @@ export const EVENT_CATALOG = {
       strict,
     ),
   },
+  // -------------------------------------------------------------------------
+  // Shared nodes (aggregate 'shared', one per shared node of a project; [[명령·이벤트 계약]] §15)
+
+  /** A shared node was defined or redefined. Running batches keep the definition they started with. */
+  'sharedNode.defined': {
+    aggregateType: 'shared',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...SharedNodeFields,
+        /** 1, 2, … per definition of this shared node. */
+        version: Type.Integer({ minimum: 1 }),
+        spec: SharedNodeSpecSchema,
+        nodeType: PinnedNodeTypeSchema,
+      },
+      strict,
+    ),
+  },
+  /** A request node's execution joined the queue. `replaces`: older executions of the same lane it took the place of. */
+  'sharedNode.requestQueued': {
+    aggregateType: 'shared',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...SharedNodeFields,
+        request: SharedRequestSchema,
+        /** Engine clock when it joined (the `window` trigger counts from the oldest request). */
+        at: Type.Integer({ minimum: 0 }),
+        replaces: Type.Optional(Type.Array(SharedRequestSchema, { maxItems: 64 })),
+      },
+      strict,
+    ),
+  },
+  /** Requests that left the queue without running: their execution ended or was replaced meanwhile. */
+  'sharedNode.requestDropped': {
+    aggregateType: 'shared',
+    version: 1,
+    schema: Type.Object({ ...SharedNodeFields, requests: Type.Array(SharedRequestSchema, { minItems: 1, maxItems: 4096 }) }, strict),
+  },
+  /** The protected paths (`protect`) are held by someone else: the batch waits for them (once per change). */
+  'sharedNode.waiting': {
+    aggregateType: 'shared',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...SharedNodeFields,
+        conflicts: Type.Array(ConflictSchema, { maxItems: 256 }),
+        policy: Type.Union(CLAIM_CONFLICT_POLICIES.map((policy) => Type.Literal(policy))),
+      },
+      strict,
+    ),
+  },
+  /** A batch started with these requests (their ticket nodes are now running). */
+  'sharedNode.batchStarted': {
+    aggregateType: 'shared',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...SharedNodeFields,
+        batch: Type.Integer({ minimum: 1 }),
+        batchId: Type.String({ minLength: 1, maxLength: 128 }),
+        members: Type.Array(SharedRequestSchema, { minItems: 1, maxItems: 4096 }),
+        trigger: Type.Union(BATCH_TRIGGERS.map((trigger) => Type.Literal(trigger))),
+        /** The definition version the batch runs. */
+        definition: Type.Integer({ minimum: 1 }),
+        /** Ledger entries the batch holds while it runs (`protect`), released when it ends. */
+        entries: Type.Array(IdSchema, { maxItems: 4096 }),
+        /** Protected paths held by others that a person let it overlap (`sharedNode.run`), or `warn`. */
+        overlaps: Type.Optional(Type.Array(ConflictSchema, { maxItems: 256 })),
+      },
+      strict,
+    ),
+  },
+  /** A batch ended. Each member's ticket got its share of the result in the same commit (or went back to the queue). */
+  'sharedNode.batchFinished': {
+    aggregateType: 'shared',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...SharedNodeFields,
+        batch: Type.Integer({ minimum: 1 }),
+        outcome: BatchOutcomeSchema,
+        /** How a failure was settled (absent on success and interruption). */
+        policy: Type.Optional(Type.Union(APPLIED_BATCH_POLICIES.map((policy) => Type.Literal(policy)))),
+        /** Members whose tickets got the result on their success port. */
+        succeeded: Type.Array(SharedRequestSchema, { maxItems: 4096 }),
+        /** Members whose tickets got the failure on their error port (the blamed ones under `blame`). */
+        failed: Type.Array(SharedRequestSchema, { maxItems: 4096 }),
+        /** Members put back at the front of the queue. */
+        requeued: Type.Array(SharedRequestSchema, { maxItems: 4096 }),
+        /** Workspace files the errors name (what `blame` compared with the ledger). */
+        errorFiles: Type.Optional(Type.Array(Type.String({ maxLength: 1024 }), { maxItems: 1000 })),
+        exitCode: Type.Optional(Type.Union([Type.Integer(), Type.Null()])),
+        error: Type.Optional(Type.String({ maxLength: 65536 })),
+        log: Type.Optional(ArtifactRefSchema),
+      },
+      strict,
+    ),
+  },
+  /**
+   * The shared node stops starting batches. `blamed`: until every ticket in `by` is back in the queue with a new
+   * execution (it was fixed). `interrupted`: the engine stopped while a batch ran; a person decides. A person can
+   * always unblock it.
+   */
+  'sharedNode.blocked': {
+    aggregateType: 'shared',
+    version: 1,
+    schema: Type.Object(
+      {
+        ...SharedNodeFields,
+        reason: Type.Union(SHARED_BLOCK_REASONS.map((reason) => Type.Literal(reason))),
+        batch: Type.Integer({ minimum: 1 }),
+        by: Type.Array(SharedRequestSchema, { maxItems: 4096 }),
+      },
+      strict,
+    ),
+  },
+  /** A blamed ticket came back to the queue (`fixed`, once all did) or a person unblocked it. */
+  'sharedNode.unblocked': {
+    aggregateType: 'shared',
+    version: 1,
+    schema: Type.Object({ ...SharedNodeFields, reason: Type.Union([Type.Literal('fixed'), Type.Literal('person')]) }, strict),
+  },
   'permission.rulesChanged': {
     aggregateType: 'permissions',
     version: 1,
@@ -838,8 +974,8 @@ export type UpcasterRegistry = { readonly [T in EventType]?: Readonly<Record<num
 
 /** Upcasters for events whose `version` was bumped after release. Pre-release bumps retire versions instead. */
 export const EVENT_UPCASTERS: UpcasterRegistry = {
-  // v2 only widened `executor` with 'merge': v1 data is valid as is.
-  'node.started': { 1: (data) => data },
+  // v2 widened `executor` with 'merge', v3 with 'shared' (and the optional `batch`): older data is valid as is.
+  'node.started': { 1: (data) => data, 2: (data) => data },
 };
 
 export class UnsupportedSchemaVersionError extends Error {

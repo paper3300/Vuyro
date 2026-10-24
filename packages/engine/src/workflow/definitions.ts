@@ -65,6 +65,11 @@ export interface DefinitionResolver {
   readonly dataValidator: SchemaValidator;
   /** An active node type version, read from its file and checked against the registered hash. */
   nodeType(type: string, version: number): Promise<CompiledNodeType | undefined>;
+  /**
+   * A node type with the hash it is pinned by: the active version when `hash` is omitted (undefined if not active),
+   * else exactly that content (throws DefinitionLoadError if the file no longer matches). Shared nodes pin theirs.
+   */
+  pinnedNodeType(type: string, version: number, hash?: string): Promise<{ nodeType: CompiledNodeType; hash: string } | undefined>;
   /** An active template (latest active version when `version` is omitted), compiled and pinned. */
   template(id: string, version?: number): Promise<LoadedTemplate | undefined>;
   /** The workflow a ticket pinned. Throws DefinitionLoadError if any file no longer matches its pinned hash. */
@@ -173,6 +178,16 @@ export class DefinitionRegistry implements DefinitionResolver {
     const row = await this.row('nodeType', type, version);
     if (row?.status !== 'active') return undefined;
     return this.compiledNodeType(type, version, row.hash);
+  }
+
+  async pinnedNodeType(type: string, version: number, hash?: string): Promise<{ nodeType: CompiledNodeType; hash: string } | undefined> {
+    let pinned = hash;
+    if (pinned === undefined) {
+      const row = await this.row('nodeType', type, version);
+      if (row?.status !== 'active') return undefined;
+      pinned = row.hash;
+    }
+    return { nodeType: await this.compiledNodeType(type, version, pinned), hash: pinned };
   }
 
   async template(id: string, version?: number): Promise<LoadedTemplate | undefined> {

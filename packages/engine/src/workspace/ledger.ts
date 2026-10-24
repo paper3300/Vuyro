@@ -27,9 +27,38 @@ export interface LedgerState {
   readonly kept: Readonly<Record<string, string>>;
   /** Clean-ups a person approved that the engine has not carried out yet: key → fingerprint. */
   readonly approved: Readonly<Record<string, string>>;
+  /**
+   * Which tickets edited a file, per space and path key (exclusive checkouts and changes attributed to a checkout),
+   * most recent last. Outlives the entries: a shared node's `blame` compares the files in a failed batch's errors with
+   * it ([[공유·권한·BlackBoard 설계]] §4.5).
+   */
+  readonly edits: Readonly<Record<string, Readonly<Record<string, EditRecord>>>>;
+  /** Which tickets held exclusive claims on a pattern, per space and pattern key (the weaker `blame` evidence). */
+  readonly claimed: Readonly<Record<string, Readonly<Record<string, EditRecord>>>>;
 }
 
-export const EMPTY_LEDGER: LedgerState = { entries: {}, known: {}, changed: {}, warned: {}, worktrees: {}, kept: {}, approved: {} };
+export interface EditRecord {
+  readonly path: string;
+  readonly tickets: readonly string[];
+}
+
+/** Tickets remembered per path: the most recent ones. */
+const EDIT_HISTORY = 32;
+
+export const EMPTY_LEDGER: LedgerState = { entries: {}, known: {}, changed: {}, warned: {}, worktrees: {}, kept: {}, approved: {}, edits: {}, claimed: {} };
+
+function remember(
+  history: Readonly<Record<string, Readonly<Record<string, EditRecord>>>>,
+  space: string,
+  path: string,
+  ticketId: string,
+): Readonly<Record<string, Readonly<Record<string, EditRecord>>>> {
+  const key = pathKey(path);
+  const bySpace = history[space] ?? {};
+  const previous = Object.hasOwn(bySpace, key) ? bySpace[key] : undefined;
+  const tickets = [...(previous?.tickets ?? []).filter((id) => id !== ticketId), ticketId].slice(-EDIT_HISTORY);
+  return { ...history, [space]: { ...bySpace, [key]: { path, tickets } } };
+}
 
 /** What a `worktree.kept` record says, for recording it again only when it changes. */
 export function keptSignature(data: { removal: string; files: readonly string[]; ignored?: readonly string[]; count: number; ignoredCount?: number }): string {
@@ -45,8 +74,14 @@ export function evolveLedger(state: LedgerState, event: NewEvent | DomainEvent):
   switch (event.type) {
     case 'checkout.acquired': {
       const entries = { ...state.entries };
-      for (const entry of event.data.entries) entries[entry.id] = entry;
-      return { ...state, entries };
+      let { edits, claimed } = state;
+      for (const entry of event.data.entries) {
+        entries[entry.id] = entry;
+        if (entry.mode !== 'exclusive') continue;
+        if (entry.kind === 'checkout') edits = remember(edits, entry.space, entry.path, entry.holder.ticketId);
+        else claimed = remember(claimed, entry.space, entry.path, entry.holder.ticketId);
+      }
+      return { ...state, entries, edits, claimed };
     }
     case 'checkout.released':
       return { ...state, entries: without(state.entries, event.data.ids) };
@@ -84,12 +119,14 @@ export function evolveLedger(state: LedgerState, event: NewEvent | DomainEvent):
       const { space } = event.data;
       const known = { ...(state.known[space] ?? {}) };
       const changed = { ...(state.changed[space] ?? {}) };
+      let { edits } = state;
       for (const change of event.data.changes) {
         const key = pathKey(change.path);
         known[key] = change.hash;
         if (change.attribution === 'worktree') changed[key] = change.holder === undefined ? { path: change.path } : { path: change.path, holder: change.holder };
+        if ((change.attribution === 'checkout' || change.attribution === 'worktree') && change.holder !== undefined) edits = remember(edits, space, change.path, change.holder.ticketId);
       }
-      return { ...state, known: { ...state.known, [space]: known }, changed: { ...state.changed, [space]: changed } };
+      return { ...state, known: { ...state.known, [space]: known }, changed: { ...state.changed, [space]: changed }, edits };
     }
     case 'workspace.overlapWarned': {
       const [a, b] = event.data.spaces;
@@ -112,6 +149,8 @@ export function evolveLedger(state: LedgerState, event: NewEvent | DomainEvent):
         approved: without(state.approved, [event.data.key]),
         known: without(state.known, [space]),
         changed: without(state.changed, [space]),
+        edits: without(state.edits, [space]),
+        claimed: without(state.claimed, [space]),
       };
     }
     default:

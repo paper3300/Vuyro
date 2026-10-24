@@ -25,6 +25,7 @@ export const RPC_METHODS = {
   ticketStats: 'query.ticketStats',
   workspace: 'query.workspace',
   worktreeCleanup: 'query.worktreeCleanup',
+  sharedNodes: 'query.sharedNodes',
 } as const;
 
 export type RpcMethod = (typeof RPC_METHODS)[keyof typeof RPC_METHODS];
@@ -123,6 +124,50 @@ export interface WorktreeCleanupCandidate {
   readonly ignoredCount: number;
   /** What `worktree.cleanup` must send back: it changes when anything in the worktree changes. */
   readonly fingerprint: string;
+}
+
+/** A project's shared nodes: definition, status, queue, running and recent batches (M5). */
+export const SharedNodesQuerySchema = Type.Object({ projectId: IdSchema, name: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })) }, strict);
+
+export interface SharedQueueEntryView {
+  readonly ticketId: string;
+  readonly nodeId: string;
+  readonly lane: string;
+  readonly run: number;
+  /** 1-based place in the queue. */
+  readonly position: number;
+  readonly queuedAt: number;
+  /** Put back by a failed or interrupted batch. */
+  readonly retry: boolean;
+}
+
+export interface SharedBatchView {
+  readonly batch: number;
+  readonly batchId: string;
+  readonly trigger: string;
+  readonly members: readonly { readonly ticketId: string; readonly nodeId: string; readonly lane: string; readonly run: number }[];
+  readonly startedAt: number;
+  readonly finishedAt?: number;
+  readonly outcome?: 'succeeded' | 'failed' | 'interrupted';
+  readonly policy?: string;
+  /** Tickets sent to their error port (the blamed ones under `blame`). */
+  readonly failed?: readonly string[];
+  readonly errorFiles?: readonly string[];
+}
+
+export interface SharedNodeView {
+  readonly projectId: string;
+  readonly name: string;
+  readonly label: string;
+  readonly version: number;
+  readonly spec: unknown;
+  /** idle, running, blocked, or waiting (for protected paths someone else holds). */
+  readonly status: 'idle' | 'running' | 'blocked' | 'waiting';
+  readonly blocked?: { readonly reason: string; readonly batch: number; readonly by: readonly { readonly ticketId: string; readonly nodeId: string; readonly lane: string; readonly run: number }[] };
+  readonly queue: readonly SharedQueueEntryView[];
+  readonly running: readonly SharedBatchView[];
+  /** The last batches, newest first (at most 20). */
+  readonly recent: readonly SharedBatchView[];
 }
 
 export interface SubscribeResult {

@@ -109,6 +109,8 @@ export interface ClaimDecision {
   readonly preempted: readonly { readonly holder: Holder; readonly claim: ClaimWait }[];
   /** The workspace-relative paths the requester now holds. */
   readonly paths: readonly string[];
+  /** Ids of the entries recorded (granted, overlap). */
+  readonly entryIds?: readonly string[];
 }
 
 /** Severity order: the strictest resolution of any conflict decides for the whole request. */
@@ -199,6 +201,11 @@ export async function decideClaims(
     readonly items: readonly ClaimItem[];
     readonly source: 'start' | 'hook' | 'agent';
     readonly override: boolean;
+    /**
+     * A shared node's batch (M5): the other member executions hold the same entries, and nothing the member tickets
+     * hold conflicts with it (the batch builds those tickets' own changes; their kept entries would block it forever).
+     */
+    readonly batch?: { readonly holders: readonly Holder[] };
   },
 ): Promise<ClaimDecision> {
   const services = servicesOf(ctx);
@@ -206,7 +213,11 @@ export async function decideClaims(
   const projectId = ticket.state.projectId;
   const ledger = await ctx.load(workspaceAggregate, workspaceAggregateId(projectId));
   const fresh = items.filter((item) => !alreadyCovers(ledger.state, location.space, holder, item, services.caseInsensitive));
-  const candidates = findConflicts(ledger.state, location.space, fresh, holder, () => true, services.caseInsensitive);
+  const members = args.batch?.holders ?? [];
+  const memberTickets = new Set(members.map((member) => member.ticketId));
+  const own = (conflict: Conflict): boolean =>
+    members.some((member) => sameHolder(member, conflict.holder)) || (ledger.state.entries[conflict.entryId]?.retained === true && memberTickets.has(conflict.holder.ticketId));
+  const candidates = findConflicts(ledger.state, location.space, fresh, holder, () => true, services.caseInsensitive).filter((conflict) => !own(conflict));
   const holds = await holdingCheck(
     ctx,
     ticket,
@@ -228,7 +239,8 @@ export async function decideClaims(
     if (policy === 'warn') next = 'warn';
     else if (policy === 'fail') next = 'fail';
     else if (policy === 'ask') next = 'ask';
-    else if (policy === 'priorityWins' && (await canPreempt(ctx, ledger.state, ticket, conflict))) next = 'preempt';
+    // A batch never takes paths from a running agent: it waits like `firstWins`.
+    else if (policy === 'priorityWins' && args.batch === undefined && (await canPreempt(ctx, ledger.state, ticket, conflict))) next = 'preempt';
     else next = 'wait';
     if (next === 'preempt') preemptible.push(conflict);
     if (SEVERITY[next] > SEVERITY[resolution]) resolution = next;
@@ -266,20 +278,22 @@ export async function decideClaims(
   const entries: CheckoutEntry[] = [];
   for (const item of fresh) {
     const baseHash = item.kind === 'checkout' && location.root !== undefined ? await services.hash(location.root, item.path) : undefined;
-    entries.push({
-      id: ctx.ids.next(),
-      space: location.space,
-      path: item.path,
-      kind: item.kind,
-      mode: item.mode,
-      holder,
-      release: item.release,
-      onConflict: item.onConflict ?? location.settings.onConflict,
-      pauseMode: item.pauseMode ?? location.settings.pauseMode,
-      priority: ticket.state.priority,
-      ...(item.ttlMs === undefined ? {} : { expiresAt: now + item.ttlMs }),
-      ...(baseHash === undefined ? {} : { baseHash }),
-    });
+    for (const entryHolder of [holder, ...members.filter((member) => !sameHolder(member, holder))]) {
+      entries.push({
+        id: ctx.ids.next(),
+        space: location.space,
+        path: item.path,
+        kind: item.kind,
+        mode: item.mode,
+        holder: entryHolder,
+        release: item.release,
+        onConflict: item.onConflict ?? location.settings.onConflict,
+        pauseMode: item.pauseMode ?? location.settings.pauseMode,
+        priority: ticket.state.priority,
+        ...(item.ttlMs === undefined ? {} : { expiresAt: now + item.ttlMs }),
+        ...(baseHash === undefined ? {} : { baseHash }),
+      });
+    }
   }
   const events: NewEvent[] = [];
   const preempted: { holder: Holder; claim: ClaimWait }[] = [];
@@ -306,7 +320,7 @@ export async function decideClaims(
   if (entries.length > 0) {
     events.push({ type: 'checkout.acquired', data: { projectId, entries, source, ...(overlaps.length === 0 ? {} : { overlaps: overlaps.slice(0, 256) }) } });
   }
-  return { outcome: overlaps.length > 0 ? 'overlap' : 'granted', conflicts, ledgerEvents: events, ledger, preempted, paths };
+  return { outcome: overlaps.length > 0 ? 'overlap' : 'granted', conflicts, ledgerEvents: events, ledger, preempted, paths, entryIds: entries.map((entry) => entry.id) };
 }
 
 /** A running agent of a lower-priority ticket whose entry allows immediate pausing can be preempted. */

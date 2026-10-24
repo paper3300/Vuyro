@@ -63,7 +63,7 @@ function requireTicket(target: Loaded<TicketState> | undefined): Loaded<TicketSt
 const ticketTarget = (payload: { ticketId: string }) => ({ definition: ticketAggregate, aggregateId: payload.ticketId });
 const nodeScope = (payload: { ticketId: string; nodeId: string }): CommandTarget => ({ ticketId: payload.ticketId, nodeId: payload.nodeId });
 
-async function openWorkflow(ctx: HandlerContext, ticket: Loaded<TicketState>, needOpen = true): Promise<CompiledWorkflow | Failure> {
+export async function openWorkflow(ctx: HandlerContext, ticket: Loaded<TicketState>, needOpen = true): Promise<CompiledWorkflow | Failure> {
   if (!ticket.state.exists) return fail('not_found', `ticket ${ticket.aggregateId} does not exist`);
   const pin = ticket.state.template;
   if (pin === undefined) return fail('invariant_violated', `ticket ${ticket.aggregateId} does not run a workflow`);
@@ -83,7 +83,7 @@ async function openWorkflow(ctx: HandlerContext, ticket: Loaded<TicketState>, ne
   }
 }
 
-function isFailure(value: unknown): value is Failure {
+export function isFailure(value: unknown): value is Failure {
   return typeof value === 'object' && value !== null && (value as { ok?: unknown }).ok === false;
 }
 
@@ -745,8 +745,8 @@ function finishMerge(draft: WorkflowDraft, node: CompiledNode, exec: Execution, 
 const TAIL = 4096;
 const tail = (text: string | undefined): string => (text === undefined ? '' : text.length > TAIL ? text.slice(-TAIL) : text);
 
-/** Maps a script's exit to an output port and items (see ScriptSpec). */
-function scriptOutput(
+/** Maps a script's exit to an output port and items (see ScriptSpec). Shared nodes map their batch's exit the same way. */
+export function scriptOutput(
   node: CompiledNode,
   result: Extract<CommandPayload<'node.finish'>['result'], { kind: 'script' }>,
 ): { port: string; drafts: DraftItem[] } | { error: string; details: Record<string, unknown> } {

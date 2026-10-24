@@ -25,6 +25,7 @@ import {
 import type { CommandTarget } from './authorize.ts';
 import type { CallerContext } from './caller.ts';
 import { issueRunToken } from './run-token.ts';
+import { sharedNodeDefine, sharedNodeEnqueue, sharedNodeFinish, sharedNodeRun, sharedNodeStart, sharedNodeUnblock } from './shared-handlers.ts';
 import {
   appConfigure,
   checkoutForceRelease,
@@ -328,4 +329,10 @@ export const HANDLERS: HandlerMap = {
   'node.resume': handler(nodeResume),
   'node.start': handler(nodeStart),
   'node.finish': handler(nodeFinish),
+  'sharedNode.define': handler(sharedNodeDefine),
+  'sharedNode.enqueue': handler(sharedNodeEnqueue),
+  'sharedNode.start': handler(sharedNodeStart),
+  'sharedNode.run': handler(sharedNodeRun),
+  'sharedNode.finish': handler(sharedNodeFinish),
+  'sharedNode.unblock': handler(sharedNodeUnblock),
 };
