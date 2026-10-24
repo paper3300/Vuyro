@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { AgentAdapter, AgentStartRequest } from '@vuyro/agent-adapters';
-import { type BoardResult, RPC_METHODS, type TemplateSummary } from '@vuyro/contracts';
+import { type BoardResult, type DefinitionListing, type ExportResult, type ImportPreview, RPC_METHODS, type RunEventsResult, type TemplateSummary } from '@vuyro/contracts';
 import type { TicketDetail } from '../src/daemon/queries.ts';
 import { systemClock } from '../src/runtime/clock.ts';
 import { type ScriptedBehavior, ScriptedAgentAdapter } from '../src/workflow/scripted-agent.ts';
@@ -221,5 +221,95 @@ describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
       (value) => value.reviews.length > 0,
     );
     expect(detail.reviews).toEqual([{ nodeId: 'work', lane: 'main', run: 1, kind: 'gate', output: { port: 'done', items: [] }, reason: 'empty' }]);
+  });
+
+  it("pages through an agent run's log: messages, tool calls with their results, usage and the end", async () => {
+    const long = 'x'.repeat(5000);
+    const agent = lateAdapter(async (session) => {
+      session.observe({ kind: 'session', providerSessionId: 'sess-1', model: 'small' });
+      session.observe({ kind: 'message', role: 'assistant', messageId: 'm1', text: 'Reading <the> spec' });
+      session.observe({ kind: 'toolCallStarted', toolCallId: 't1', name: 'Read', input: { file_path: 'docs/spec.md' } });
+      session.observe({ kind: 'toolCallFinished', toolCallId: 't1', output: long });
+      session.observe({ kind: 'toolCallStarted', toolCallId: 't2', name: 'Bash', input: { command: 'build' } });
+      session.observe({ kind: 'toolCallFinished', toolCallId: 't2', isError: true, output: 'failed' });
+      session.observe({ kind: 'warning', message: 'slow down', source: 'rate' });
+      return specAgent(session);
+    });
+    h = await openDaemonHarness({ adapters: { claude: agent.adapter } });
+    agent.bind(h);
+    const ui = await h.ui();
+    const { result: project } = await ui.execute({ requestId: rid(), type: 'project.create', payload: { name: 'sample' } });
+    const created = await ui.execute({ requestId: rid(), type: 'ticket.create', payload: { projectId: (project as { projectId: string }).projectId, title: 'Log', template: { id: 'vuyro/ai-sdlc' } } });
+    const ticketId = (created.result as { ticketId: string }).ticketId;
+    await ui.execute({ requestId: rid(), type: 'node.done', payload: { ticketId, nodeId: 'brainstorming', port: 'done', summary: 'idea' } });
+    const detail = await until(
+      () => ui.request<TicketDetail>(RPC_METHODS.ticket, { ticketId }),
+      (value) => value.runs.some((run) => run.status !== 'running'),
+    );
+    const runId = String(detail.runs[0]?.runId);
+
+    const all = await ui.request<RunEventsResult>(RPC_METHODS.runEvents, { runId });
+    expect(all.run).toMatchObject({ runId, ticketId, nodeId: 'spec', provider: 'claude' });
+    expect(all.more).toBe(false);
+    expect(all.entries.map((entry) => entry.kind)).toEqual(['started', 'session', 'message', 'toolStarted', 'toolFinished', 'toolStarted', 'toolFinished', 'warning', 'usage', 'settled']);
+    expect(all.entries[2]).toMatchObject({ kind: 'message', role: 'assistant', text: { text: 'Reading <the> spec', length: 18 } });
+    expect(all.entries[3]).toMatchObject({ kind: 'toolStarted', name: 'Read' });
+    expect(all.entries[4]).toMatchObject({ kind: 'toolFinished', isError: false, output: { length: 5000 } });
+    expect((all.entries[4] as { output: { text: string } }).output.text).toHaveLength(4000);
+    expect(all.entries[6]).toMatchObject({ kind: 'toolFinished', isError: true, output: { text: 'failed' } });
+
+    // Pages continue from the cursor without gaps or repeats.
+    const first = await ui.request<RunEventsResult>(RPC_METHODS.runEvents, { runId, limit: 4 });
+    expect(first.more).toBe(true);
+    const second = await ui.request<RunEventsResult>(RPC_METHODS.runEvents, { runId, after: first.cursor, limit: 100 });
+    expect([...first.entries, ...second.entries].map((entry) => entry.revision)).toEqual(all.entries.map((entry) => entry.revision));
+    // One entry in full.
+    const full = await ui.request<RunEventsResult>(RPC_METHODS.runEvents, { runId, after: (all.entries[4]?.revision ?? 1) - 1, limit: 1, textLimit: 1_048_576 });
+    expect((full.entries[0] as { output: { text: string } }).output.text).toBe(long);
+    await expect(ui.request(RPC_METHODS.runEvents, { runId: '01900000-0000-7000-8000-000000000000' })).rejects.toMatchObject({ data: { code: 'not_found' } });
+    await expect(ui.request(RPC_METHODS.runEvents, { runId, limit: 0 })).rejects.toMatchObject({ rpcCode: -32602 });
+  });
+
+  it('exports the default template, imports it under a new id, and a ticket of the copy passes the approval gate', async () => {
+    const agent = lateAdapter(specAgent);
+    h = await openDaemonHarness({ adapters: { claude: agent.adapter } });
+    agent.bind(h);
+    const ui = await h.ui();
+    const listed = await ui.request<{ definitions: DefinitionListing[] }>(RPC_METHODS.definitions, { kind: 'template' });
+    expect(listed.definitions).toEqual([expect.objectContaining({ kind: 'template', id: 'vuyro/ai-sdlc', version: 1, name: 'AI-Native SDLC', status: 'active', latest: true })]);
+
+    const exported = await ui.request<ExportResult>(RPC_METHODS.exportDefinition, { kind: 'template', id: 'vuyro/ai-sdlc' });
+    expect(exported).toMatchObject({ fileName: 'vuyro.ai-sdlc@1.json', redacted: [], document: { kind: 'bundle', id: 'vuyro/ai-sdlc' } });
+    const text = JSON.stringify(exported.document, null, 2);
+    const key = 'template:vuyro/ai-sdlc@1';
+    const plan = await ui.request<ImportPreview>(RPC_METHODS.importPreview, { text, choices: { [key]: { action: 'newId', id: 'myteam/ai-sdlc', name: 'AI-Native SDLC (copy)' } } });
+    expect(plan.canSave).toBe(true);
+    for (const save of plan.saves) await ui.execute({ requestId: rid(), type: save.type, payload: { definition: save.definition } });
+    await until(
+      () => ui.request<{ definitions: DefinitionListing[] }>(RPC_METHODS.definitions, { kind: 'template' }),
+      (value) => value.definitions.some((each) => each.id === 'myteam/ai-sdlc' && each.status === 'active'),
+    );
+
+    const { result: project } = await ui.execute({ requestId: rid(), type: 'project.create', payload: { name: 'sample' } });
+    const created = await ui.execute({ requestId: rid(), type: 'ticket.create', payload: { projectId: (project as { projectId: string }).projectId, title: 'Copied', template: { id: 'myteam/ai-sdlc' } } });
+    const ticketId = (created.result as { ticketId: string }).ticketId;
+    await ui.execute({ requestId: rid(), type: 'node.done', payload: { ticketId, nodeId: 'brainstorming', run: 1, port: 'done', summary: 'idea' } });
+    await until(
+      () => ui.request<TicketDetail>(RPC_METHODS.ticket, { ticketId }),
+      (value) => value.reviews.some((review) => review.nodeId === 'specApproval'),
+    );
+    await ui.execute({ requestId: rid(), type: 'node.approve', payload: { ticketId, nodeId: 'specApproval', run: 1 } });
+    const detail = await until(
+      () => ui.request<TicketDetail>(RPC_METHODS.ticket, { ticketId }),
+      (value) => value.executions.some((execution) => execution.nodeId === 'plan'),
+    );
+    expect(detail.workflow).toMatchObject({ id: 'myteam/ai-sdlc', name: 'AI-Native SDLC (copy)' });
+
+    // Previews are reads: an unverified client may look, never save; and the text is checked as untrusted.
+    const reader = await h.connect();
+    expect((await reader.request<ImportPreview>(RPC_METHODS.importPreview, { text: '[]' })).readable).toBe(false);
+    await expect(reader.execute({ requestId: rid(), type: 'template.save', payload: { definition: plan.saves[0]?.definition } })).rejects.toMatchObject({ data: { code: 'forbidden' } });
+    await expect(ui.request(RPC_METHODS.importPreview, { text: 'x'.repeat(4 * 1024 * 1024 + 1) })).rejects.toMatchObject({ rpcCode: -32602 });
+    await expect(ui.request(RPC_METHODS.exportDefinition, { kind: 'template', id: 'myteam/none' })).rejects.toMatchObject({ data: { code: 'not_found' } });
   });
 });

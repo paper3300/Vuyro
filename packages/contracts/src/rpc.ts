@@ -28,6 +28,10 @@ export const RPC_METHODS = {
   sharedNodes: 'query.sharedNodes',
   templates: 'query.templates',
   board: 'query.board',
+  runEvents: 'query.runEvents',
+  definitions: 'query.definitions',
+  exportDefinition: 'query.exportDefinition',
+  importPreview: 'query.importPreview',
 } as const;
 
 export type RpcMethod = (typeof RPC_METHODS)[keyof typeof RPC_METHODS];
@@ -170,6 +174,66 @@ export interface SharedNodeView {
   readonly running: readonly SharedBatchView[];
   /** The last batches, newest first (at most 20). */
   readonly recent: readonly SharedBatchView[];
+}
+
+/**
+ * One agent run's log (M6b node detail): messages, tool calls, usage, warnings and the end, in order, a page at a time.
+ * `after` is the run's event revision to continue from (the previous page's `cursor`). Long text is cut at `textLimit`
+ * characters; ask again for one entry (`after` = its revision - 1, `limit` 1) with a larger limit to see all of it.
+ */
+export const RunEventsQuerySchema = Type.Object(
+  {
+    runId: IdSchema,
+    after: Type.Optional(Type.Integer({ minimum: 0 })),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+    textLimit: Type.Optional(Type.Integer({ minimum: 200, maximum: 1_048_576 })),
+  },
+  strict,
+);
+
+/** Text as the log shows it: the first `textLimit` characters, and the full length. */
+export interface LogText {
+  readonly text: string;
+  readonly length: number;
+}
+
+interface RunLogBase {
+  /** The run's event revision (the paging cursor). */
+  readonly revision: number;
+  readonly sequence: number;
+  /** When the adapter saw it (falls back to when it was stored). Epoch ms. */
+  readonly at: number;
+}
+
+export type RunLogEntry = RunLogBase &
+  (
+    | { readonly kind: 'started'; readonly provider: string; readonly resumedFromRunId?: string }
+    | { readonly kind: 'session'; readonly model?: string; readonly cliVersion?: string }
+    | { readonly kind: 'message'; readonly role: 'assistant' | 'user' | 'system'; readonly messageId?: string; readonly text: LogText }
+    | { readonly kind: 'toolStarted'; readonly toolCallId: string; readonly name: string; readonly input?: LogText }
+    | { readonly kind: 'toolFinished'; readonly toolCallId: string; readonly isError: boolean; readonly output?: LogText }
+    | { readonly kind: 'usage'; readonly scope: 'run' | 'turn'; readonly tokens: TokenUsage; readonly model?: string }
+    | { readonly kind: 'warning'; readonly message: LogText; readonly source?: string }
+    | { readonly kind: 'raw'; readonly stream: 'stdout' | 'stderr'; readonly providerType?: string; readonly text: LogText }
+    | { readonly kind: 'settled'; readonly outcome: string; readonly exitCode?: number | null; readonly terminalReason?: string; readonly error?: LogText }
+  );
+
+export interface RunEventsResult {
+  readonly run: {
+    readonly runId: string;
+    readonly ticketId: string;
+    readonly nodeId: string;
+    readonly provider: string;
+    readonly status: string;
+    readonly model: string | null;
+    readonly startedAt: number;
+    readonly settledAt: number | null;
+  };
+  readonly entries: readonly RunLogEntry[];
+  /** Pass as `after` for the next page. */
+  readonly cursor: number;
+  /** More events after this page (now). */
+  readonly more: boolean;
 }
 
 /** Active templates, latest version of each (M6: ticket creation). */

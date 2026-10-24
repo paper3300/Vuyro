@@ -221,6 +221,16 @@ export class EventStore {
     return rows.map(toEvent);
   }
 
+  /** One page of an aggregate's events after `afterRevision` (a run's log is read this way). */
+  async readAggregatePage(aggregateId: string, afterRevision: number, limit: number): Promise<DomainEvent[]> {
+    const rows = await this.reader.all<EventRow>('SELECT * FROM events WHERE aggregate_id = ? AND revision > ? ORDER BY revision LIMIT ?', [
+      aggregateId,
+      afterRevision,
+      limit,
+    ]);
+    return rows.map(toEvent);
+  }
+
   async readEvents(options: { afterSequence?: number; limit?: number } = {}): Promise<DomainEvent[]> {
     const rows = await this.reader.all<EventRow>('SELECT * FROM events WHERE sequence > ? ORDER BY sequence LIMIT ?', [
       options.afterSequence ?? 0,

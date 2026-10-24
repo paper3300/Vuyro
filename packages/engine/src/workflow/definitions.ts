@@ -92,7 +92,8 @@ export class DefinitionRegistry implements DefinitionResolver {
   readonly root: string;
   private readonly fs: FileSystem;
   private readonly store: EventStore;
-  private readonly envelopeValidator = new SchemaValidator();
+  /** Strict validator for envelopes (definition files, imported documents). */
+  readonly validator = new SchemaValidator();
   /** Port, param and data schemas written by people and agents: unknown keywords are tolerated. */
   readonly dataValidator = new SchemaValidator({ strict: false });
   private readonly nodeTypes = new Map<string, CompiledNodeType>();
@@ -140,13 +141,23 @@ export class DefinitionRegistry implements DefinitionResolver {
     } catch (error) {
       throw new DefinitionLoadError(`cannot read ${kind} ${id}@${version} (${path}): ${(error as Error).message}`);
     }
-    const issues = this.envelopeValidator.validate(DefinitionEnvelopeSchema, parsed);
+    const issues = this.validator.validate(DefinitionEnvelopeSchema, parsed);
     if (issues.length > 0) throw new DefinitionLoadError(`${path} is not a valid definition: ${issues.map((issue) => `${issue.path} ${issue.message}`).join('; ')}`);
     const envelope = parsed as DefinitionEnvelope;
     if (envelope.kind !== kind || envelope.id !== id || envelope.version !== version) {
       throw new DefinitionLoadError(`${path} holds ${envelope.kind} ${envelope.id}@${envelope.version}, not ${kind} ${id}@${version}`);
     }
     return envelope;
+  }
+
+  /**
+   * An active definition version (the latest when `version` is omitted) as its file holds it, checked against the
+   * registered hash (exporting reads it this way). Throws DefinitionLoadError when the file changed.
+   */
+  async activeDefinition(kind: DefinitionKind, id: string, version?: number): Promise<{ row: DefinitionRow; definition: DefinitionEnvelope } | undefined> {
+    const row = await this.row(kind, id, version);
+    if (row?.status !== 'active') return undefined;
+    return { row, definition: await this.verified(kind, id, row.version, row.hash) };
   }
 
   private async verified(kind: DefinitionKind, id: string, version: number, hash: string): Promise<DefinitionEnvelope> {

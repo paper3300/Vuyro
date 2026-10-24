@@ -31,6 +31,10 @@ import {
   SharedNodesQuerySchema,
   TemplatesQuerySchema,
   BoardQuerySchema,
+  DefinitionsQuerySchema,
+  ExportDefinitionQuerySchema,
+  ImportPreviewQuerySchema,
+  RunEventsQuerySchema,
 } from '@vuyro/contracts';
 import type { CommandBus } from '../commands/command-bus.ts';
 import type { TransportIdentity } from '../commands/caller.ts';
@@ -39,6 +43,7 @@ import type { RandomSource } from '../runtime/ids.ts';
 import type { EventStore } from '../store/event-store.ts';
 import type { HumanApprover } from './approver.ts';
 import type { CredentialKind, HumanCredentials } from './credentials.ts';
+import { ExchangeError } from '../workflow/exchange.ts';
 import type { EngineQueries } from './queries.ts';
 
 /**
@@ -308,6 +313,31 @@ export class RpcConnection {
         return { templates: await queries.templates() };
       case RPC_METHODS.board:
         return queries.board(this.params(BoardQuerySchema, params).projectId);
+      case RPC_METHODS.runEvents: {
+        const query = this.params(RunEventsQuerySchema, params);
+        const page = await queries.runEvents(query.runId, {
+          ...(query.after === undefined ? {} : { after: query.after }),
+          ...(query.limit === undefined ? {} : { limit: query.limit }),
+          ...(query.textLimit === undefined ? {} : { textLimit: query.textLimit }),
+        });
+        if (page === undefined) throw new RpcError(commandError('not_found', 'no such run'));
+        return page;
+      }
+      case RPC_METHODS.definitions:
+        return { definitions: await queries.definitionList(this.params(DefinitionsQuerySchema, params).kind) };
+      case RPC_METHODS.exportDefinition: {
+        const query = this.params(ExportDefinitionQuerySchema, params);
+        try {
+          return await queries.exportDefinition(query);
+        } catch (error) {
+          if (error instanceof ExchangeError) throw new RpcError(commandError(error.code, error.message));
+          throw error;
+        }
+      }
+      case RPC_METHODS.importPreview: {
+        const query = this.params(ImportPreviewQuerySchema, params);
+        return queries.importPreview(query.text, query.choices);
+      }
       case RPC_METHODS.ticketStats: {
         const stats = await queries.ticketStats(this.params(TicketQuerySchema, params).ticketId);
         if (stats === undefined) throw new RpcError(commandError('not_found', 'no such ticket'));
