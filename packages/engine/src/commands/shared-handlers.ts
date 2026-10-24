@@ -267,12 +267,14 @@ async function startBatch(ctx: HandlerContext, shared: Loaded<SharedNodeState>, 
   for (const entry of state.queue) {
     const ticket = await ctx.load(ticketAggregate, entry.ticketId);
     const exec = ticket.state.exists ? requestExecution(ticket.state, entry) : undefined;
-    const workflow = exec === undefined || ticket.state.status !== 'open' ? undefined : await openWorkflow(ctx, ticket);
-    const node = workflow === undefined || isFailure(workflow) ? undefined : workflow.nodes.get(entry.nodeId);
-    if (exec === undefined || workflow === undefined || isFailure(workflow) || node?.completion !== 'shared' || (exec.status !== 'queued' && exec.status !== 'paused')) {
+    if (exec === undefined || ticket.state.status !== 'open' || (exec.status !== 'queued' && exec.status !== 'paused')) {
       dropped.push(holderOf(entry));
       continue;
     }
+    // A ticket that cannot be carried on now (its definition file changed, events in an old format) keeps its place.
+    const workflow = await openWorkflow(ctx, ticket);
+    const node = isFailure(workflow) ? undefined : workflow.nodes.get(entry.nodeId);
+    if (isFailure(workflow) || node?.completion !== 'shared') continue;
     if (exec.status === 'queued') candidates.push({ entry, ticket, workflow, node, exec });
   }
   const dropEvents: NewEvent[] = dropped.length === 0 ? [] : [{ type: 'sharedNode.requestDropped', data: { ...fields, requests: dropped.slice(0, 4096) } }];

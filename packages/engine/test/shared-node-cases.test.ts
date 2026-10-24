@@ -287,7 +287,7 @@ describe('shared nodes', { timeout: 30_000 }, () => {
       );
       enqueueBuild(h, buildPasses());
       await ticket('D', 'myteam/edit-only');
-      await h.clock.advance(MINUTE / 2);
+      await driveUntil(h, h.clock.now() + MINUTE / 2);
       for (const title of ['A', 'B', 'C']) await ticket(title);
       await ticket('E', 'myteam/edit-only');
       await h.drive();
@@ -326,6 +326,19 @@ describe('shared nodes', { timeout: 30_000 }, () => {
       await h.drive();
       expect((await error(ticketId)).error).toMatch(/worktree mode/);
       expect(h.processes.spawned).toEqual([]);
+    });
+
+    it("a batch never runs in the engine's own folder: without a project folder it fails without starting anything", async () => {
+      await open();
+      const { projectId: bare } = (await h.ok('project.create', { name: 'no folder' })).result as { projectId: string };
+      await defineShared(h, bare, buildSpec({ batchTrigger: { count: 1 } }));
+      const { ticketId } = (await h.ok('ticket.create', { projectId: bare, title: 'bare', template: { id: 'myteam/quick-flow' } })).result as { ticketId: string };
+      await h.ok('node.done', { ticketId, nodeId: 'task', port: 'done' });
+      await h.drive();
+      expect(h.processes.spawned).toEqual([]);
+      const output = currentExecution(await h.ticket(ticketId), 'build', 'main')?.output;
+      expect(output?.port).toBe('error');
+      expect((output?.items[0]?.data as { error: string }).error).toMatch(/no workspace folder/);
     });
 
     it('a request replaced by a newer run of its lane takes its place in the queue; a paused one keeps its place but waits', async () => {

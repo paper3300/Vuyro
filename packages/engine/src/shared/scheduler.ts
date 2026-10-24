@@ -247,6 +247,11 @@ export class SharedNodeScheduler {
       await finish({ kind: 'script', exitCode: null, error: 'the program resolved to an empty string' });
       return;
     }
+    // A batch builds the project folder (shared mode): never the engine's own working directory.
+    if (project.root === undefined && invocation.cwd === undefined) {
+      await finish({ kind: 'script', exitCode: null, error: "the project has no workspace folder to run the batch in (set it with 'vuyro project configure --root')" });
+      return;
+    }
     const child = startScript(this.options.processRunner, this.options.clock, invocation, project.root);
     live.kill = () => {
       child.kill();
