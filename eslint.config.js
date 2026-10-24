@@ -105,4 +105,28 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    // The window's page: no Node, no Electron, no engine. It reaches the engine only through the preload bridge.
+    files: ['apps/desktop/src/renderer/**', 'apps/desktop/test/renderer/**'],
+    languageOptions: { globals: globals.browser },
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            { name: pkg.cli, message: 'Hosts do not import each other.' },
+            { name: pkg.engine, message: 'The renderer talks to the engine only through window.vuyro (preload).' },
+            { name: pkg.agentAdapters, message: 'The renderer talks to the engine only through window.vuyro (preload).' },
+          ],
+          patterns: [electron, deepImport, { ...nodeBuiltins, message: 'The renderer has no Node access (contextIsolation, sandbox).' }],
+        },
+      ],
+      // Agent output and logs are text, never HTML (기술 스택 결정 §1).
+      'no-restricted-syntax': [
+        'error',
+        { selector: "JSXAttribute[name.name='dangerouslySetInnerHTML']", message: 'Show agent and user text as text; never inject HTML.' },
+        { selector: "MemberExpression[property.name=/^(innerHTML|outerHTML)$/]", message: 'Show agent and user text as text; never inject HTML.' },
+      ],
+    },
+  },
 );

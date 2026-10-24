@@ -1,0 +1,96 @@
+import { describe, expect, it } from 'vitest';
+import type { BridgeResult, ConnectionState } from '../../src/shared/bridge.ts';
+import { type QuitDeps, quitForGood, trayItems, trayTooltip } from '../../src/main/tray-model.ts';
+
+/** The tray menu and "완전 종료" (기획 결정 2026-10-23): ask first when something runs; the engine stops with the app. */
+
+describe('tray menu', () => {
+  it('opens the window, shows the running count, quits for good', () => {
+    const state: ConnectionState = { phase: 'connected', access: 'write', running: 3 };
+    expect(trayItems(state)).toEqual([
+      { kind: 'action', id: 'open', label: '창 열기' },
+      { kind: 'info', label: '실행 중 작업: 3개' },
+      { kind: 'separator' },
+      { kind: 'action', id: 'quit', label: '완전 종료' },
+    ]);
+    expect(trayTooltip(state)).toBe('Vuyro · 실행 중 작업: 3개');
+  });
+
+  it('says when there is no engine to count', () => {
+    expect(trayItems({ phase: 'offline', access: 'none' })[1]).toEqual({ kind: 'info', label: '엔진 연결 안 됨' });
+    expect(trayItems({ phase: 'launching', access: 'none' })[1]).toEqual({ kind: 'info', label: '엔진 시작 중' });
+    expect(trayItems({ phase: 'connected', access: 'read-only' })[1]).toEqual({ kind: 'info', label: '실행 중 작업: 0개' });
+  });
+});
+
+function deps(options: { running: number | undefined; access: ConnectionState['access']; answer?: boolean; shutdown?: BridgeResult<unknown> }) {
+  const calls: string[] = [];
+  const questions: string[] = [];
+  const notices: string[] = [];
+  const quit: QuitDeps = {
+    running: () => {
+      calls.push('running');
+      return Promise.resolve(options.running);
+    },
+    access: () => options.access,
+    confirm: ({ message }) => {
+      calls.push('confirm');
+      questions.push(message);
+      return Promise.resolve(options.answer ?? false);
+    },
+    notify: ({ message }) => {
+      calls.push('notify');
+      notices.push(message);
+      return Promise.resolve();
+    },
+    shutdownEngine: () => {
+      calls.push('shutdown');
+      return Promise.resolve(options.shutdown ?? { ok: true, value: { stopping: true } });
+    },
+    exitApp: () => {
+      calls.push('exit');
+    },
+  };
+  return { quit, calls, questions, notices };
+}
+
+describe('quitting for good', () => {
+  it('nothing running: stops the engine and quits without asking', async () => {
+    const { quit, calls } = deps({ running: 0, access: 'write' });
+    expect(await quitForGood(quit)).toBe('quit-with-engine');
+    expect(calls).toEqual(['running', 'shutdown', 'exit']);
+  });
+
+  it('work running: asks first; "취소" leaves everything running', async () => {
+    const { quit, calls, questions } = deps({ running: 2, access: 'write', answer: false });
+    expect(await quitForGood(quit)).toBe('cancelled');
+    expect(calls).toEqual(['running', 'confirm']);
+    expect(questions).toEqual(['실행 중인 작업 2개가 있습니다. 완전히 종료할까요?']);
+  });
+
+  it('work running and confirmed: stops the engine, then quits', async () => {
+    const { quit, calls } = deps({ running: 1, access: 'write', answer: true });
+    expect(await quitForGood(quit)).toBe('quit-with-engine');
+    expect(calls).toEqual(['running', 'confirm', 'shutdown', 'exit']);
+  });
+
+  it('a read-only app cannot stop an engine started elsewhere: it says so and quits alone', async () => {
+    const { quit, calls, notices } = deps({ running: 0, access: 'read-only' });
+    expect(await quitForGood(quit)).toBe('quit-engine-kept');
+    expect(calls).toEqual(['running', 'notify', 'exit']);
+    expect(notices).toEqual(['엔진은 계속 실행됩니다.']);
+  });
+
+  it('no engine at all: quits without questions', async () => {
+    const { quit, calls } = deps({ running: undefined, access: 'none' });
+    expect(await quitForGood(quit)).toBe('quit-engine-kept');
+    expect(calls).toEqual(['running', 'exit']);
+  });
+
+  it('when the engine refuses to stop, the person is told and the app still quits', async () => {
+    const { quit, calls, notices } = deps({ running: 0, access: 'write', shutdown: { ok: false, error: { code: 'forbidden', message: 'only the human', retryable: false } } });
+    expect(await quitForGood(quit)).toBe('quit-engine-kept');
+    expect(calls).toEqual(['running', 'shutdown', 'notify', 'exit']);
+    expect(notices).toEqual(['엔진을 멈추지 못했습니다.']);
+  });
+});

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mainWindowOptions } from '../src/window-options.ts';
+import { mainWindowOptions } from '../../src/main/window-options.ts';
 
 describe('main window', () => {
   it('isolates the renderer from Node', () => {
