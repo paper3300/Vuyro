@@ -104,6 +104,21 @@ function requestId(step: string, ...parts: (string | number)[]): string {
   return `ws-${step}-${createHash('sha256').update(parts.join('\u0000')).digest('hex').slice(0, 40)}`;
 }
 
+/**
+ * A merge left in progress in the ticket worktree under `fail` or `rerun` (an engine stopped mid-merge, or a merge
+ * that conflicted against its preview). The engine does not abort it (that would drop whatever is in those files): the
+ * join fails with where it is, and a person finishes or aborts it there. Running the lanes again would not help.
+ */
+function leftInProgress(worktree: string, branch: string, files: readonly string[]): MergeResult {
+  return {
+    kind: 'merge',
+    outcome: 'error',
+    worktree,
+    branch,
+    error: `a merge is in progress in ${worktree} with conflicts in ${files.slice(0, 20).join(', ')}; the engine does not abort it. Resolve and commit it, or abort it yourself, then retry the join`,
+  };
+}
+
 /** Codex runs a repository's own hooks too when the hook trust check is bypassed (D-031): not with those present. The user's are checked in `codexUserHooks`. */
 export function codexProjectHooks(root: string): boolean {
   if (existsSync(join(root, '.codex', 'hooks.json'))) return true;
@@ -344,6 +359,7 @@ export class WorkspaceCoordinator {
           }
           const conflict = { branch: pendingLane?.name.branch ?? branch, nodeId: pendingLane?.nodeId ?? node.id, lane: pendingLane?.lane ?? 'main', files: unmerged };
           if (policy === 'agent') return { kind: 'agent', base, worktree, conflicts: [conflict], agent: settings.mergeAgent };
+          if (policy === 'fail' || policy === 'rerun') return leftInProgress(worktree, branch, unmerged);
           return { ...base, outcome: 'conflict', conflicts: [conflict], head: ticket.head };
         }
         await git.concludeMerge(worktree);
@@ -359,6 +375,16 @@ export class WorkspaceCoordinator {
           merged.push({ branch: lane.name.branch, commit });
           continue;
         }
+        // fail and rerun never start a merge that would conflict, so there is never one to abort (D-042): the
+        // conflict is found without touching the worktree, and the branch is simply not merged.
+        if (policy === 'fail' || policy === 'rerun') {
+          const predicted = await git.mergePreview(worktree, lane.name.branch);
+          if (predicted.length > 0) {
+            conflicts.push({ branch: lane.name.branch, nodeId: lane.nodeId, lane: lane.lane, files: predicted });
+            if (policy === 'fail') break;
+            continue;
+          }
+        }
         const files = await git.merge(worktree, lane.name.branch, `vuyro: merge ${lane.name.branch} (${node.id})`);
         if (files.length === 0) {
           merged.push({ branch: lane.name.branch, commit });
@@ -367,9 +393,8 @@ export class WorkspaceCoordinator {
         const conflict = { branch: lane.name.branch, nodeId: lane.nodeId, lane: lane.lane, files };
         if (policy === 'ask') return { ...base, outcome: 'conflict', merged, conflicts: [conflict], head: (await git.revParse(worktree, 'HEAD')) ?? '' };
         if (policy === 'agent') return { kind: 'agent', base: { ...base, merged }, worktree, conflicts: [conflict], agent: settings.mergeAgent };
-        await git.abortMerge(worktree);
-        conflicts.push(conflict);
-        if (policy === 'fail') break;
+        // Predicted clean but conflicted all the same: the merge stays in progress for a person; nothing is aborted.
+        return leftInProgress(worktree, branch, files);
       }
       const head = (await git.revParse(worktree, 'HEAD')) ?? '';
       if (conflicts.length > 0) return { ...base, outcome: 'conflict', merged, conflicts, head };
@@ -916,8 +941,8 @@ export class WorkspaceCoordinator {
           continue;
         }
         if (existsSync(worktree.path)) await git.removeWorktree(status.repo, worktree.path);
-        const branchDeleted = worktree.scope === 'lane' && status.merged;
-        if (branchDeleted) await git.deleteBranch(status.repo, worktree.branch);
+        // Only while it still is the commit found merged: a commit added since keeps the branch.
+        const branchDeleted = worktree.scope === 'lane' && status.merged && status.head !== undefined && (await git.deleteBranch(status.repo, worktree.branch, status.head));
         await this.record({ projectId, op: 'worktreeRemoved', ticketId: worktree.ticketId, key: worktree.key, reason: removal, branchDeleted }, worktree.key, worktree.base);
       } catch (error) {
         this.options.reportError(error instanceof Error ? error : new Error(String(error)), `cleaning up worktree ${worktree.path}`);
@@ -931,7 +956,7 @@ export class WorkspaceCoordinator {
    */
   private async worktreeStatus(
     worktree: Worktree,
-  ): Promise<{ repo: string; ticketDone: boolean; inUse: boolean; merged: boolean; superseded: boolean } | undefined> {
+  ): Promise<{ repo: string; ticketDone: boolean; inUse: boolean; merged: boolean; superseded: boolean; head?: string } | undefined> {
     const state = await this.ticket(worktree.ticketId);
     const repo = state.workspace?.root;
     if (repo === undefined) return undefined;
@@ -948,7 +973,7 @@ export class WorkspaceCoordinator {
     const head = await git.revParse(repo, `refs/heads/${worktree.branch}`);
     const merged = head !== undefined && (await git.revParse(repo, `refs/heads/${ticketBranch}`)) !== undefined && (await git.isAncestor(repo, head, `refs/heads/${ticketBranch}`));
     const inUse = !ticketDone && !superseded && lane !== undefined && ACTIVE_STATUSES.has(lane.status);
-    return { repo, ticketDone, inUse, merged, superseded };
+    return { repo, ticketDone, inUse, merged, superseded, ...(head === undefined ? {} : { head }) };
   }
 
   /** What a worktree holds beyond its commit (undefined: it could not be read, so it is treated as holding something). */
@@ -1039,8 +1064,7 @@ export class WorkspaceCoordinator {
           continue;
         }
         if (existsSync(worktree.path)) await this.options.git.removeWorktree(status.repo, worktree.path, { approvedByPerson: true });
-        const branchDeleted = worktree.scope === 'lane' && status.merged;
-        if (branchDeleted) await this.options.git.deleteBranch(status.repo, worktree.branch);
+        const branchDeleted = worktree.scope === 'lane' && status.merged && status.head !== undefined && (await this.options.git.deleteBranch(status.repo, worktree.branch, status.head));
         await this.record({ projectId, op: 'worktreeRemoved', ticketId: worktree.ticketId, key, reason: 'manual', branchDeleted }, key, worktree.base, 'manual');
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

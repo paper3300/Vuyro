@@ -51,7 +51,8 @@ async function heldPaths(h: WorkflowHarness, projectId: string): Promise<string[
   return rows.map((row) => `${row.node_id}:${row.path}`);
 }
 
-describe('claims and their conflict policies', () => {
+// Real git and file hashing: seconds per test, more under a full parallel run (the default 5 s timed out there).
+describe('claims and their conflict policies', { timeout: 30_000 }, () => {
   let h: WorkflowHarness;
   let root: string;
 

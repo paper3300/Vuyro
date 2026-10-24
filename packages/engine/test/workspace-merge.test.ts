@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { workspaceAggregateId } from '@vuyro/contracts';
 import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
 import { laneWorktree, ticketWorktree } from '../src/workspace/layout.ts';
-import { GitClient } from '../src/workspace/git.ts';
+import { GitClient, nodeGitExec } from '../src/workspace/git.ts';
 import { git } from './helpers/workspace-fixtures.ts';
 import { CONFLICTING, type ParallelTicket, startParallel } from './helpers/worktree-fixtures.ts';
 
@@ -21,10 +21,23 @@ describe('merge conflicts at the join', { timeout: 120_000 }, () => {
     t = undefined;
   });
 
-  it('fail: the join fails, the merge is undone, and the lanes keep their worktrees', async () => {
-    t = await startParallel({ settings: { workspaceMode: 'worktree', onMergeConflict: 'fail' }, dev: CONFLICTING });
+  it('fail: the join fails without ever starting the conflicting merge (nothing to abort), and the lanes keep their worktrees', async () => {
+    const calls: string[] = [];
+    const exec = nodeGitExec();
+    t = await startParallel({
+      settings: { workspaceMode: 'worktree', onMergeConflict: 'fail' },
+      dev: CONFLICTING,
+      git: new GitClient((args, cwd) => {
+        calls.push(args.join(' '));
+        return exec(args, cwd);
+      }),
+    });
     const { h, ticketId } = t;
     await h.drive();
+    // The conflict was found by a read-only preview; no merge was aborted, nothing reset or cleaned.
+    expect(calls.some((call) => call.startsWith('merge-tree --write-tree'))).toBe(true);
+    expect(calls.filter((call) => /(^|\s)(--abort|reset|clean|stash|restore|-D)(\s|$)/.test(call) || call.includes('--force'))).toEqual([]);
+    expect(calls.filter((call) => call.includes(`merge --no-ff --no-edit -m vuyro: merge vuyro/${ticketId}/dev-2`))).toEqual([]);
     expect(await h.status(ticketId, 'join')).toBe('failed');
     const failed = currentExecution(await h.ticket(ticketId), 'join', 'main');
     expect(failed?.output?.items[0]?.data).toMatchObject({ conflicts: [{ branch: `vuyro/${ticketId}/dev-2`, nodeId: 'dev', lane: '2', files: ['src/app.txt'] }] });
@@ -70,16 +83,16 @@ describe('merge conflicts at the join', { timeout: 120_000 }, () => {
   });
 
   it('rerun: the conflicting lane runs again in a new worktree on top of what was merged; the old one is left as it was (D-042)', async () => {
-    // A person edits lane 2's worktree after its run ended, just before the join merges it (the merge then conflicts).
+    // A person edits lane 2's worktree after its run ended, just before the join looks at merging it (it conflicts).
     let leftBehind: string | undefined;
     const gitClient = new (class extends GitClient {
-      override async merge(cwd: string, branch: string, message: string): Promise<string[]> {
+      override async mergePreview(cwd: string, branch: string): Promise<string[]> {
         if (leftBehind === undefined && branch.endsWith('/dev-2') && t !== undefined) {
           leftBehind = laneWorktree(t.h.workspaces.layout.worktreeRoot, t.ticketId, 'dev', '2').path;
           writeFileSync(join(leftBehind, 'notes.txt'), 'not committed yet\n');
           writeFileSync(join(leftBehind, 'src', 'app.txt'), 'line 1\nline 2 fixed by hand\nline 3\n');
         }
-        return super.merge(cwd, branch, message);
+        return super.mergePreview(cwd, branch);
       }
     })();
     t = await startParallel({

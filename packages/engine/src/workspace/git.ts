@@ -5,11 +5,23 @@ import { resolveExecutable } from '@vuyro/agent-adapters';
 
 /**
  * The git commands the engine runs, and nothing else ([[공유·권한·BlackBoard 설계]] §3.8, §3.9):
- * - read-only queries for change detection (`status`, `rev-parse`, `merge-base`, `diff --name-only`), with optional
- *   locks off so a query never writes the index;
+ * - read-only queries for change detection (`status`, `rev-parse`, `merge-base`, `diff --name-only`, `merge-tree`),
+ *   with optional locks off so a query never writes the index;
  * - worktree mode only: making, merging and removing the engine's own worktrees and `vuyro/…` branches.
- * Never anything that throws work away on the engine's own initiative: no `reset --hard`, no `clean`, no forced
- * removal ([[결정 대기]] D-042). A worktree is removed only when it holds nothing, or when a person confirmed it.
+ *
+ * **Nothing that throws work away on the engine's own initiative** ([[결정 대기]] D-042, [[명령·이벤트 계약]] §14.9).
+ * No `reset`, `clean`, `checkout -f`/`checkout --`, `restore`, `stash`, `merge --abort`, `branch -D`, `push`.
+ * Every call that changes something, and why it cannot lose work:
+ * - `worktree add` (`-b` new branch at a commit, or an existing branch): makes a new folder; git refuses an existing one.
+ * - `worktree prune`: forgets registrations whose folder is already gone (metadata only, no file).
+ * - `worktree remove` without `--force`: only after `contents` found nothing (ignored files included); git refuses a
+ *   changed or untracked file anyway. With `--force` only for a person's confirmed clean-up whose fingerprint still matches.
+ * - `update-ref -d <branch> <commit>`: deletes a branch only while it still is the commit found merged into the ticket
+ *   branch (atomic compare-and-delete); a new commit on it makes git refuse, and the branch stays.
+ * - `add --all` + `commit`: records what is there on the engine's own branch; nothing is dropped.
+ * - `merge --no-ff`: only after `merge-tree` predicted no conflict, or under a policy that leaves the conflict for a
+ *   person or an agent to resolve (never aborted); git refuses when it would overwrite local changes.
+ * - `merge --ff-only`: moves a branch forward only; git refuses when local changes would be overwritten.
  * No shell: git is started directly with an argument list. Nothing here locks or checks out anything for the person.
  */
 
@@ -187,8 +199,13 @@ export class GitClient {
     await this.run(repo, ['worktree', 'prune']);
   }
 
-  async deleteBranch(repo: string, branch: string): Promise<void> {
-    await this.run(repo, ['branch', '-D', branch]);
+  /**
+   * Deletes a branch only if it still points at `expected` (the commit the caller found merged), atomically. Returns
+   * false (and keeps the branch) when it moved or anything else went wrong.
+   */
+  async deleteBranch(repo: string, branch: string, expected: string): Promise<boolean> {
+    const result = await this.exec(['update-ref', '-d', `refs/heads/${branch}`, expected], repo);
+    return result.code === 0;
   }
 
   /** Commits everything in a worktree (its own branch). Returns the new head, or undefined when nothing changed. */
@@ -211,14 +228,22 @@ export class GitClient {
     return conflicts;
   }
 
+  /**
+   * Read-only: the files that would conflict if `branch` were merged into the worktree's HEAD ([] = it merges cleanly).
+   * Touches no worktree and no index (`merge-tree --write-tree`, git 2.38+).
+   */
+  async mergePreview(cwd: string, branch: string): Promise<string[]> {
+    const result = await this.run(cwd, ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', 'HEAD', branch], { allow: [1] });
+    if (result.code === 0) return [];
+    // The first field is the tree written; the rest name the conflicting files.
+    const files = result.stdout.split('\0').slice(1).filter((path) => path !== '');
+    return [...new Set(files)];
+  }
+
   /** Files with unresolved conflicts. */
   async unmerged(cwd: string): Promise<string[]> {
     const { stdout } = await this.run(cwd, ['diff', '--name-only', '--diff-filter=U', '-z']);
     return stdout.split('\0').filter((path) => path !== '');
-  }
-
-  async abortMerge(cwd: string): Promise<void> {
-    await this.run(cwd, ['merge', '--abort']);
   }
 
   /** Concludes a merge whose conflicts were resolved (and staged by whoever resolved them). */

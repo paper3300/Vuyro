@@ -91,7 +91,8 @@ async function changes(h: WorkflowHarness, projectId: string): Promise<{ path: s
   }));
 }
 
-describe('checkouts before edits and changes found afterwards', () => {
+// Real git and file hashing: seconds per test, more under a full parallel run (the default 5 s timed out there).
+describe('checkouts before edits and changes found afterwards', { timeout: 30_000 }, () => {
   let h: WorkflowHarness;
   let repo: string;
 
