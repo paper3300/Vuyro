@@ -60,8 +60,12 @@ export interface Execution {
    * despite overlaps (recorded as warnings). A person decided it may; waiting again would undo that.
    */
   readonly override?: true;
-  /** Worktree mode: start the lane's worktree over from the ticket branch (merge conflict, `rerun`). */
-  readonly reset?: true;
+  /**
+   * Worktree mode: this execution starts the lane over in a new worktree (new folder and branch) from the ticket
+   * branch (merge conflict, `rerun`). Later executions of the lane keep working there. The previous worktree is left
+   * as it is for a person (D-042): the engine never resets one.
+   */
+  readonly newWorktree?: true;
   /** A join's merge waiting for a person (conflicts), M4. */
   readonly merge?: MergeReview;
   /** Set when the output had items for edges but every one was stale, so nothing travelled (not a path end, D-021). */
@@ -273,7 +277,7 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEven
         routes: {},
         artifacts: {},
         pauseRequested: false,
-        reset: data.workspace?.reset,
+        newWorktree: data.workspace?.reset,
       });
       return setNode(next, data.nodeId, (node) => {
         const existing = Object.hasOwn(node.lanes, data.lane) ? node.lanes[data.lane] : undefined;
@@ -298,7 +302,6 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEven
           executor: data.executor,
           runIds: data.runId === undefined ? current.runIds : [...current.runIds, data.runId],
           resumeFromRunId: undefined,
-          reset: undefined,
           merge: undefined,
         }),
       );

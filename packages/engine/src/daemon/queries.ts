@@ -1,4 +1,4 @@
-import type { DomainEvent, PinnedTemplate, TicketStats } from '@vuyro/contracts';
+import type { DomainEvent, PinnedTemplate, TicketStats, WorktreeCleanupCandidate } from '@vuyro/contracts';
 import type { Clock } from '../runtime/clock.ts';
 import { computeTicketStats, type NodeKind } from '../stats/ticket-stats.ts';
 import type { EventStore } from '../store/event-store.ts';
@@ -97,11 +97,24 @@ export class EngineQueries {
   private readonly store: EventStore;
   private readonly definitions: DefinitionResolver;
   private readonly clock: Clock;
+  private readonly cleanup: ((projectId: string, ticketId?: string) => Promise<WorktreeCleanupCandidate[]>) | undefined;
 
-  constructor(options: { store: EventStore; definitions: DefinitionResolver; clock: Clock }) {
+  constructor(options: {
+    store: EventStore;
+    definitions: DefinitionResolver;
+    clock: Clock;
+    /** The engine's view of worktrees a person may clean up (it reads the worktrees on disk). */
+    cleanup?: (projectId: string, ticketId?: string) => Promise<WorktreeCleanupCandidate[]>;
+  }) {
     this.store = options.store;
     this.definitions = options.definitions;
     this.clock = options.clock;
+    this.cleanup = options.cleanup;
+  }
+
+  /** Worktrees a person may clean up, with what each still holds (ignored files included) and its fingerprint. */
+  async worktreeCleanup(projectId: string, ticketId?: string): Promise<WorktreeCleanupCandidate[]> {
+    return this.cleanup === undefined ? [] : this.cleanup(projectId, ticketId);
   }
 
   async projects(): Promise<ProjectRow[]> {
@@ -148,7 +161,9 @@ export class EngineQueries {
     );
     const worktrees = await this.store.query<Record<string, unknown>>(
       `SELECT key, ticket_id AS ticketId, scope, node_id AS nodeId, lane, path, branch, base, created_at AS createdAt, removed_at AS removedAt,
-              removed_reason AS removedReason, branch_deleted AS branchDeleted, kept_at AS keptAt, kept_files AS keptFiles, kept_count AS keptCount
+              removed_reason AS removedReason, branch_deleted AS branchDeleted, kept_at AS keptAt, kept_reason AS keptReason, kept_files AS keptFiles, kept_count AS keptCount,
+              kept_ignored AS keptIgnored, kept_ignored_count AS keptIgnoredCount, cleanup_approved_at AS cleanupApprovedAt,
+              cleanup_skipped_at AS cleanupSkippedAt, cleanup_skipped_reason AS cleanupSkippedReason
          FROM p_worktrees WHERE project_id = ?${byTicket} ORDER BY created_at, key`,
       params(),
     );
@@ -159,7 +174,7 @@ export class EngineQueries {
       blocks: parse(blocks, ['paths', 'conflicts']).map((row) => ({ ...row, deadlock: row.deadlock === 1 })),
       changes: parse(changes, ['suspects']),
       overlaps: parse(overlaps, ['spaces', 'holders']),
-      worktrees: parse(worktrees, ['keptFiles']).map((row) => ({ ...row, branchDeleted: row.branchDeleted === null ? null : row.branchDeleted === 1 })),
+      worktrees: parse(worktrees, ['keptFiles', 'keptIgnored']).map((row) => ({ ...row, branchDeleted: row.branchDeleted === null ? null : row.branchDeleted === 1 })),
     };
   }
 

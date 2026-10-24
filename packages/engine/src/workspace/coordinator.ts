@@ -10,6 +10,8 @@ import {
   type Holder,
   type MergeResult,
   type ScanReason,
+  type Worktree,
+  type WorktreeCleanupCandidate,
   workspaceAggregateId,
 } from '@vuyro/contracts';
 import type { CommandBus } from '../commands/command-bus.ts';
@@ -23,7 +25,7 @@ import { ancestorsOf } from '../workflow/context.ts';
 import type { DefinitionResolver } from '../workflow/definitions.ts';
 import { ACTIVE_STATUSES, currentExecution, EMPTY_TICKET, evolveTicket, type Execution, execution, nodeProgress, type TicketWorkflow } from '../workflow/state.ts';
 import { GitError, type GitClient } from './git.ts';
-import { laneWorktree, locate, type Location, ticketWorktree, type WorktreeName } from './layout.ts';
+import { laneWorktree, locate, type Location, ticketWorktree, type WorktreeName, worktreeGeneration } from './layout.ts';
 import { EMPTY_LEDGER, evolveLedger, holderKey, type LedgerEntry, type LedgerState, sameHolder } from './ledger.ts';
 import { insideRoot, isPattern, matches, matchesAny, normalizeRelative, pathKey } from './paths.ts';
 import type { WorkspaceServices } from './services.ts';
@@ -187,18 +189,19 @@ export class WorkspaceCoordinator {
   // ---------------------------------------------------------------------------
   // Before and after an executor
 
-  locate(target: Pick<PrepareTarget, 'ticketId' | 'state' | 'workflow' | 'node'>, lane: string): Location {
-    return locate(this.options.services.layout, target.state, target.ticketId, target.workflow, target.node.id, lane);
+  /** Where an execution of a lane works (`run`: the lane's current execution when absent). */
+  locate(target: Pick<PrepareTarget, 'ticketId' | 'state' | 'workflow' | 'node'>, lane: string, run?: number): Location {
+    return locate(this.options.services.layout, target.state, target.ticketId, target.workflow, target.node.id, lane, run);
   }
 
   async prepare(target: PrepareTarget): Promise<Prepared> {
     const { ticketId, state, node, exec } = target;
-    const location = this.locate(target, exec.lane);
+    const location = this.locate(target, exec.lane, exec.run);
     const holder: Holder = { ticketId, nodeId: node.id, lane: exec.lane, run: exec.run };
     const notes: string[] = [];
     const warnings: string[] = [];
     await this.exclusive(state.projectId, async () => {
-      if (location.worktree !== undefined) await this.ensureWorktree(state, ticketId, location.worktree, exec);
+      if (location.worktree !== undefined) await this.ensureWorktree(state, ticketId, location.worktree);
       if (location.root === undefined) return;
       // What changed before this execution started is not its doing.
       await this.scan(state.projectId, location, state, 'start', undefined, [], holder);
@@ -220,7 +223,7 @@ export class WorkspaceCoordinator {
   /** After the executor's process ended, before the engine reports it: the engine's commit and the `finish` scan. */
   async finish(target: PrepareTarget): Promise<void> {
     const { ticketId, state, node, exec } = target;
-    const location = this.locate(target, exec.lane);
+    const location = this.locate(target, exec.lane, exec.run);
     const holder: Holder = { ticketId, nodeId: node.id, lane: exec.lane, run: exec.run };
     this.stopWatching(location.space, holderKey(holder));
     const root = location.root;
@@ -267,21 +270,23 @@ export class WorkspaceCoordinator {
     return Promise.resolve(existsSync(join(path, '.git')));
   }
 
-  private async ensureWorktree(state: TicketWorkflow, ticketId: string, name: WorktreeName, exec: Execution): Promise<void> {
+  /**
+   * Makes the lane's worktree if it is not there. A lane that starts over (merge conflict, `rerun`) gets a worktree of
+   * a new generation (its own folder and branch) from the ticket branch, so the old one is left untouched (D-042).
+   * An existing worktree only picks up merged work when that is a fast-forward (git refuses rather than overwrite).
+   */
+  private async ensureWorktree(state: TicketWorkflow, ticketId: string, name: WorktreeName): Promise<void> {
     const ticket = await this.ensureTicketWorktree(state, ticketId);
     if (name.scope === 'ticket') return;
     const repo = await this.repository(state);
     const git = this.options.git;
     if (await this.knownWorktree(name.path)) {
-      // A merge conflict sent the lane back: it starts over from what was merged. Otherwise pick up merged work if it is a fast-forward.
-      if (exec.reset === true) await git.resetHard(name.path, ticket.head);
-      else await git.fastForward(name.path, ticket.name.branch);
+      await git.fastForward(name.path, ticket.name.branch);
       return;
     }
     const existing = await git.revParse(repo, name.branch);
     await git.addWorktree(repo, name.path, name.branch, ticket.head);
-    if (exec.reset === true && existing !== undefined) await git.resetHard(name.path, ticket.head);
-    else if (existing !== undefined) await git.fastForward(name.path, ticket.name.branch);
+    if (existing !== undefined) await git.fastForward(name.path, ticket.name.branch);
     const base = (await git.revParse(name.path, 'HEAD')) ?? ticket.head;
     await this.record(
       { projectId: state.projectId, op: 'worktreeCreated', worktree: { ticketId, key: name.key, scope: 'lane', ...(name.nodeId === undefined ? {} : { nodeId: name.nodeId }), ...(name.lane === undefined ? {} : { lane: name.lane }), path: name.path, branch: name.branch, base } },
@@ -445,8 +450,9 @@ export class WorkspaceCoordinator {
           for (const source of sources) {
             const lane = execution(state, source.nodeId, source.run)?.lane;
             if (lane === undefined || lane === 'main' || !laneWorktrees(state, workflow, source.nodeId)) continue;
-            const key = `${source.nodeId}/${lane}`;
-            if (!lanes.has(key)) lanes.set(key, { nodeId: source.nodeId, lane, name: laneWorktree(this.options.services.layout.worktreeRoot, ticketId, source.nodeId, lane) });
+            // The worktree (generation) the execution that produced the item worked in.
+            const name = laneWorktree(this.options.services.layout.worktreeRoot, ticketId, source.nodeId, lane, worktreeGeneration(state, source.nodeId, lane, source.run));
+            if (!lanes.has(name.key)) lanes.set(name.key, { nodeId: source.nodeId, lane, name });
           }
         }
       }
@@ -604,7 +610,7 @@ export class WorkspaceCoordinator {
         for (const lane of progress.laneOrder) {
           const exec = currentExecution(state, nodeId, lane);
           if (exec?.status !== 'running') continue;
-          if (this.locate({ ticketId, state, workflow, node }, lane).space === space) holders.push({ ticketId, nodeId, lane, run: exec.run });
+          if (this.locate({ ticketId, state, workflow, node }, lane, exec.run).space === space) holders.push({ ticketId, nodeId, lane, run: exec.run });
         }
       }
     }
@@ -710,7 +716,9 @@ export class WorkspaceCoordinator {
     if (this.stopped) return;
     for (const event of events) {
       if (event.type === 'ticket.created') this.projectOf.set(event.aggregateId, event.data.projectId);
-      if (event.aggregateType === 'workspace' && (event.type === 'checkout.released' || event.type === 'checkout.acquired')) this.touch(event.data.projectId);
+      if (event.aggregateType === 'workspace' && (event.type === 'checkout.released' || event.type === 'checkout.acquired' || event.type === 'worktree.cleanupApproved')) {
+        this.touch(event.data.projectId);
+      }
       if (event.aggregateType !== 'ticket') continue;
       if (event.type === 'ticket.completed' || (event.type === 'node.completed' && event.data.status === 'done')) this.cleanup.add(event.aggregateId);
       if (
@@ -808,8 +816,9 @@ export class WorkspaceCoordinator {
     if (retain.length > 0) await this.record({ projectId, op: 'retain', ids: retain }, ...retain);
     for (const pause of pauses.values()) await this.record({ projectId, op: 'pause', holder: pause.holder, hashes: pause.hashes }, holderKey(pause.holder), JSON.stringify(pause.hashes));
     this.scheduleExpiry(projectId, nextExpiry);
-    // Kept worktrees (uncommitted changes) are looked at again on every pass: once someone commits or discards, they go.
-    if (reason === 'recovery' || Object.keys(ledger.kept).length > 0 || Object.keys(ledger.worktrees).some((key) => this.cleanup.has(ledger.worktrees[key]?.ticketId ?? ''))) {
+    // Kept worktrees are looked at again when their ticket's work moves on and at engine start; a person's approved
+    // clean-ups are carried out on the next pass.
+    if (reason === 'recovery' || Object.keys(ledger.approved).length > 0 || Object.keys(ledger.worktrees).some((key) => this.cleanup.has(ledger.worktrees[key]?.ticketId ?? ''))) {
       await this.exclusive(projectId, () => this.cleanWorktrees(projectId, reason === 'recovery'));
       for (const worktree of Object.values(ledger.worktrees)) this.cleanup.delete(worktree.ticketId);
     }
@@ -822,7 +831,7 @@ export class WorkspaceCoordinator {
       const workflow = await this.options.definitions.workflow(state.template);
       const node = workflow.nodes.get(entry.holder.nodeId);
       if (node === undefined) return null;
-      const root = this.locate({ ticketId: entry.holder.ticketId, state, workflow, node }, entry.holder.lane).root;
+      const root = this.locate({ ticketId: entry.holder.ticketId, state, workflow, node }, entry.holder.lane, entry.holder.run).root;
       return root === undefined ? null : await this.options.services.hash(root, entry.path);
     } catch {
       return null;
@@ -879,66 +888,165 @@ export class WorkspaceCoordinator {
   }
 
   /**
-   * Worktrees of completed tickets, and lane worktrees whose branch is merged into the ticket branch, are removed,
-   * unless they hold changes nobody committed: those stay, recorded as `worktree.kept`, and are looked at again on
-   * every later clean-up pass and at engine start (D-041). Removing them would lose a person's work.
+   * Automatic clean-up (D-041, D-042). The engine removes a worktree on its own only when it is done with it (its ticket
+   * completed, or a lane's branch is merged into the ticket branch) **and** it holds nothing at all: no changed, untracked
+   * or ignored file. Anything else stays and is recorded as `worktree.kept` for a person, who removes it with
+   * `worktree.cleanup` after seeing what it holds. A lane worktree replaced by a newer generation (`rerun`) is kept
+   * while its ticket is open. Removal never uses `--force` here; branches are deleted only when merged.
    */
   private async cleanWorktrees(projectId: string, all = false): Promise<void> {
+    await this.carryOutApprovals(projectId);
     const ledger = await this.ledger(projectId);
     const git = this.options.git;
     for (const worktree of Object.values(ledger.worktrees)) {
-      if (!all && !this.cleanup.has(worktree.ticketId) && !Object.hasOwn(ledger.kept, worktree.key)) continue;
-      const state = await this.ticket(worktree.ticketId);
-      const repo = state.workspace?.root;
-      if (repo === undefined) continue;
-      const ticketDone = !state.exists || state.status !== 'open';
-      const ticketBranch = ticketWorktree(this.options.services.layout.worktreeRoot, worktree.ticketId).branch;
+      if (!all && !this.cleanup.has(worktree.ticketId)) continue;
       try {
-        if (worktree.scope === 'lane') {
-          const lane = worktree.nodeId === undefined || worktree.lane === undefined ? undefined : currentExecution(state, worktree.nodeId, worktree.lane);
-          const busy = lane !== undefined && ACTIVE_STATUSES.has(lane.status);
-          const head = await git.revParse(repo, `refs/heads/${worktree.branch}`);
-          const merged = head !== undefined && (await git.revParse(repo, `refs/heads/${ticketBranch}`)) !== undefined && (await git.isAncestor(repo, head, `refs/heads/${ticketBranch}`));
-          // A failed lane keeps its worktree for a look until its ticket completes; a merged one goes now.
-          if (busy || (!ticketDone && !merged) || (!ticketDone && lane?.status === 'failed')) continue;
-          const removal = merged && !ticketDone ? 'merged' : 'ticketDone';
-          if (await this.keepUncommitted(projectId, worktree, removal)) continue;
-          if (existsSync(worktree.path)) await git.removeWorktree(repo, worktree.path);
-          if (merged) await git.deleteBranch(repo, worktree.branch);
-          await this.record({ projectId, op: 'worktreeRemoved', ticketId: worktree.ticketId, key: worktree.key, reason: removal, branchDeleted: merged }, worktree.key, worktree.base);
-        } else if (ticketDone) {
-          // The ticket branch stays: it is the ticket's result.
-          if (await this.keepUncommitted(projectId, worktree, 'ticketDone')) continue;
-          if (existsSync(worktree.path)) await git.removeWorktree(repo, worktree.path);
-          await this.record({ projectId, op: 'worktreeRemoved', ticketId: worktree.ticketId, key: worktree.key, reason: 'ticketDone', branchDeleted: false }, worktree.key, worktree.base);
+        const status = await this.worktreeStatus(worktree);
+        if (status === undefined || status.inUse) continue;
+        let removal: 'merged' | 'ticketDone';
+        if (status.ticketDone) removal = 'ticketDone';
+        else if (status.superseded) {
+          await this.recordKept(projectId, worktree, 'superseded', await this.contentsOf(worktree.path));
+          continue;
+        } else if (worktree.scope === 'lane' && status.merged) removal = 'merged';
+        else continue;
+        const contents = await this.contentsOf(worktree.path);
+        if (contents === undefined || contents.changed.length > 0 || contents.ignored.length > 0) {
+          await this.recordKept(projectId, worktree, removal, contents);
+          continue;
         }
+        if (existsSync(worktree.path)) await git.removeWorktree(status.repo, worktree.path);
+        const branchDeleted = worktree.scope === 'lane' && status.merged;
+        if (branchDeleted) await git.deleteBranch(status.repo, worktree.branch);
+        await this.record({ projectId, op: 'worktreeRemoved', ticketId: worktree.ticketId, key: worktree.key, reason: removal, branchDeleted }, worktree.key, worktree.base);
       } catch (error) {
-        this.options.reportError(error instanceof Error ? error : new Error(String(error)), `removing worktree ${worktree.path}`);
+        this.options.reportError(error instanceof Error ? error : new Error(String(error)), `cleaning up worktree ${worktree.path}`);
       }
     }
   }
 
   /**
-   * Whether a worktree has changed or untracked files (git status; ignored files such as build output do not count).
-   * If so it is kept and recorded. A worktree whose status cannot be read is kept too (fail closed).
+   * Where a worktree stands: in use (its ticket's work, or a lane's current worktree while the lane is active), done
+   * with (ticket completed), a lane branch merged into the ticket branch, or a replaced generation of a lane.
    */
-  private async keepUncommitted(projectId: string, worktree: { ticketId: string; key: string; path: string }, removal: 'merged' | 'ticketDone'): Promise<boolean> {
-    if (!existsSync(worktree.path)) return false;
-    let files: string[];
+  private async worktreeStatus(
+    worktree: Worktree,
+  ): Promise<{ repo: string; ticketDone: boolean; inUse: boolean; merged: boolean; superseded: boolean } | undefined> {
+    const state = await this.ticket(worktree.ticketId);
+    const repo = state.workspace?.root;
+    if (repo === undefined) return undefined;
+    const ticketDone = !state.exists || state.status !== 'open';
+    if (worktree.scope === 'ticket') return { repo, ticketDone, inUse: !ticketDone, merged: false, superseded: false };
+    const git = this.options.git;
+    const lane = worktree.nodeId === undefined || worktree.lane === undefined ? undefined : currentExecution(state, worktree.nodeId, worktree.lane);
+    const current =
+      lane === undefined || worktree.nodeId === undefined || worktree.lane === undefined
+        ? undefined
+        : laneWorktree(this.options.services.layout.worktreeRoot, worktree.ticketId, worktree.nodeId, worktree.lane, worktreeGeneration(state, worktree.nodeId, worktree.lane, lane.run)).key;
+    const superseded = current !== undefined && current !== worktree.key;
+    const ticketBranch = ticketWorktree(this.options.services.layout.worktreeRoot, worktree.ticketId).branch;
+    const head = await git.revParse(repo, `refs/heads/${worktree.branch}`);
+    const merged = head !== undefined && (await git.revParse(repo, `refs/heads/${ticketBranch}`)) !== undefined && (await git.isAncestor(repo, head, `refs/heads/${ticketBranch}`));
+    const inUse = !ticketDone && !superseded && lane !== undefined && ACTIVE_STATUSES.has(lane.status);
+    return { repo, ticketDone, inUse, merged, superseded };
+  }
+
+  /** What a worktree holds beyond its commit (undefined: it could not be read, so it is treated as holding something). */
+  private async contentsOf(path: string): Promise<{ changed: string[]; ignored: string[] } | undefined> {
+    if (!existsSync(path)) return { changed: [], ignored: [] };
     try {
-      files = (await this.options.git.status(worktree.path)).map((entry) => entry.path);
+      const contents = await this.options.git.contents(path);
+      return { changed: [...new Set(contents.changed)].sort(), ignored: [...new Set(contents.ignored)].sort() };
     } catch (error) {
-      this.options.reportError(error instanceof Error ? error : new Error(String(error)), `reading git status of ${worktree.path} before removing it (kept)`);
-      return true;
+      this.options.reportError(error instanceof Error ? error : new Error(String(error)), `reading what ${path} holds (it is kept)`);
+      return undefined;
     }
-    if (files.length === 0) return false;
-    const listed = [...new Set(files)].sort();
+  }
+
+  private async recordKept(projectId: string, worktree: Worktree, removal: 'merged' | 'ticketDone' | 'superseded', contents: { changed: string[]; ignored: string[] } | undefined): Promise<void> {
+    const changed = contents?.changed ?? [];
+    const ignored = contents?.ignored ?? [];
     await this.record(
-      { projectId, op: 'worktreeKept', ticketId: worktree.ticketId, key: worktree.key, removal, files: listed.slice(0, 1000), count: listed.length },
+      { projectId, op: 'worktreeKept', ticketId: worktree.ticketId, key: worktree.key, removal, files: changed.slice(0, 1000), count: changed.length, ignored: ignored.slice(0, 1000), ignoredCount: ignored.length },
       worktree.key,
-      JSON.stringify(listed.slice(0, 1000)),
+      removal,
+      JSON.stringify([changed.slice(0, 1000), ignored.slice(0, 1000)]),
     );
-    return true;
+  }
+
+  /** Changes whenever anything in the worktree changes: its commit, or any changed, untracked or ignored file (with content). */
+  private async fingerprint(path: string, contents: { changed: string[]; ignored: string[] }): Promise<string> {
+    const hash = createHash('sha256');
+    hash.update(JSON.stringify([existsSync(path) ? ((await this.options.git.revParse(path, 'HEAD')) ?? null) : null, contents.changed, contents.ignored]));
+    for (const file of [...contents.changed, ...contents.ignored]) hash.update(`\u0000${file}\u0000${(await this.options.services.hash(path, file)) ?? 'none'}`);
+    return `sha256:${hash.digest('hex')}`;
+  }
+
+  /**
+   * Worktrees a person may clean up (`vuyro workspace cleanup`): every worktree the engine is not using, with what it
+   * holds and the fingerprint `worktree.cleanup` must send back.
+   */
+  async cleanupCandidates(projectId: string, ticketId?: string): Promise<WorktreeCleanupCandidate[]> {
+    return this.options.activity.track(() =>
+      this.exclusive(projectId, async () => {
+        const ledger = await this.ledger(projectId);
+        const candidates: WorktreeCleanupCandidate[] = [];
+        for (const worktree of Object.values(ledger.worktrees)) {
+          if (ticketId !== undefined && worktree.ticketId !== ticketId) continue;
+          const status = await this.worktreeStatus(worktree);
+          if (status === undefined || status.inUse) continue;
+          const contents = await this.contentsOf(worktree.path);
+          if (contents === undefined) continue;
+          candidates.push({
+            key: worktree.key,
+            ticketId: worktree.ticketId,
+            scope: worktree.scope,
+            ...(worktree.nodeId === undefined ? {} : { nodeId: worktree.nodeId }),
+            ...(worktree.lane === undefined ? {} : { lane: worktree.lane }),
+            path: worktree.path,
+            branch: worktree.branch,
+            merged: worktree.scope === 'lane' && status.merged,
+            files: contents.changed.slice(0, 200),
+            count: contents.changed.length,
+            ignored: contents.ignored.slice(0, 200),
+            ignoredCount: contents.ignored.length,
+            fingerprint: await this.fingerprint(worktree.path, contents),
+          });
+        }
+        return candidates;
+      }),
+    );
+  }
+
+  /**
+   * Clean-ups a person approved: the worktree goes (with `--force`: they saw what it holds) only if it still has the
+   * fingerprint they were shown and the engine is not using it. Otherwise the approval is dropped with the reason.
+   */
+  private async carryOutApprovals(projectId: string): Promise<void> {
+    const ledger = await this.ledger(projectId);
+    for (const [key, approved] of Object.entries(ledger.approved)) {
+      const worktree = ledger.worktrees[key];
+      if (worktree === undefined) continue;
+      try {
+        const status = await this.worktreeStatus(worktree);
+        if (status === undefined || status.inUse) {
+          await this.record({ projectId, op: 'cleanupSkipped', key, reason: 'inUse', detail: 'the engine is using this worktree' }, key, approved, 'inUse');
+          continue;
+        }
+        const contents = await this.contentsOf(worktree.path);
+        if (contents === undefined || (await this.fingerprint(worktree.path, contents)) !== approved) {
+          await this.record({ projectId, op: 'cleanupSkipped', key, reason: 'changed', detail: 'the worktree changed after it was shown; look at it again' }, key, approved, 'changed');
+          continue;
+        }
+        if (existsSync(worktree.path)) await this.options.git.removeWorktree(status.repo, worktree.path, { approvedByPerson: true });
+        const branchDeleted = worktree.scope === 'lane' && status.merged;
+        if (branchDeleted) await this.options.git.deleteBranch(status.repo, worktree.branch);
+        await this.record({ projectId, op: 'worktreeRemoved', ticketId: worktree.ticketId, key, reason: 'manual', branchDeleted }, key, worktree.base, 'manual');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await this.record({ projectId, op: 'cleanupSkipped', key, reason: 'error', detail: message.slice(0, 4096) }, key, approved, 'error');
+      }
+    }
   }
 
   /**

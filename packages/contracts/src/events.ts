@@ -710,17 +710,22 @@ export const EVENT_CATALOG = {
         projectId: IdSchema,
         ticketId: IdSchema,
         key: Type.String({ minLength: 1, maxLength: 230 }),
-        /** merged: its branch is in the ticket branch. ticketDone: the ticket completed. */
-        reason: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone')]),
+        /**
+         * merged: its branch is in the ticket branch. ticketDone: the ticket completed. Both only when the worktree held
+         * nothing at all. manual: a person approved removing it with what it held (`worktree.cleanupApproved`).
+         */
+        reason: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone'), Type.Literal('manual')]),
         branchDeleted: Type.Boolean(),
       },
       strict,
     ),
   },
   /**
-   * A worktree the engine would have removed has changes nobody committed (a person's edits while the ticket waited,
-   * or an execution cut off before the engine's commit). It stays on disk until they are committed or discarded;
-   * removing it would lose them ([[결정 대기]] D-041). Recorded again only when the list of files changes.
+   * A worktree the engine does not remove on its own and leaves for a person to clean up (`worktree.cleanup`,
+   * [[결정 대기]] D-041, D-042): it still holds something (changed, untracked or ignored files: a person's edits
+   * while the ticket waited, build output, an execution cut off before the engine's commit), or a lane started over
+   * in a new worktree and this one is the replaced generation. The engine never removes anything with content and
+   * never resets or cleans a worktree. Recorded again only when what it holds changes.
    */
   'worktree.kept': {
     aggregateType: 'workspace',
@@ -730,12 +735,39 @@ export const EVENT_CATALOG = {
         projectId: IdSchema,
         ticketId: IdSchema,
         key: Type.String({ minLength: 1, maxLength: 230 }),
-        /** Why it would have gone (as on `worktree.removed`). */
-        removal: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone')]),
-        reason: Type.Literal('uncommitted'),
+        /** Why it would have gone, or `superseded`: its lane runs in a newer worktree now. */
+        removal: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone'), Type.Literal('superseded')]),
+        /** uncommitted: changed or untracked files. ignored: only ignored files. superseded: a replaced generation. */
+        reason: Type.Union([Type.Literal('uncommitted'), Type.Literal('ignored'), Type.Literal('superseded')]),
         /** Changed and untracked files (git status), at most the first 1000. */
         files: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 1000 }),
-        count: Type.Integer({ minimum: 1 }),
+        count: Type.Integer({ minimum: 0 }),
+        /** Ignored files (git status --ignored), at most the first 1000. */
+        ignored: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 1000 })),
+        ignoredCount: Type.Optional(Type.Integer({ minimum: 0 })),
+      },
+      strict,
+    ),
+  },
+  /** A person confirmed removing a worktree with exactly the content they were shown (`fingerprint`). */
+  'worktree.cleanupApproved': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      { projectId: IdSchema, ticketId: IdSchema, key: Type.String({ minLength: 1, maxLength: 230 }), fingerprint: HashSchema },
+      strict,
+    ),
+  },
+  /** The engine did not carry out an approved clean-up: the worktree changed since it was shown, is in use, or failed. */
+  'worktree.cleanupSkipped': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      {
+        projectId: IdSchema,
+        key: Type.String({ minLength: 1, maxLength: 230 }),
+        reason: Type.Union([Type.Literal('changed'), Type.Literal('inUse'), Type.Literal('error')]),
+        detail: Type.Optional(Type.String({ maxLength: 4096 })),
       },
       strict,
     ),

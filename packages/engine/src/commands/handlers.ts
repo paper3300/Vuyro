@@ -31,6 +31,7 @@ import {
   projectConfigure,
   ticketWorkspace,
   workspaceRecord,
+  worktreeCleanup,
 } from './workspace-handlers.ts';
 import {
   checkoutAcquireHandler,
@@ -314,6 +315,7 @@ export const HANDLERS: HandlerMap = {
   'checkout.release': handler(checkoutReleaseHandler),
   'checkout.forceRelease': handler(checkoutForceRelease),
   'workspace.record': handler(workspaceRecord),
+  'worktree.cleanup': handler(worktreeCleanup),
   'nodeType.save': handler(nodeTypeSave),
   'template.save': handler(templateSave),
   'definition.activate': handler(definitionActivate),

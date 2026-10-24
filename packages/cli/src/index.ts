@@ -68,6 +68,8 @@ Workspace (Vuyro's own checkout ledger; nothing is locked in git or Perforce)
   checkout release [<path>...]    Release this node's checkouts (all, or the given files)
   checkout force-release --project <id> <entryId>...   Release ledger entries (a person)
   workspace show --project <id> [--ticket <id>] [--all]   Held entries, refusals, flagged changes, worktrees
+  workspace cleanup --project <id> [--ticket <id>]        Worktrees left for you, with everything they still hold
+  workspace cleanup --project <id> --remove <key> --fingerprint <fp> [--no-wait]   Remove one exactly as it was shown
   hook pretooluse [--provider claude|codex]   The automatic checkout hook (run by the agent CLI)
   mcp                          Serve the node agent's report tools over stdio MCP (started by the agent CLI)
   events [--after <sequence>] [--follow]
@@ -596,9 +598,73 @@ async function checkoutCommand(ctx: Context, sub: string | undefined): Promise<n
   }
 }
 
+interface CleanupRow {
+  key: string;
+  ticketId: string;
+  path: string;
+  branch: string;
+  merged: boolean;
+  files: string[];
+  count: number;
+  ignored: string[];
+  ignoredCount: number;
+  fingerprint: string;
+}
+
+/**
+ * `vuyro workspace cleanup`: worktrees the engine left for a person, with everything they still hold (ignored files
+ * included). Removing one takes its key and the fingerprint that was shown, so only what the person saw is removed;
+ * the engine refuses when anything changed since (D-042).
+ */
+async function cleanupCommand(ctx: Context): Promise<number> {
+  onlyFlags(ctx.args, ['project', 'ticket', 'remove', 'fingerprint', 'no-wait']);
+  const projectId = requireFlag(ctx.args, 'project');
+  const key = flag(ctx.args, 'remove');
+  if (key === undefined) {
+    const ticketId = flag(ctx.args, 'ticket');
+    const view = await withClient(ctx, (client) => client.request<{ worktrees: CleanupRow[] }>(RPC_METHODS.worktreeCleanup, { projectId, ...(ticketId === undefined ? {} : { ticketId }) }));
+    print(ctx, view, () => [
+      `Worktrees to clean up (${view.worktrees.length}):`,
+      ...view.worktrees.flatMap((row) => [
+        `  ${row.key}  ${row.path}`,
+        `    branch ${row.branch}${row.merged ? ' (merged: deleted with it)' : ' (kept)'}; ${row.count} changed or untracked, ${row.ignoredCount} ignored`,
+        ...row.files.map((file) => `    changed  ${file}`),
+        ...row.ignored.map((file) => `    ignored  ${file}`),
+        ...(row.count > row.files.length || row.ignoredCount > row.ignored.length ? ['    …'] : []),
+        `    remove (deletes all of the above): vuyro workspace cleanup --project ${projectId} --remove ${row.key} --fingerprint ${row.fingerprint}`,
+      ]),
+    ]);
+    return EXIT.ok;
+  }
+  const fingerprint = requireFlag(ctx.args, 'fingerprint');
+  await execute(ctx, 'worktree.cleanup', { projectId, key, fingerprint });
+  if (has(ctx.args, 'no-wait')) {
+    print(ctx, { key, requested: true }, () => [`Clean-up of ${key} requested.`]);
+    return EXIT.ok;
+  }
+  // The engine carries it out; wait for the outcome.
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const view = await withClient(ctx, (client) => client.request<{ worktrees: Record<string, unknown>[] }>(RPC_METHODS.workspace, { projectId, changes: 'flagged', limit: 1 }));
+    const row = view.worktrees.find((worktree) => worktree.key === key);
+    if (row !== undefined && row.removedAt !== null) {
+      print(ctx, { key, removed: true }, () => [`Removed ${key}.`]);
+      return EXIT.ok;
+    }
+    if (row !== undefined && typeof row.cleanupSkippedAt === 'number' && typeof row.cleanupApprovedAt === 'number' && row.cleanupSkippedAt >= row.cleanupApprovedAt) {
+      const reason = typeof row.cleanupSkippedReason === 'string' ? row.cleanupSkippedReason : 'unknown';
+      print(ctx, { key, removed: false, reason }, () => [`Not removed (${reason}): look at it again with 'vuyro workspace cleanup --project ${projectId}'.`]);
+      return EXIT.refused;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  print(ctx, { key, requested: true }, () => [`Clean-up of ${key} requested; the engine has not finished it yet.`]);
+  return EXIT.ok;
+}
+
 async function workspaceCommand(ctx: Context, sub: string | undefined): Promise<number> {
+  if (sub === 'cleanup') return cleanupCommand(ctx);
   onlyFlags(ctx.args, ['project', 'ticket', 'all']);
-  if (sub !== 'show') throw new UsageError("workspace: expected 'show'");
+  if (sub !== 'show') throw new UsageError("workspace: expected 'show' or 'cleanup'");
   const ticketId = flag(ctx.args, 'ticket');
   const view = await withClient(ctx, (client) =>
     client.request<{ checkouts: Record<string, unknown>[]; blocks: Record<string, unknown>[]; changes: Record<string, unknown>[]; overlaps: Record<string, unknown>[]; worktrees: Record<string, unknown>[] }>(

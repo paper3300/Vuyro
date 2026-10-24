@@ -23,11 +23,18 @@ export interface LedgerState {
   /** Overlap warnings already recorded (`<path key>\u0000<space>\u0000<space>`). */
   readonly warned: Readonly<Record<string, true>>;
   readonly worktrees: Readonly<Record<string, Worktree>>;
-  /** Worktrees kept instead of removed because of uncommitted changes (key → the files, as recorded). */
-  readonly kept: Readonly<Record<string, readonly string[]>>;
+  /** Worktrees left for a person (`worktree.kept`): key → what was recorded (`keptSignature`). */
+  readonly kept: Readonly<Record<string, string>>;
+  /** Clean-ups a person approved that the engine has not carried out yet: key → fingerprint. */
+  readonly approved: Readonly<Record<string, string>>;
 }
 
-export const EMPTY_LEDGER: LedgerState = { entries: {}, known: {}, changed: {}, warned: {}, worktrees: {}, kept: {} };
+export const EMPTY_LEDGER: LedgerState = { entries: {}, known: {}, changed: {}, warned: {}, worktrees: {}, kept: {}, approved: {} };
+
+/** What a `worktree.kept` record says, for recording it again only when it changes. */
+export function keptSignature(data: { removal: string; files: readonly string[]; ignored?: readonly string[]; count: number; ignoredCount?: number }): string {
+  return JSON.stringify([data.removal, data.count, data.ignoredCount ?? 0, data.files, data.ignored ?? []]);
+}
 
 function without<T>(record: Readonly<Record<string, T>>, ids: readonly string[]): Record<string, T> {
   const gone = new Set(ids);
@@ -91,13 +98,18 @@ export function evolveLedger(state: LedgerState, event: NewEvent | DomainEvent):
     case 'worktree.created':
       return { ...state, worktrees: { ...state.worktrees, [event.data.worktree.key]: event.data.worktree }, kept: without(state.kept, [event.data.worktree.key]) };
     case 'worktree.kept':
-      return { ...state, kept: { ...state.kept, [event.data.key]: event.data.files } };
+      return { ...state, kept: { ...state.kept, [event.data.key]: keptSignature(event.data) } };
+    case 'worktree.cleanupApproved':
+      return { ...state, approved: { ...state.approved, [event.data.key]: event.data.fingerprint } };
+    case 'worktree.cleanupSkipped':
+      return { ...state, approved: without(state.approved, [event.data.key]) };
     case 'worktree.removed': {
       const space = `wt:${event.data.key}`;
       return {
         ...state,
         worktrees: without(state.worktrees, [event.data.key]),
         kept: without(state.kept, [event.data.key]),
+        approved: without(state.approved, [event.data.key]),
         known: without(state.known, [space]),
         changed: without(state.changed, [space]),
       };

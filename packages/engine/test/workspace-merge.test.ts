@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { workspaceAggregateId } from '@vuyro/contracts';
 import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
 import { laneWorktree, ticketWorktree } from '../src/workspace/layout.ts';
+import { GitClient } from '../src/workspace/git.ts';
 import { git } from './helpers/workspace-fixtures.ts';
 import { CONFLICTING, type ParallelTicket, startParallel } from './helpers/worktree-fixtures.ts';
 
@@ -68,9 +69,22 @@ describe('merge conflicts at the join', { timeout: 120_000 }, () => {
     expect(currentExecution(await h.ticket(ticketId), 'join', 'main')?.merge?.conflicts).toEqual([{ branch: `vuyro/${ticketId}/dev-2`, files: ['src/app.txt'] }]);
   });
 
-  it('rerun: the conflicting lane runs again on top of what was merged, and the join merges again', async () => {
+  it('rerun: the conflicting lane runs again in a new worktree on top of what was merged; the old one is left as it was (D-042)', async () => {
+    // A person edits lane 2's worktree after its run ended, just before the join merges it (the merge then conflicts).
+    let leftBehind: string | undefined;
+    const gitClient = new (class extends GitClient {
+      override async merge(cwd: string, branch: string, message: string): Promise<string[]> {
+        if (leftBehind === undefined && branch.endsWith('/dev-2') && t !== undefined) {
+          leftBehind = laneWorktree(t.h.workspaces.layout.worktreeRoot, t.ticketId, 'dev', '2').path;
+          writeFileSync(join(leftBehind, 'notes.txt'), 'not committed yet\n');
+          writeFileSync(join(leftBehind, 'src', 'app.txt'), 'line 1\nline 2 fixed by hand\nline 3\n');
+        }
+        return super.merge(cwd, branch, message);
+      }
+    })();
     t = await startParallel({
       settings: { workspaceMode: 'worktree', onMergeConflict: 'rerun' },
+      git: gitClient,
       dev: (s, run) => {
         const file = join(s.request.cwd ?? '', 'src', 'app.txt');
         // The second run starts from the merged branch and builds on it.
@@ -78,15 +92,33 @@ describe('merge conflicts at the join', { timeout: 120_000 }, () => {
         else writeFileSync(file, `${readFileSync(file, 'utf8')}line 4 by lane ${s.request.lane}\n`);
       },
     });
-    const { h, ticketId } = t;
+    const { h, ticketId, projectId, seen } = t;
     await h.drive();
     expect(nodeProgress(await h.ticket(ticketId), 'join').executions.map((exec) => exec.status)).toEqual(['failed', 'done']);
     const reworked = nodeProgress(await h.ticket(ticketId), 'dev').executions.find((exec) => exec.cause === 'rework');
     expect(reworked).toMatchObject({ lane: '2', status: 'done' });
     expect(reworked?.feedback?.comment).toContain('conflicted with the other work merged');
-    const ticketTree = ticketWorktree(h.workspaces.layout.worktreeRoot, ticketId);
+    const root = h.workspaces.layout.worktreeRoot;
+    const ticketTree = ticketWorktree(root, ticketId);
     expect(git(ticketTree.path, 'show', 'HEAD:src/app.txt')).toBe('line 1\nline 2 by lane 1\nline 3\nline 4 by lane 2');
+    // The rerun worked in a worktree of its own (new folder and branch), started from the merged ticket branch.
+    const fresh = laneWorktree(root, ticketId, 'dev', '2', reworked?.run);
+    expect(seen.filter((request) => request.nodeId === 'dev' && request.lane === '2').map((request) => request.cwd)).toEqual([leftBehind, fresh.path]);
+    // The old worktree was never reset or cleaned: the person's uncommitted edits are still there, and it waits for a person.
+    expect(readFileSync(join(leftBehind ?? '', 'notes.txt'), 'utf8')).toBe('not committed yet\n');
+    expect(readFileSync(join(leftBehind ?? '', 'src', 'app.txt'), 'utf8')).toBe('line 1\nline 2 fixed by hand\nline 3\n');
+    const kept = (await h.store.readAggregate(workspaceAggregateId(projectId))).filter((event) => event.type === 'worktree.kept');
+    expect(kept.map((event) => event.data)).toContainEqual(
+      expect.objectContaining({ key: laneWorktree(root, ticketId, 'dev', '2').key, removal: 'superseded', reason: 'superseded', files: ['notes.txt', 'src/app.txt'] }),
+    );
+    expect(t.branches()).toContain(`vuyro/${ticketId}/dev-2`);
     expect(await h.status(ticketId, 'qa')).toBe('review');
+
+    // When the ticket ends, the old worktree still holds the edits: it stays for a person, the merged new one is gone.
+    await h.ok('node.approve', { ticketId, nodeId: 'qa' });
+    await h.drive();
+    expect(existsSync(join(leftBehind ?? '', 'notes.txt'))).toBe(true);
+    expect(existsSync(fresh.path)).toBe(false);
   });
 
   it('agent: an agent resolves the conflict in the ticket worktree, a person reviews it, and the merge goes on', async () => {

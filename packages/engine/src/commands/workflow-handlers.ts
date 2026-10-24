@@ -552,7 +552,7 @@ export const nodeStart: CommandHandler<'node.start', TicketState> = {
     if (isFailure(claims)) return claims;
     const extra: StreamAppend[] = [];
     if (claims.length > 0) {
-      const location = locate(servicesOf(ctx).layout, ticket.state, ticket.aggregateId, workflow, node.id, exec.lane);
+      const location = locate(servicesOf(ctx).layout, ticket.state, ticket.aggregateId, workflow, node.id, exec.lane, exec.run);
       const decision = await decideClaims(ctx, { ticket, workflow, holder: holderOf(ticket.aggregateId, exec), location, items: claims, source: 'start', override: exec.override === true });
       const ledgerAppend: StreamAppend = { aggregateType: 'workspace', aggregateId: decision.ledger.aggregateId, expectedRevision: decision.ledger.revision, events: decision.ledgerEvents };
       if (decision.outcome === 'wait' || decision.outcome === 'ask' || decision.outcome === 'fail') {

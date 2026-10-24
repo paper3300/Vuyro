@@ -2,6 +2,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ClaimSpec, WorkspaceSettings } from '@vuyro/contracts';
 import type { ScriptedBehavior, ScriptedSession } from '../../src/workflow/scripted-agent.ts';
+import type { GitClient } from '../../src/workspace/git.ts';
 import { openWorkflowHarness, type WorkflowHarness } from './workflow-harness.ts';
 import { edge, editorType, expectOk, git, gitRepo, MINUTE, projectAt, save, template, ticketIn } from './workspace-fixtures.ts';
 
@@ -20,6 +21,8 @@ export interface Setup {
   readonly resolver?: (s: ScriptedSession) => void | Promise<void>;
   /** Claims of the dev node (it then runs as a node type of its own). */
   readonly devClaims?: ClaimSpec[];
+  /** The engine's git (tests wrap it to act between its steps). */
+  readonly git?: GitClient;
 }
 
 export interface ParallelTicket {
@@ -71,7 +74,7 @@ export const CONFLICTING: DevStep = (s) => {
 
 export async function startParallel(setup: Setup): Promise<ParallelTicket> {
   const seen: ScriptedSession['request'][] = [];
-  const h = await openWorkflowHarness({ behavior: behavior(setup, seen) });
+  const h = await openWorkflowHarness({ behavior: behavior(setup, seen), ...(setup.git === undefined ? {} : { git: setup.git }) });
   const repo = gitRepo(join(h.dir, 'repo'));
   if (setup.devClaims !== undefined) await save(h, editorType('test.dev', setup.devClaims));
   const dev = setup.devClaims === undefined ? { type: 'vuyro.agent', params: { instructions: 'dev' } } : { type: 'test.dev' };

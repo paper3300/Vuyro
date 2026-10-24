@@ -21,7 +21,7 @@ const outOfScope = (reason: string): AuthorizationResult => ({ ok: false, code: 
  *
  * 1. Permission commands: only the verified human. AI principals (agents, unverified local clients)
  *    and the engine itself are always refused.
- * 2. System-only commands: only the engine.
+ * 2. System-only commands: only the engine. Human-only commands (destroying what is on disk): only the verified human.
  * 3. Node agents (run token): only commands open to node agents, only on their own ticket and node.
  *
  * 4. Unverified local clients (engine token only) and external MCP clients are read-only.
@@ -39,6 +39,10 @@ export function authorize(type: string, definition: CommandDefinition, caller: C
 
   if (definition.access.systemOnly === true) {
     return principal.kind === 'system' ? allow('system') : forbidden(`'${type}' is run by the engine only`);
+  }
+
+  if (definition.access.humanOnly === true && principal.kind !== 'human') {
+    return forbidden(`'${type}' destroys what is on disk: only a person can do it (fixed rule)`);
   }
 
   if (caller.binding !== undefined) {

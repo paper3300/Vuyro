@@ -77,6 +77,11 @@ export interface CommandAccess {
   readonly nodeAgent: 'own-node' | 'deny';
   /** Only the engine itself (system principal) may send it. */
   readonly systemOnly?: boolean;
+  /**
+   * Only a verified person (fixed rule): actions that destroy what is on disk, such as removing a worktree with its
+   * content. AI principals and the engine itself are refused.
+   */
+  readonly humanOnly?: boolean;
 }
 
 export interface CommandDefinition {
@@ -271,6 +276,16 @@ export const COMMAND_CATALOG = {
     payload: Type.Object({ projectId: IdSchema, ids: Type.Array(IdSchema, { minItems: 1, maxItems: 1024 }) }, strict),
     result: Type.Object({ released: Type.Integer({ minimum: 0 }) }, strict),
   },
+  'worktree.cleanup': {
+    version: 1,
+    scope: 'project',
+    category: 'workspace',
+    access: { nodeAgent: 'deny', humanOnly: true },
+    summary:
+      'Remove a worktree the engine left for a person (query.worktreeCleanup shows it), with exactly the content shown: the fingerprint must still match when the engine removes it.',
+    payload: Type.Object({ projectId: IdSchema, key: Type.String({ minLength: 1, maxLength: 230 }), fingerprint: HashSchema }, strict),
+    result: Type.Object({ requested: Type.Boolean() }, strict),
+  },
   'workspace.record': {
     version: 1,
     scope: 'project',
@@ -327,7 +342,7 @@ export const COMMAND_CATALOG = {
           op: Type.Literal('worktreeRemoved'),
           ticketId: IdSchema,
           key: Type.String({ minLength: 1, maxLength: 230 }),
-          reason: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone')]),
+          reason: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone'), Type.Literal('manual')]),
           branchDeleted: Type.Boolean(),
         },
         strict,
@@ -338,9 +353,21 @@ export const COMMAND_CATALOG = {
           op: Type.Literal('worktreeKept'),
           ticketId: IdSchema,
           key: Type.String({ minLength: 1, maxLength: 230 }),
-          removal: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone')]),
+          removal: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone'), Type.Literal('superseded')]),
           files: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 1000 }),
-          count: Type.Integer({ minimum: 1 }),
+          count: Type.Integer({ minimum: 0 }),
+          ignored: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 1000 }),
+          ignoredCount: Type.Integer({ minimum: 0 }),
+        },
+        strict,
+      ),
+      Type.Object(
+        {
+          projectId: IdSchema,
+          op: Type.Literal('cleanupSkipped'),
+          key: Type.String({ minLength: 1, maxLength: 230 }),
+          reason: Type.Union([Type.Literal('changed'), Type.Literal('inUse'), Type.Literal('error')]),
+          detail: Type.Optional(Type.String({ maxLength: 4096 })),
         },
         strict,
       ),

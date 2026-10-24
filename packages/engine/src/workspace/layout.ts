@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import type { CompiledWorkflow } from '../workflow/compile.ts';
-import type { TicketWorkflow } from '../workflow/state.ts';
+import { execution, laneOf, type TicketWorkflow } from '../workflow/state.ts';
 import { type EffectiveSettings, laneWorktrees, nodeSettings } from './settings.ts';
 
 /**
@@ -41,9 +41,13 @@ export function ticketWorktree(worktreeRoot: string, ticketId: string): Worktree
   return { key, scope: 'ticket', path: join(worktreeRoot, key, '_ticket'), branch: `vuyro/${ticketId}/ticket` };
 }
 
-export function laneWorktree(worktreeRoot: string, ticketId: string, nodeId: string, lane: string): WorktreeName {
+/**
+ * A lane's worktree. `generation` is the execution that started the lane over in a new worktree (D-042); the first
+ * worktree of a lane has none. Each generation has its own folder and branch, so nothing is ever reset.
+ */
+export function laneWorktree(worktreeRoot: string, ticketId: string, nodeId: string, lane: string, generation?: number): WorktreeName {
   const base = ticketKey(ticketId);
-  const name = `${nodeId}-${lane}`;
+  const name = generation === undefined ? `${nodeId}-${lane}` : `${nodeId}-${lane}.r${generation}`;
   return { key: `${base}/${name}`, scope: 'lane', path: join(worktreeRoot, base, name), branch: `vuyro/${ticketId}/${name}`, nodeId, lane };
 }
 
@@ -52,14 +56,25 @@ export interface LayoutOptions {
   readonly worktreeRoot: string;
 }
 
-export function locate(options: LayoutOptions, state: TicketWorkflow, ticketId: string, workflow: CompiledWorkflow, nodeId: string, lane: string): Location {
+/** The generation of a lane's worktree an execution works in: the latest execution up to `run` that started a new one. */
+export function worktreeGeneration(state: TicketWorkflow, nodeId: string, lane: string, run: number): number | undefined {
+  let generation: number | undefined;
+  for (const candidate of laneOf(state, nodeId, lane)?.runs ?? []) {
+    if (candidate <= run && execution(state, nodeId, candidate)?.newWorktree === true) generation = candidate;
+  }
+  return generation;
+}
+
+/** Where an execution works. `run` defaults to the lane's current execution. */
+export function locate(options: LayoutOptions, state: TicketWorkflow, ticketId: string, workflow: CompiledWorkflow, nodeId: string, lane: string, run?: number): Location {
   const settings = nodeSettings(state, workflow, nodeId);
   if (settings.workspaceMode === 'shared') {
     return { space: 'root', root: state.workspace?.root, settings };
   }
+  const at = run ?? laneOf(state, nodeId, lane)?.runs.at(-1) ?? 0;
   const worktree =
     settings.worktreeScope === 'nodeRun' && lane !== 'main' && laneWorktrees(state, workflow, nodeId)
-      ? laneWorktree(options.worktreeRoot, ticketId, nodeId, lane)
+      ? laneWorktree(options.worktreeRoot, ticketId, nodeId, lane, worktreeGeneration(state, nodeId, lane, at))
       : ticketWorktree(options.worktreeRoot, ticketId);
   return { space: `wt:${worktree.key}`, root: worktree.path, settings, worktree };
 }

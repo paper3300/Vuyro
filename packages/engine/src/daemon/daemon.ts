@@ -218,7 +218,8 @@ export async function startEngineDaemon(options: EngineDaemonOptions = {}): Prom
     await engine.start();
 
     const startedAt = clock.now();
-    const queries = new EngineQueries({ store, definitions: registry, clock });
+    const workspaceEngine = engine;
+    const queries = new EngineQueries({ store, definitions: registry, clock, cleanup: (projectId, ticketId) => workspaceEngine.workspaces.cleanupCandidates(projectId, ticketId) });
     const runningEngine = engine;
     const openStore = store;
     let closePromise: Promise<void> | undefined;

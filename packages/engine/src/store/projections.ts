@@ -590,7 +590,7 @@ const audit: Projector = {
  */
 const workspace: Projector = {
   name: 'workspace',
-  version: 2,
+  version: 3,
   tables: ['p_checkouts', 'p_checkout_blocks', 'p_workspace_changes', 'p_overlap_warnings', 'p_worktrees'],
   ddl: [
     `CREATE TABLE p_checkouts (
@@ -676,8 +676,14 @@ const workspace: Projector = {
       removed_reason TEXT,
       branch_deleted INTEGER,
       kept_at INTEGER,
+      kept_reason TEXT,
       kept_files TEXT,
       kept_count INTEGER,
+      kept_ignored TEXT,
+      kept_ignored_count INTEGER,
+      cleanup_approved_at INTEGER,
+      cleanup_skipped_at INTEGER,
+      cleanup_skipped_reason TEXT,
       PRIMARY KEY (project_id, key)
     ) STRICT`,
   ],
@@ -787,7 +793,8 @@ const workspace: Projector = {
                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                   ON CONFLICT (project_id, key) DO UPDATE SET
                     path = excluded.path, branch = excluded.branch, base = excluded.base, created_at = excluded.created_at,
-                    removed_at = NULL, removed_reason = NULL, branch_deleted = NULL, kept_at = NULL, kept_files = NULL, kept_count = NULL`,
+                    removed_at = NULL, removed_reason = NULL, branch_deleted = NULL, kept_at = NULL, kept_reason = NULL, kept_files = NULL, kept_count = NULL, kept_ignored = NULL, kept_ignored_count = NULL,
+                    cleanup_approved_at = NULL, cleanup_skipped_at = NULL, cleanup_skipped_reason = NULL`,
             params: [
               event.data.projectId,
               worktree.key,
@@ -806,8 +813,26 @@ const workspace: Projector = {
       case 'worktree.kept':
         return [
           {
-            sql: 'UPDATE p_worktrees SET kept_at = ?, kept_files = ?, kept_count = ? WHERE project_id = ? AND key = ?',
-            params: [event.timestamp, JSON.stringify(event.data.files), event.data.count, event.data.projectId, event.data.key],
+            sql: 'UPDATE p_worktrees SET kept_at = ?, kept_reason = ?, kept_files = ?, kept_count = ?, kept_ignored = ?, kept_ignored_count = ? WHERE project_id = ? AND key = ?',
+            params: [
+              event.timestamp,
+              event.data.reason,
+              JSON.stringify(event.data.files),
+              event.data.count,
+              JSON.stringify(event.data.ignored ?? []),
+              event.data.ignoredCount ?? 0,
+              event.data.projectId,
+              event.data.key,
+            ],
+          },
+        ];
+      case 'worktree.cleanupApproved':
+        return [{ sql: 'UPDATE p_worktrees SET cleanup_approved_at = ? WHERE project_id = ? AND key = ?', params: [event.timestamp, event.data.projectId, event.data.key] }];
+      case 'worktree.cleanupSkipped':
+        return [
+          {
+            sql: 'UPDATE p_worktrees SET cleanup_skipped_at = ?, cleanup_skipped_reason = ? WHERE project_id = ? AND key = ?',
+            params: [event.timestamp, event.data.reason, event.data.projectId, event.data.key],
           },
         ];
       case 'worktree.removed':

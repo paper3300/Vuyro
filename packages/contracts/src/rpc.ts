@@ -24,6 +24,7 @@ export const RPC_METHODS = {
   artifacts: 'query.artifacts',
   ticketStats: 'query.ticketStats',
   workspace: 'query.workspace',
+  worktreeCleanup: 'query.worktreeCleanup',
 } as const;
 
 export type RpcMethod = (typeof RPC_METHODS)[keyof typeof RPC_METHODS];
@@ -101,6 +102,28 @@ export const WorkspaceQuerySchema = Type.Object(
   },
   strict,
 );
+
+/** Worktrees a person may clean up, with what each still holds (`vuyro workspace cleanup`). */
+export const WorktreeCleanupQuerySchema = Type.Object({ projectId: IdSchema, ticketId: Type.Optional(IdSchema) }, strict);
+
+export interface WorktreeCleanupCandidate {
+  readonly key: string;
+  readonly ticketId: string;
+  readonly scope: 'ticket' | 'lane';
+  readonly nodeId?: string;
+  readonly lane?: string;
+  readonly path: string;
+  readonly branch: string;
+  /** Its branch is in the ticket branch (removing the worktree then also deletes the branch). */
+  readonly merged: boolean;
+  /** Changed and untracked files, and ignored files (first 200 of each), with their counts. */
+  readonly files: readonly string[];
+  readonly count: number;
+  readonly ignored: readonly string[];
+  readonly ignoredCount: number;
+  /** What `worktree.cleanup` must send back: it changes when anything in the worktree changes. */
+  readonly fingerprint: string;
+}
 
 export interface SubscribeResult {
   readonly subscription: string;

@@ -6,7 +6,8 @@ import { EngineQueries } from '../src/daemon/queries.ts';
 import type { ScriptedSession } from '../src/workflow/scripted-agent.ts';
 import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
 import { laneWorktree, ticketWorktree } from '../src/workspace/layout.ts';
-import { openWorkflowHarness, type WorkflowHarness } from './helpers/workflow-harness.ts';
+import { CLI } from './helpers/engine-harness.ts';
+import { openWorkflowHarness, SYSTEM, type WorkflowHarness } from './helpers/workflow-harness.ts';
 import { edge, editorType, expectOk, git, gitRepo, MINUTE, projectAt, save, template, ticketIn } from './helpers/workspace-fixtures.ts';
 import { CLEAN, type ParallelTicket, startParallel } from './helpers/worktree-fixtures.ts';
 
@@ -79,7 +80,7 @@ describe('worktree mode', { timeout: 120_000 }, () => {
     expect(git(repo, 'status', '--porcelain')).toBe('');
   });
 
-  it('keeps a worktree with uncommitted changes instead of removing it, until they are committed or discarded (D-041)', async () => {
+  it('keeps a worktree with uncommitted changes instead of removing it, until they are committed (D-041)', async () => {
     t = await startParallel({ settings: { workspaceMode: 'worktree', worktreeScope: 'nodeRun' }, dev: CLEAN });
     const { h, ticketId, projectId } = t;
     await h.drive();
@@ -99,10 +100,13 @@ describe('worktree mode', { timeout: 120_000 }, () => {
     expect((await kinds()).map((event) => [event.type, event.data])).toEqual([
       ['worktree.removed', expect.objectContaining({ reason: 'merged' }) as unknown],
       ['worktree.removed', expect.objectContaining({ reason: 'merged' }) as unknown],
-      ['worktree.kept', { projectId, ticketId, key: ticketTree.key, removal: 'ticketDone', reason: 'uncommitted', files: ['lane-1.txt', 'notes.txt'], count: 2 }],
+      [
+        'worktree.kept',
+        { projectId, ticketId, key: ticketTree.key, removal: 'ticketDone', reason: 'uncommitted', files: ['lane-1.txt', 'notes.txt'], count: 2, ignored: [], ignoredCount: 0 },
+      ],
     ]);
     const shown = await new EngineQueries({ store: h.store, definitions: h.registry, clock: h.clock }).workspace(projectId, { changes: 'flagged', limit: 100 });
-    expect(shown.worktrees.find((row) => row.key === ticketTree.key)).toMatchObject({ removedAt: null, keptFiles: ['lane-1.txt', 'notes.txt'], keptCount: 2 });
+    expect(shown.worktrees.find((row) => row.key === ticketTree.key)).toMatchObject({ removedAt: null, keptReason: 'uncommitted', keptFiles: ['lane-1.txt', 'notes.txt'], keptCount: 2 });
 
     // Looked at again (engine start), unchanged: still kept, recorded once.
     await h.restart();
@@ -110,7 +114,7 @@ describe('worktree mode', { timeout: 120_000 }, () => {
     expect(existsSync(join(ticketTree.path, 'notes.txt'))).toBe(true);
     expect((await kinds()).filter((event) => event.type === 'worktree.kept')).toHaveLength(1);
 
-    // Once the person committed their work (or threw it away), the worktree goes; the branch keeps what was committed.
+    // Once the person committed their work, the worktree holds nothing more and goes; the branch keeps what was committed.
     git(ticketTree.path, 'add', '--all');
     git(ticketTree.path, '-c', 'user.name=Person', '-c', 'user.email=person@localhost', 'commit', '--quiet', '-m', 'notes');
     await h.restart();
@@ -118,6 +122,60 @@ describe('worktree mode', { timeout: 120_000 }, () => {
     expect(existsSync(ticketTree.path)).toBe(false);
     expect((await kinds()).at(-1)?.type).toBe('worktree.removed');
     expect(git(t.repo, 'show', `${ticketTree.branch}:notes.txt`)).toBe('my notes');
+  });
+
+  it('keeps a worktree that holds only ignored files; a person removes it after seeing them, and only as it was shown (D-042)', async () => {
+    t = await startParallel({ settings: { workspaceMode: 'worktree', worktreeScope: 'nodeRun' }, dev: CLEAN });
+    const { h, ticketId, projectId, repo } = t;
+    await h.drive();
+    const ticketTree = ticketWorktree(h.workspaces.layout.worktreeRoot, ticketId);
+    // A file git ignores (local settings, build output): git status does not show it, removing the worktree would delete it.
+    writeFileSync(join(repo, '.git', 'info', 'exclude'), '*.local\n');
+    writeFileSync(join(ticketTree.path, 'secret.local'), 'my local settings\n');
+    expect(git(ticketTree.path, 'status', '--porcelain')).toBe('');
+
+    await h.ok('node.approve', { ticketId, nodeId: 'qa' });
+    await h.drive();
+    expect((await h.ticket(ticketId)).status).toBe('done');
+    expect(readFileSync(join(ticketTree.path, 'secret.local'), 'utf8')).toBe('my local settings\n');
+    const kept = (await h.store.readAggregate(workspaceAggregateId(projectId))).filter((event) => event.type === 'worktree.kept');
+    expect(kept.map((event) => event.data)).toEqual([
+      { projectId, ticketId, key: ticketTree.key, removal: 'ticketDone', reason: 'ignored', files: [], count: 0, ignored: ['secret.local'], ignoredCount: 1 },
+    ]);
+    await h.restart();
+    await h.drive();
+    expect(existsSync(join(ticketTree.path, 'secret.local'))).toBe(true);
+
+    // The clean-up list shows the ignored file and a fingerprint of what is there.
+    const engine = h.engine;
+    if (engine === undefined) throw new Error('no engine');
+    const [shown] = await engine.workspaces.cleanupCandidates(projectId);
+    expect(shown).toMatchObject({ key: ticketTree.key, path: ticketTree.path, files: [], ignored: ['secret.local'], ignoredCount: 1 });
+    const fingerprint = shown?.fingerprint ?? '';
+    // Only a person: an agent, an unverified client or the engine itself is refused.
+    for (const transport of [CLI, SYSTEM]) {
+      const refused = await h.exec('worktree.cleanup', { projectId, key: ticketTree.key, fingerprint }, transport);
+      expect(refused.ok ? 'ok' : refused.error.code).toBe('forbidden');
+    }
+
+    // It changed after it was shown: the approval is dropped and nothing is removed.
+    writeFileSync(join(ticketTree.path, 'secret.local'), 'changed after the look\n');
+    await h.ok('worktree.cleanup', { projectId, key: ticketTree.key, fingerprint });
+    await h.drive();
+    expect(readFileSync(join(ticketTree.path, 'secret.local'), 'utf8')).toBe('changed after the look\n');
+    const skipped = (await h.store.readAggregate(workspaceAggregateId(projectId))).filter((event) => event.type === 'worktree.cleanupSkipped');
+    expect(skipped.map((event) => (event.data as { reason: string }).reason)).toEqual(['changed']);
+
+    // Looked at again and confirmed: removed with what it held. The ticket branch stays.
+    const [again] = await engine.workspaces.cleanupCandidates(projectId);
+    expect(again?.fingerprint).not.toBe(fingerprint);
+    await h.ok('worktree.cleanup', { projectId, key: ticketTree.key, fingerprint: again?.fingerprint ?? '' });
+    await h.drive();
+    expect(existsSync(ticketTree.path)).toBe(false);
+    const removed = (await h.store.readAggregate(workspaceAggregateId(projectId))).filter((event) => event.type === 'worktree.removed').at(-1);
+    expect(removed?.data).toMatchObject({ key: ticketTree.key, reason: 'manual' });
+    expect(t.branches()).toContain(ticketTree.branch);
+    expect(await engine.workspaces.cleanupCandidates(projectId)).toEqual([]);
   });
 
   it("a merging join takes its node type's claims: it waits for a claim and merges once the paths are free", async () => {

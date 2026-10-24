@@ -16,7 +16,7 @@ import { parseDuration } from '../workflow/duration.ts';
 import { WorkflowDraft } from '../workflow/machine.ts';
 import { ACTIVE_STATUSES, currentExecution, type Execution, execution, type TicketWorkflow } from '../workflow/state.ts';
 import { locate, type Location } from '../workspace/layout.ts';
-import { entriesOf, findConflicts, holderKey, type LedgerEntry, type LedgerState, type PathRequest, sameHolder, warnKey } from '../workspace/ledger.ts';
+import { entriesOf, findConflicts, holderKey, keptSignature, type LedgerEntry, type LedgerState, type PathRequest, sameHolder, warnKey } from '../workspace/ledger.ts';
 import { insideRoot, isPattern, matches, normalizeRelative, pathKey } from '../workspace/paths.ts';
 import type { WorkspaceServices } from '../workspace/services.ts';
 import { appSettingsAggregate, type AppSettingsState, projectAggregate, type ProjectState, type TicketState, ticketAggregate, workspaceAggregate } from './aggregates.ts';
@@ -430,7 +430,7 @@ export async function checkoutContext(
   if (node === undefined) return fail('not_found', `node '${payload.nodeId}' is not in template ${workflow.template.id}@${workflow.template.version}`);
   const exec = runningExecution(ctx, ticket.state, node.id, payload.lane);
   if (isFailure(exec)) return exec;
-  const location = locate(servicesOf(ctx).layout, ticket.state, ticket.aggregateId, workflow, node.id, exec.lane);
+  const location = locate(servicesOf(ctx).layout, ticket.state, ticket.aggregateId, workflow, node.id, exec.lane, exec.run);
   return { workflow, node, exec, location };
 }
 
@@ -559,6 +559,28 @@ export const checkoutForceRelease: CommandHandler<'checkout.forceRelease', Ledge
   },
 };
 
+/**
+ * A person's confirmed clean-up of a worktree (`vuyro workspace cleanup`): recorded here, carried out by the engine,
+ * which removes it only if what it holds still has the fingerprint the person saw (D-042). Human only (fixed rule).
+ */
+export const worktreeCleanup: CommandHandler<'worktree.cleanup', LedgerState> = {
+  target: (payload) => ({ definition: workspaceAggregate, aggregateId: workspaceAggregateId(payload.projectId) }),
+  scope: () => ({}),
+  decide: (_ctx, payload, target) => {
+    if (target === undefined) throw new Error('ledger not loaded');
+    const worktree = target.state.worktrees[payload.key];
+    if (worktree === undefined) return Promise.resolve(fail('not_found', `project ${payload.projectId} has no worktree '${payload.key}'`));
+    if (target.state.approved[payload.key] === payload.fingerprint) return Promise.resolve({ ok: true, appends: [], result: { requested: true } });
+    return Promise.resolve({
+      ok: true,
+      appends: [
+        stream('workspace', target, [{ type: 'worktree.cleanupApproved', data: { projectId: payload.projectId, ticketId: worktree.ticketId, key: payload.key, fingerprint: payload.fingerprint } }]),
+      ],
+      result: { requested: true },
+    });
+  },
+};
+
 /** The engine's bookkeeping. Ids that are already gone are dropped (the step may run twice after a crash). */
 export const workspaceRecord: CommandHandler<'workspace.record', LedgerState> = {
   target: (payload) => ({ definition: workspaceAggregate, aggregateId: workspaceAggregateId(payload.projectId) }),
@@ -603,16 +625,27 @@ export const workspaceRecord: CommandHandler<'workspace.record', LedgerState> = 
         }
         break;
       case 'worktreeKept': {
-        // Once per list of files: the clean-up checks again on every pass.
-        const known = ledger.kept[payload.key];
-        if (Object.hasOwn(ledger.worktrees, payload.key) && (known === undefined || known.join('\u0000') !== payload.files.join('\u0000'))) {
-          events.push({
-            type: 'worktree.kept',
-            data: { projectId, ticketId: payload.ticketId, key: payload.key, removal: payload.removal, reason: 'uncommitted', files: payload.files, count: payload.count },
-          });
-        }
+        // Once per content: the clean-up looks again on every pass.
+        const reason = payload.removal === 'superseded' ? 'superseded' : payload.count > 0 ? 'uncommitted' : 'ignored';
+        const data = {
+          projectId,
+          ticketId: payload.ticketId,
+          key: payload.key,
+          removal: payload.removal,
+          reason,
+          files: payload.files,
+          count: payload.count,
+          ignored: payload.ignored,
+          ignoredCount: payload.ignoredCount,
+        } as const;
+        if (Object.hasOwn(ledger.worktrees, payload.key) && ledger.kept[payload.key] !== keptSignature(data)) events.push({ type: 'worktree.kept', data });
         break;
       }
+      case 'cleanupSkipped':
+        if (Object.hasOwn(ledger.approved, payload.key)) {
+          events.push({ type: 'worktree.cleanupSkipped', data: { projectId, key: payload.key, reason: payload.reason, ...(payload.detail === undefined ? {} : { detail: payload.detail }) } });
+        }
+        break;
       case 'worktreeRemoved':
         if (Object.hasOwn(ledger.worktrees, payload.key)) {
           events.push({ type: 'worktree.removed', data: { projectId, ticketId: payload.ticketId, key: payload.key, reason: payload.reason, branchDeleted: payload.branchDeleted } });

@@ -8,6 +8,8 @@ import { resolveExecutable } from '@vuyro/agent-adapters';
  * - read-only queries for change detection (`status`, `rev-parse`, `merge-base`, `diff --name-only`), with optional
  *   locks off so a query never writes the index;
  * - worktree mode only: making, merging and removing the engine's own worktrees and `vuyro/…` branches.
+ * Never anything that throws work away on the engine's own initiative: no `reset --hard`, no `clean`, no forced
+ * removal ([[결정 대기]] D-042). A worktree is removed only when it holds nothing, or when a person confirmed it.
  * No shell: git is started directly with an argument list. Nothing here locks or checks out anything for the person.
  */
 
@@ -160,9 +162,25 @@ export class GitClient {
    * Removes a worktree without `--force`: git refuses when it has changed or untracked files, so nothing uncommitted
    * is ever deleted (the caller checks first and keeps such worktrees, D-041). Ignored files (build output) go with it.
    */
-  async removeWorktree(repo: string, path: string): Promise<void> {
+  async removeWorktree(repo: string, path: string, options: { readonly approvedByPerson?: boolean } = {}): Promise<void> {
     this.tops.delete(path);
-    await this.run(repo, ['worktree', 'remove', path]);
+    // `--force` only for a person's confirmed clean-up (`worktree.cleanup`), never on the engine's own initiative.
+    await this.run(repo, ['worktree', 'remove', ...(options.approvedByPerson === true ? ['--force'] : []), path]);
+  }
+
+  /**
+   * Read-only: everything a worktree holds beyond its commit — changed and untracked files, and ignored files (build
+   * output, local settings), each file listed. Empty lists: removing the folder loses nothing.
+   */
+  async contents(cwd: string): Promise<{ changed: string[]; ignored: string[] }> {
+    const { stdout } = await this.run(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=traditional', '--no-renames']);
+    const changed: string[] = [];
+    const ignored: string[] = [];
+    for (const record of stdout.split('\0')) {
+      if (record.length < 4) continue;
+      (record.startsWith('!!') ? ignored : changed).push(record.slice(3));
+    }
+    return { changed, ignored };
   }
 
   async prune(repo: string): Promise<void> {
@@ -207,12 +225,6 @@ export class GitClient {
   async concludeMerge(cwd: string): Promise<void> {
     await this.run(cwd, ['add', '--all']);
     await this.run(cwd, [...(await this.identityArgs(cwd)), 'commit', '--no-verify', '--no-edit', '--quiet']);
-  }
-
-  /** Moves the worktree's branch to `commit` and drops local changes (the engine's own lane worktrees only). */
-  async resetHard(cwd: string, commit: string): Promise<void> {
-    await this.run(cwd, ['reset', '--hard', '--quiet', commit]);
-    await this.run(cwd, ['clean', '-fd', '--quiet']);
   }
 
   async fastForward(cwd: string, ref: string): Promise<boolean> {
