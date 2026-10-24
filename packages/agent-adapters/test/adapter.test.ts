@@ -255,3 +255,48 @@ describe('Codex MCP tool items', () => {
     expect(normalizer.stdout(item({ message: 'boom' }), 0)[1]).toMatchObject({ isError: true });
   });
 });
+
+describe('automatic checkout hook (M4)', () => {
+  const hookCli = { command: 'C:\\Program Files\\nodejs\\node.exe', args: ['C:\\vuyro\\bin.js'] };
+
+  async function argsFor(provider: 'claude' | 'codex', extra: Partial<AgentStartRequest>, vuyroHook?: typeof hookCli) {
+    const clock = new ManualClock();
+    const runner = new FakeProcessRunner(clock);
+    runner.enqueue({ steps: [{ exit: 0 }] });
+    const options = { runner, clock, resolve: (command: string) => command, baseEnv: {}, ...(vuyroHook === undefined ? {} : { vuyroHook }) };
+    const adapter = provider === 'claude' ? CliAgentAdapter.claude(options) : CliAgentAdapter.codex(options);
+    const handle = adapter.start(request({ provider, ...extra }));
+    const observations = await drain(handle.observations);
+    return { args: runner.spawned[0]?.spec.args ?? [], observations };
+  }
+
+  it('Claude: a PreToolUse hook on its file tools through --settings; the command line has paths, never the token', async () => {
+    const { args } = await argsFor('claude', { checkoutHook: true }, hookCli);
+    const settings = JSON.parse(args[args.indexOf('--settings') + 1] ?? '{}') as { hooks: { PreToolUse: { matcher: string; hooks: { type: string; command: string }[] }[] } };
+    expect(settings.hooks.PreToolUse).toEqual([
+      { matcher: 'Write|Edit|MultiEdit|NotebookEdit', hooks: [{ type: 'command', command: '"C:/Program Files/nodejs/node.exe" C:/vuyro/bin.js hook pretooluse --provider claude', timeout: 60 }] },
+    ]);
+    expect(args.join(' ')).not.toContain('vrt_token');
+  });
+
+  it('Codex: hooks.PreToolUse on apply_patch with commandWindows, and the hook trust bypass', async () => {
+    const { args } = await argsFor('codex', { checkoutHook: true }, hookCli);
+    const index = args.findIndex((arg) => arg.startsWith('hooks.PreToolUse='));
+    expect(args[index - 1]).toBe('-c');
+    expect(args[index]).toBe(
+      'hooks.PreToolUse=[{matcher="apply_patch", hooks=[{type="command", command="\\"C:/Program Files/nodejs/node.exe\\" C:/vuyro/bin.js hook pretooluse --provider codex", commandWindows="\\"C:/Program Files/nodejs/node.exe\\" C:/vuyro/bin.js hook pretooluse --provider codex", timeout=60}]}]',
+    );
+    expect(args).toContain('--dangerously-bypass-hook-trust');
+    expect(args.at(-1)).toBe('-');
+  });
+
+  it('no hook unless asked; asked without a CLI to run it, the run says so', async () => {
+    const plain = await argsFor('claude', {}, hookCli);
+    expect(plain.args).not.toContain('--settings');
+    const codex = await argsFor('codex', {}, hookCli);
+    expect(codex.args).not.toContain('--dangerously-bypass-hook-trust');
+    const missing = await argsFor('claude', { checkoutHook: true });
+    expect(missing.args).not.toContain('--settings');
+    expect(missing.observations).toContainEqual(expect.objectContaining({ kind: 'warning', message: expect.stringContaining('checkout hook') as unknown }));
+  });
+});

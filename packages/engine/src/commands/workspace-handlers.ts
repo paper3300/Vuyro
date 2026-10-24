@@ -620,7 +620,8 @@ function overlapWarnings(ledger: LedgerState, projectId: string, space: string, 
     if (change.attribution !== 'worktree') continue;
     const key = pathKey(change.path);
     for (const [other, paths] of Object.entries(ledger.changed)) {
-      if (other === space || !Object.hasOwn(paths, key)) continue;
+      // Lane worktrees only (`wt:<ticket>/<node>-<lane>`): what the ticket's own worktree changes is not merged.
+      if (other === space || !other.includes('/') || !Object.hasOwn(paths, key)) continue;
       const pair = warnKey(change.path, space, other);
       if (ledger.warned[pair] === true || warned.has(pair)) continue;
       warned.add(pair);

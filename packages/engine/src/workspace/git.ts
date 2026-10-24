@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute, join, resolve } from 'node:path';
 import { resolveExecutable } from '@vuyro/agent-adapters';
 
 /**
@@ -70,6 +72,7 @@ const FALLBACK_IDENTITY = ['-c', 'user.name=Vuyro', '-c', 'user.email=vuyro@loca
 export class GitClient {
   private readonly exec: GitExec;
   private readonly identity = new Map<string, readonly string[]>();
+  private readonly tops = new Map<string, string | undefined>();
 
   constructor(exec: GitExec = nodeGitExec()) {
     this.exec = exec;
@@ -81,10 +84,14 @@ export class GitClient {
     return result;
   }
 
-  /** The top folder of the repository `cwd` is in, or undefined when it is not in one. */
+  /** The top folder of the repository `cwd` is in, or undefined when it is not in one. Remembered per folder. */
   async topLevel(cwd: string): Promise<string | undefined> {
+    if (this.tops.has(cwd)) return this.tops.get(cwd);
     const result = await this.exec(['rev-parse', '--show-toplevel'], cwd);
-    return result.code === 0 ? result.stdout.trim() : undefined;
+    const top = result.code === 0 ? result.stdout.trim() : undefined;
+    // A folder that is not a repository yet may become one; only a positive answer is kept.
+    if (top !== undefined) this.tops.set(cwd, top);
+    return top;
   }
 
   /** Read-only: changed and untracked files (no renames, so each side shows up as a path). */
@@ -128,13 +135,29 @@ export class GitClient {
     return list;
   }
 
-  /** Makes a worktree on a new branch at `start`, or on the existing branch. */
+  /**
+   * Makes a worktree on a new branch at `start`, or on the existing branch. A stale registration of the same folder
+   * (its folder was deleted by hand) is pruned and the add tried once more.
+   */
   async addWorktree(repo: string, path: string, branch: string, start: string): Promise<void> {
-    if (await this.branchExists(repo, branch)) await this.run(repo, ['worktree', 'add', path, branch]);
-    else await this.run(repo, ['worktree', 'add', '-b', branch, path, start]);
+    const args = (await this.branchExists(repo, branch)) ? ['worktree', 'add', path, branch] : ['worktree', 'add', '-b', branch, path, start];
+    const first = await this.exec(args, repo);
+    if (first.code === 0) return;
+    await this.prune(repo);
+    await this.run(repo, args);
+  }
+
+  /**
+   * Whether a merge is in progress in a worktree, from its git folder (no process): the `.git` file of a worktree
+   * names its folder under the repository's `.git/worktrees`.
+   */
+  mergeInProgress(cwd: string): Promise<boolean> {
+    const dir = gitDir(cwd);
+    return dir === undefined ? this.revParse(cwd, 'MERGE_HEAD').then((head) => head !== undefined) : Promise.resolve(existsSync(join(dir, 'MERGE_HEAD')));
   }
 
   async removeWorktree(repo: string, path: string): Promise<void> {
+    this.tops.delete(path);
     await this.run(repo, ['worktree', 'remove', '--force', path]);
   }
 
@@ -148,6 +171,7 @@ export class GitClient {
 
   /** Commits everything in a worktree (its own branch). Returns the new head, or undefined when nothing changed. */
   async commitAll(cwd: string, message: string): Promise<string | undefined> {
+    if ((await this.status(cwd)).length === 0) return undefined;
     await this.run(cwd, ['add', '--all']);
     const staged = await this.run(cwd, ['diff', '--cached', '--quiet'], { allow: [1] });
     if (staged.code === 0) return undefined;
@@ -169,10 +193,6 @@ export class GitClient {
   async unmerged(cwd: string): Promise<string[]> {
     const { stdout } = await this.run(cwd, ['diff', '--name-only', '--diff-filter=U', '-z']);
     return stdout.split('\0').filter((path) => path !== '');
-  }
-
-  async mergeInProgress(cwd: string): Promise<boolean> {
-    return (await this.revParse(cwd, 'MERGE_HEAD')) !== undefined;
   }
 
   async abortMerge(cwd: string): Promise<void> {
@@ -199,10 +219,25 @@ export class GitClient {
   private async identityArgs(cwd: string): Promise<readonly string[]> {
     const known = this.identity.get(cwd);
     if (known !== undefined) return known;
-    const email = await this.exec(['config', 'user.email'], cwd);
-    const name = await this.exec(['config', 'user.name'], cwd);
-    const args = email.code === 0 && email.stdout.trim() !== '' && name.code === 0 && name.stdout.trim() !== '' ? [] : FALLBACK_IDENTITY;
+    // Fails when git has no name or email to commit with (it would not guess one for us either).
+    const ident = await this.exec(['var', 'GIT_COMMITTER_IDENT'], cwd);
+    const args = ident.code === 0 ? [] : FALLBACK_IDENTITY;
     this.identity.set(cwd, args);
     return args;
+  }
+}
+
+/** The git folder of a worktree or repository folder, read from its `.git` (no process). */
+export function gitDir(cwd: string): string | undefined {
+  const dotGit = join(cwd, '.git');
+  try {
+    const text = readFileSync(dotGit, 'utf8');
+    const match = /^gitdir:\s*(.+)$/m.exec(text);
+    if (match?.[1] === undefined) return undefined;
+    const dir = match[1].trim();
+    return isAbsolute(dir) ? dir : resolve(cwd, dir);
+  } catch (error) {
+    // A repository's own folder: `.git` is the directory.
+    return (error as NodeJS.ErrnoException).code === 'EISDIR' ? dotGit : undefined;
   }
 }

@@ -117,6 +117,8 @@ export class WorkspaceCoordinator {
   private readonly ledgers = new Map<string, { revision: number; state: LedgerState }>();
   private readonly projectOf = new Map<string, string>();
   private readonly pending = new Set<string>();
+  /** Tickets whose worktrees may be removable: a join merged, or the ticket completed. */
+  private readonly cleanup = new Set<string>();
   private readonly watches = new Map<string, { handle: Promise<WatchHandle | undefined>; users: Set<string>; paths: Set<string>; timer?: TimerHandle | undefined; projectId: string; root: string }>();
   private chain: Promise<void> = Promise.resolve();
   private readonly locks = new Map<string, Promise<unknown>>();
@@ -242,8 +244,7 @@ export class WorkspaceCoordinator {
     const repo = await this.repository(state);
     const name = ticketWorktree(this.options.services.layout.worktreeRoot, ticketId);
     const git = this.options.git;
-    if (!(await this.knownWorktree(repo, name.path))) {
-      await git.prune(repo);
+    if (!(await this.knownWorktree(name.path))) {
       const base = (await git.revParse(repo, name.branch)) ?? (await git.revParse(repo, state.workspace?.baseRef ?? 'HEAD'));
       if (base === undefined) throw new Error(`cannot find the start of the ticket branch (${state.workspace?.baseRef ?? 'HEAD'}) in ${repo}`);
       await git.addWorktree(repo, name.path, name.branch, base);
@@ -254,10 +255,9 @@ export class WorkspaceCoordinator {
     return { name, head };
   }
 
-  private async knownWorktree(repo: string, path: string): Promise<boolean> {
-    const list = await this.options.git.worktrees(repo);
-    const key = pathKey(path.replace(/\\/g, '/'));
-    return list.some((entry) => pathKey(entry.path.replace(/\\/g, '/')) === key) && existsSync(path);
+  /** A worktree folder with its `.git` link in place is taken as made; anything else is made (again). */
+  private knownWorktree(path: string): Promise<boolean> {
+    return Promise.resolve(existsSync(join(path, '.git')));
   }
 
   private async ensureWorktree(state: TicketWorkflow, ticketId: string, name: WorktreeName, exec: Execution): Promise<void> {
@@ -265,13 +265,12 @@ export class WorkspaceCoordinator {
     if (name.scope === 'ticket') return;
     const repo = await this.repository(state);
     const git = this.options.git;
-    if (await this.knownWorktree(repo, name.path)) {
+    if (await this.knownWorktree(name.path)) {
       // A merge conflict sent the lane back: it starts over from what was merged. Otherwise pick up merged work if it is a fast-forward.
       if (exec.reset === true) await git.resetHard(name.path, ticket.head);
       else await git.fastForward(name.path, ticket.name.branch);
       return;
     }
-    await git.prune(repo);
     const existing = await git.revParse(repo, name.branch);
     await git.addWorktree(repo, name.path, name.branch, ticket.head);
     if (exec.reset === true && existing !== undefined) await git.resetHard(name.path, ticket.head);
@@ -325,7 +324,12 @@ export class WorkspaceCoordinator {
       if (await git.mergeInProgress(worktree)) {
         const unmerged = await git.unmerged(worktree);
         if (unmerged.length > 0) {
-          const pendingLane = lanes[0];
+          // The branch being merged is the lane whose head is MERGE_HEAD.
+          const mergeHead = await git.revParse(worktree, 'MERGE_HEAD');
+          let pendingLane: (typeof lanes)[number] | undefined;
+          for (const lane of lanes) {
+            if (mergeHead !== undefined && (await git.revParse(worktree, `refs/heads/${lane.name.branch}`)) === mergeHead) pendingLane = lane;
+          }
           const conflict = { branch: pendingLane?.name.branch ?? branch, nodeId: pendingLane?.nodeId ?? node.id, lane: pendingLane?.lane ?? 'main', files: unmerged };
           if (policy === 'agent') return { kind: 'agent', base, worktree, conflicts: [conflict], agent: settings.mergeAgent };
           return { ...base, outcome: 'conflict', conflicts: [conflict], head: ticket.head };
@@ -547,12 +551,13 @@ export class WorkspaceCoordinator {
     if (runningHolder !== undefined) return { ...base, attribution: 'checkout', holder: runningHolder.holder };
     const held = exclusive[0] ?? covering[0];
     if (held !== undefined) return { ...base, attribution: 'conflict', holder: held.holder };
-    if (location.worktree?.scope === 'lane') {
-      const owner = focus ?? running[0];
-      return { ...base, attribution: 'worktree', ...(owner === undefined ? {} : { holder: owner }) };
-    }
     const suspects = [...running];
     if (focus !== undefined && !suspects.some((holder) => sameHolder(holder, focus))) suspects.push(focus);
+    // A lane's own worktree, or the ticket's worktree with one execution in it: the engine's folder, so it is theirs.
+    if (location.worktree !== undefined && (location.worktree.scope === 'lane' || suspects.length === 1)) {
+      const owner = focus ?? suspects[0];
+      return { ...base, attribution: 'worktree', ...(owner === undefined ? {} : { holder: owner }) };
+    }
     return { ...base, attribution: 'unattributed', ...(suspects.length === 0 ? {} : { suspects: suspects.slice(0, 64) }) };
   }
 
@@ -700,6 +705,7 @@ export class WorkspaceCoordinator {
       if (event.type === 'ticket.created') this.projectOf.set(event.aggregateId, event.data.projectId);
       if (event.aggregateType === 'workspace' && (event.type === 'checkout.released' || event.type === 'checkout.acquired')) this.touch(event.data.projectId);
       if (event.aggregateType !== 'ticket') continue;
+      if (event.type === 'ticket.completed' || (event.type === 'node.completed' && event.data.status === 'done')) this.cleanup.add(event.aggregateId);
       if (
         event.type === 'node.completed' ||
         event.type === 'node.superseded' ||
@@ -795,7 +801,10 @@ export class WorkspaceCoordinator {
     if (retain.length > 0) await this.record({ projectId, op: 'retain', ids: retain }, ...retain);
     for (const pause of pauses.values()) await this.record({ projectId, op: 'pause', holder: pause.holder, hashes: pause.hashes }, holderKey(pause.holder), JSON.stringify(pause.hashes));
     this.scheduleExpiry(projectId, nextExpiry);
-    await this.exclusive(projectId, () => this.cleanWorktrees(projectId));
+    if (reason === 'recovery' || Object.keys(ledger.worktrees).some((key) => this.cleanup.has(ledger.worktrees[key]?.ticketId ?? ''))) {
+      await this.exclusive(projectId, () => this.cleanWorktrees(projectId, reason === 'recovery'));
+      for (const worktree of Object.values(ledger.worktrees)) this.cleanup.delete(worktree.ticketId);
+    }
     await this.resumeWaiting(projectId);
   }
 
@@ -861,10 +870,11 @@ export class WorkspaceCoordinator {
   }
 
   /** Worktrees of completed tickets, and lane worktrees whose branch is merged into the ticket branch, are removed. */
-  private async cleanWorktrees(projectId: string): Promise<void> {
+  private async cleanWorktrees(projectId: string, all = false): Promise<void> {
     const ledger = await this.ledger(projectId);
     const git = this.options.git;
     for (const worktree of Object.values(ledger.worktrees)) {
+      if (!all && !this.cleanup.has(worktree.ticketId)) continue;
       const state = await this.ticket(worktree.ticketId);
       const repo = state.workspace?.root;
       if (repo === undefined) continue;
