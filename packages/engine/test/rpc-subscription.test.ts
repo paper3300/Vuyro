@@ -127,3 +127,75 @@ describe('events.subscribe (server)', () => {
     connection.close();
   });
 });
+
+describe('message size (server)', () => {
+  function raw(maxLineBytes: number) {
+    const [server, client] = duplexPair();
+    const store = new FakeStore();
+    new RpcConnection(
+      server,
+      {
+        bus: {} as CommandBus,
+        store: store as unknown as EventStore,
+        queries: {} as EngineQueries,
+        credentials: new HumanCredentials({ clock: systemClock, random: cryptoRandom }),
+        approver: denyingApprover,
+        pairing: new PairingGate(),
+        clock: systemClock,
+        random: cryptoRandom,
+        validator: new SchemaValidator(),
+        engineVersion: 'test',
+        cliCredentialTtlMs: 1000,
+        pairingTimeoutMs: 1000,
+        status: () => Promise.reject(new Error('unused')),
+        shutdown: () => undefined,
+        reportError: () => undefined,
+      },
+      { maxLineBytes },
+    );
+    const replies: { id?: unknown; result?: unknown; error?: { message: string } }[] = [];
+    let closed = false;
+    let buffer = '';
+    client.setEncoding('utf8');
+    client.on('data', (chunk: string) => {
+      buffer += chunk;
+      for (let newline = buffer.indexOf('\n'); newline >= 0; newline = buffer.indexOf('\n')) {
+        replies.push(JSON.parse(buffer.slice(0, newline)) as (typeof replies)[number]);
+        buffer = buffer.slice(newline + 1);
+      }
+    });
+    client.on('close', () => {
+      closed = true;
+    });
+    client.on('error', () => undefined);
+    // duplexPair does not tell one end that the other was destroyed; the server end says whether it hung up.
+    return { client, replies, closed: () => closed || server.destroyed };
+  }
+
+  const hello = (padding: number) => `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: RPC_METHODS.hello, params: { protocol: 1, client: 'cli' }, pad: 'x'.repeat(padding) })}\n`;
+
+  it('refuses a complete line over the limit without parsing it, in the same chunk as its newline', async () => {
+    const connection = raw(200);
+    connection.client.write(hello(300));
+    await settle();
+    expect(connection.replies).toEqual([{ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'message too large' } }]);
+    expect(connection.closed()).toBe(true);
+  });
+
+  it('refuses an unfinished line over the limit', async () => {
+    const connection = raw(200);
+    connection.client.write('{"jsonrpc":"2.0","pad":"' + 'x'.repeat(300));
+    await settle();
+    expect(connection.replies[0]?.error?.message).toBe('message too large');
+    expect(connection.closed()).toBe(true);
+  });
+
+  it('answers a line within the limit', async () => {
+    const connection = raw(200);
+    connection.client.write(hello(10));
+    await settle();
+    expect(connection.replies[0]).toMatchObject({ id: 1, result: { identity: 'unverified' } });
+    expect(connection.closed()).toBe(false);
+    connection.client.destroy();
+  });
+});

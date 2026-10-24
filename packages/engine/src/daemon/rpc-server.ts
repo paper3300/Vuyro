@@ -116,6 +116,7 @@ interface Subscription {
 export class RpcConnection {
   private readonly socket: Duplex;
   private readonly services: RpcServices;
+  private readonly maxLineBytes: number;
   private identity: TransportIdentity | undefined;
   private humanCredential: string | undefined;
   private buffer = '';
@@ -124,9 +125,10 @@ export class RpcConnection {
   private readonly subscriptions = new Map<string, Subscription>();
   private nextSubscription = 1;
 
-  constructor(socket: Duplex, services: RpcServices) {
+  constructor(socket: Duplex, services: RpcServices, limits: { maxLineBytes?: number } = {}) {
     this.socket = socket;
     this.services = services;
+    this.maxLineBytes = limits.maxLineBytes ?? MAX_LINE_BYTES;
     socket.setEncoding('utf8');
     socket.on('data', (chunk: string) => {
       this.onData(chunk);
@@ -154,13 +156,20 @@ export class RpcConnection {
     while (newline >= 0) {
       const line = this.buffer.slice(0, newline);
       this.buffer = this.buffer.slice(newline + 1);
+      // A complete line is held to the same limit as an unfinished one, before anything parses it.
+      if (Buffer.byteLength(line, 'utf8') > this.maxLineBytes) {
+        this.tooLarge();
+        return;
+      }
       if (line.trim() !== '') this.onLine(line);
       newline = this.buffer.indexOf('\n');
     }
-    if (Buffer.byteLength(this.buffer, 'utf8') > MAX_LINE_BYTES) {
-      this.send({ jsonrpc: '2.0', id: null, error: { code: RPC_PROTOCOL_ERRORS.invalidRequest, message: 'message too large' } });
-      this.close();
-    }
+    if (Buffer.byteLength(this.buffer, 'utf8') > this.maxLineBytes) this.tooLarge();
+  }
+
+  private tooLarge(): void {
+    this.send({ jsonrpc: '2.0', id: null, error: { code: RPC_PROTOCOL_ERRORS.invalidRequest, message: 'message too large' } });
+    this.close();
   }
 
   private onLine(line: string): void {

@@ -14,8 +14,14 @@ afterAll(() => {
 
 function fakeEngine() {
   const sent: { envelope: Record<string, unknown>; options: EngineClientOptions }[] = [];
+  const requests: { method: string; options: EngineClientOptions }[] = [];
   const connect = (options: EngineClientOptions): Promise<EngineClient> =>
     Promise.resolve({
+      request: (method: string) => {
+        requests.push({ method, options });
+        return Promise.resolve({ kind: 'cli', credential: 'vhc_new' });
+      },
+      on: () => () => undefined,
       hello: { protocol: 1, engineVersion: '0.0.0', identity: 'unverified', lastSequence: 0 },
       execute: (envelope: Record<string, unknown>) => {
         sent.push({ envelope, options });
@@ -23,7 +29,7 @@ function fakeEngine() {
       },
       close: () => undefined,
     } as unknown as EngineClient);
-  return { sent, connect };
+  return { sent, requests, connect };
 }
 
 const io = (): CliIo & { err: (line: string) => void; errors: string[] } => {
@@ -68,6 +74,13 @@ describe('vuyro command envelopes', () => {
     expect(engine.sent[0]?.options.humanCredential).toBe('vhc_secret');
     expect(engine.sent[0]?.envelope).toMatchObject({ type: 'node.reject', payload: { ticketId: 'T', nodeId: 'qa', lane: '2', comment: 'again' } });
     expect(engine.sent[0]?.envelope).not.toHaveProperty('auth');
+  });
+
+  it('auth login connects without the terminal human credential (an expired one would fail hello)', async () => {
+    const engine = fakeEngine();
+    const code = await runCli(['auth', 'login', '--json'], io(), { env: { VUYRO_HUMAN_CREDENTIAL: 'vhc_expired' }, connect: engine.connect });
+    expect(code).toBe(0);
+    expect(engine.requests).toEqual([{ method: 'auth.pair', options: expect.not.objectContaining({ humanCredential: expect.anything() as unknown }) as EngineClientOptions }]);
   });
 
   it('ticket create with a pinned template version', async () => {

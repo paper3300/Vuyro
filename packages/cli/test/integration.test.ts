@@ -116,6 +116,10 @@ describe.runIf(process.platform === 'win32')('vuyro CLI against the engine daemo
     const { credential } = JSON.parse(login.out.stdout.join('\n')) as { credential: string };
     expect(login.out.stderr.join('\n')).toContain(`Code: ${approvals[0]?.split(':')[1] ?? '?'}`);
     const human = { VUYRO_HUMAN_CREDENTIAL: credential };
+    // Logging in again works even while the terminal still holds an expired or unknown credential.
+    const again = await vuyro(['auth', 'login', '--json'], { VUYRO_HUMAN_CREDENTIAL: 'vhc_expired-credential-from-yesterday-0123456789' });
+    expect(again.code).toBe(0);
+    expect(approvals).toHaveLength(2);
     expect((await json<{ identity: string }>(['auth', 'status'], human)).identity).toBe('human-cli');
 
     const { projectId } = await json<{ projectId: string }>(['project', 'create', 'sample'], human);

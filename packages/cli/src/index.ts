@@ -168,8 +168,12 @@ function location(ctx: Context): { dataDir?: string; pipePath?: string; env: Rea
   return { ...(dataDir === undefined ? {} : { dataDir }), ...(pipePath === undefined ? {} : { pipePath }), env: ctx.env };
 }
 
-async function connect(ctx: Context): Promise<EngineClient> {
-  const humanCredential = ctx.env[HUMAN_CREDENTIAL_ENV];
+/**
+ * `asHuman: false` connects without the terminal's human credential: `auth login` must work exactly when the old
+ * credential has expired (the engine refuses a stale one at hello).
+ */
+async function connect(ctx: Context, asHuman = true): Promise<EngineClient> {
+  const humanCredential = asHuman ? ctx.env[HUMAN_CREDENTIAL_ENV] : undefined;
   const options: EngineClientOptions = {
     client: 'cli',
     ...location(ctx),
@@ -178,8 +182,8 @@ async function connect(ctx: Context): Promise<EngineClient> {
   return (ctx.options.connect ?? ((o) => EngineClient.connect(o)))(options);
 }
 
-async function withClient<T>(ctx: Context, work: (client: EngineClient) => Promise<T>): Promise<T> {
-  const client = await connect(ctx);
+async function withClient<T>(ctx: Context, work: (client: EngineClient) => Promise<T>, asHuman = true): Promise<T> {
+  const client = await connect(ctx, asHuman);
   try {
     return await work(client);
   } finally {
@@ -268,7 +272,7 @@ async function authCommand(ctx: Context, sub: string | undefined): Promise<numbe
         } finally {
           off();
         }
-      });
+      }, false);
       const until = result.expiresAt === undefined ? '' : ` until ${new Date(result.expiresAt).toISOString()}`;
       print(ctx, result, () => [
         `Approved. This credential makes the terminal that holds it act as you${until}:`,
