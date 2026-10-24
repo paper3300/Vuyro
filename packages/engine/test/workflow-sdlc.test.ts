@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { CommandResponse, NodeRunOutput } from '@vuyro/contracts';
 import type { ScriptedBehavior, ScriptedSession } from '../src/workflow/scripted-agent.ts';
+import { EngineQueries } from '../src/daemon/queries.ts';
 import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
 import { openWorkflowHarness, startSdlcTicket, type WorkflowHarness } from './helpers/workflow-harness.ts';
 
@@ -160,8 +161,12 @@ describe('AI-Native SDLC template', () => {
     expect(ticketRow).toMatchObject({ status: 'done', template_id: 'vuyro/ai-sdlc' });
 
     // The artifact registry kept every registration, attached to its lane by the run.
-    const changes = await h.store.query<{ uri: string; version: string }>("SELECT uri, version FROM p_artifacts WHERE slot = 'change' AND source = 'added' ORDER BY sequence");
+    const changes = await h.store.query<{ uri: string; version: string; lane: string | null }>("SELECT uri, version, lane FROM p_artifacts WHERE slot = 'change' AND source = 'added' ORDER BY sequence");
     expect(changes.map((row) => row.uri).sort()).toEqual(['repo:T1', 'repo:T2', 'repo:T2', 'repo:T3']);
+    expect(changes.map((row) => `${row.uri}@${String(row.lane)}`).sort()).toEqual(['repo:T1@1', 'repo:T2@2', 'repo:T2@2', 'repo:T3@3']);
+    // So the registry's latest entry is per lane: every task's change is current.
+    const current = (await new EngineQueries({ store: h.store, definitions: h.registry, clock: h.clock }).artifacts(ticketId, 'dev')).filter((row) => row.current && row.slot === 'change');
+    expect(current.map((row) => row.uri).sort()).toEqual(['repo:T1', 'repo:T2', 'repo:T3']);
     // Outputs carry them on as well (source 'output'), one per finished Dev execution.
     const outputs = await h.store.query<{ uri: string }>("SELECT uri FROM p_artifacts WHERE slot = 'change' AND source = 'output' AND node_id = 'dev'");
     expect(outputs.map((row) => row.uri).sort()).toEqual(['repo:T1', 'repo:T2', 'repo:T2', 'repo:T3']);

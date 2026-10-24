@@ -211,7 +211,7 @@ export const HANDLERS: HandlerMap = {
       const ticket = requireTarget(target);
       if (!ticket.state.exists) return Promise.resolve(fail('not_found', `ticket ${payload.ticketId} does not exist`));
       const runId = ctx.caller.binding?.runId;
-      const data = { ...payload, ...(runId === undefined ? {} : { runId }) };
+      let data = { ...payload, ...(runId === undefined ? {} : { runId }) };
       if (runId !== undefined && Object.hasOwn(ticket.state.runIndex, runId)) {
         // A workflow run may register artifacts only while it still drives its lane (not once superseded).
         const owner = ticket.state.runIndex[runId];
@@ -220,6 +220,9 @@ export const HANDLERS: HandlerMap = {
         if (exec === undefined || current?.run !== exec.run || exec.status !== 'running' || exec.runIds.at(-1) !== runId) {
           return Promise.resolve(fail('invariant_violated', `run ${runId} no longer drives its lane (it is ${exec?.status ?? 'unknown'})`));
         }
+        // The run says which lane it registers for, so parallel lanes keep their own latest artifact (M6a fix:
+        // without it every lane's registration had no lane and the registry's "current" kept only the last one).
+        data = { ...data, lane: payload.lane ?? exec.lane };
       }
       return Promise.resolve({
         ok: true,
