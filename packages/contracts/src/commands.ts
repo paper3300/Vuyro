@@ -556,6 +556,19 @@ export const COMMAND_CATALOG = {
     payload: Type.Object({ ...DefinitionKeyPayload, reason: Type.String({ maxLength: 1024 }) }, strict),
     result: Empty,
   },
+  /** Drop every staged version of one save or import in one commit (M6b check): a group never ends half dropped. */
+  'definition.abandonMany': {
+    version: 1,
+    scope: 'app',
+    category: 'definition',
+    access: { nodeAgent: 'deny', systemOnly: true },
+    summary: 'Drop the staged definitions of one save or import together.',
+    payload: Type.Object(
+      { items: Type.Array(Type.Object(DefinitionKeyPayload, strict), { minItems: 1, maxItems: 201 }), reason: Type.String({ maxLength: 1024 }) },
+      strict,
+    ),
+    result: Empty,
+  },
   'node.done': {
     version: 1,
     scope: 'node',

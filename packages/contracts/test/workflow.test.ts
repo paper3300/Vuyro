@@ -84,7 +84,7 @@ describe('workflow contracts', () => {
     for (const type of ['node.approve', 'node.reject', 'node.retry', 'node.pause', 'node.resume', 'nodeType.save', 'template.save', 'definition.import'] as const) {
       expect(COMMAND_CATALOG[type].access.nodeAgent, type).toBe('deny');
     }
-    for (const type of ['node.start', 'node.finish', 'definition.activate', 'definition.activateMany', 'definition.abandon'] as const) {
+    for (const type of ['node.start', 'node.finish', 'definition.activate', 'definition.activateMany', 'definition.abandon', 'definition.abandonMany'] as const) {
       expect(COMMAND_CATALOG[type].access, type).toEqual({ nodeAgent: 'deny', systemOnly: true });
     }
   });

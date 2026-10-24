@@ -383,6 +383,27 @@ export const definitionAbandon: CommandHandler<'definition.abandon', DefinitionS
   },
 };
 
+/** `definition.abandonMany`: every still-staged version of one save or import, dropped in one commit. */
+export const definitionAbandonMany: CommandHandler<'definition.abandonMany', DefinitionState> = {
+  scope: () => ({}),
+  decide: async (ctx, payload) => {
+    const streams = new Map<string, { loaded: Loaded<DefinitionState>; events: NewEvent[] }>();
+    for (const item of payload.items) {
+      const aggregateId = definitionAggregateId(item.kind, item.id);
+      const entry = streams.get(aggregateId) ?? { loaded: await ctx.load(definitionAggregate, aggregateId), events: [] };
+      streams.set(aggregateId, entry);
+      const version = Object.hasOwn(entry.loaded.state.versions, item.version) ? entry.loaded.state.versions[item.version] : undefined;
+      if (version === undefined || version.hash !== item.hash) return fail('not_found', `${item.kind} ${item.id}@${item.version} with this hash was never staged`);
+      if (version.status !== 'staged') continue;
+      entry.events.push({ type: 'definition.abandoned', data: { ...item, reason: payload.reason } });
+    }
+    const appends: StreamAppend[] = [...streams.entries()]
+      .filter(([, entry]) => entry.events.length > 0)
+      .map(([aggregateId, entry]) => ({ aggregateType: 'definition', aggregateId, expectedRevision: entry.loaded.revision, events: entry.events }));
+    return { ok: true, appends, result: {} };
+  },
+};
+
 export const nodeTypeSave = stageHandler<'nodeType.save'>('nodeType');
 export const templateSave = stageHandler<'template.save'>('template');
 

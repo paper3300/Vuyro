@@ -634,4 +634,48 @@ describe('writing an import: every file first, then one activation (M6b re-revie
     await h.restart({ noEngine: true });
     expect(await statuses()).toEqual(Object.fromEntries(ids.map((each) => [each, 'active'])));
   });
+
+  it('a failed group is dropped in one commit', async () => {
+    const fs = new MemoryFileSystem();
+    h = await openWorkflowHarness({ noEngine: true, fs });
+    fs.failNext('rename', `${path('nodeType', 'myteam.three')}.tmp`);
+    await importAll();
+    await settled();
+    expect(await statuses()).toEqual(Object.fromEntries(ids.map((each) => [each, 'abandoned'])));
+    const drops = await h.store.query<{ request_id: string; type: string }>("SELECT DISTINCT request_id, type FROM events WHERE type = 'definition.abandoned' AND aggregate_id LIKE 'def:%myteam%'");
+    expect(drops).toHaveLength(1);
+    expect(drops[0]?.request_id).toMatch(/^def-abandon-many-/);
+  });
+
+  it('stopping while a group is being dropped: the next start drops the rest instead of activating it', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    h.writer.stop();
+    await importAll();
+    // An engine that dropped the members one at a time stopped after the first one (the template, which nothing else
+    // needs: the node types alone would pass every activation check).
+    const template = three().content;
+    expect((await h.exec('definition.abandon', { kind: 'template', id: template.id, version: 1, hash: definitionHash(template), reason: 'write failed' }, SYSTEM)).ok).toBe(true);
+    expect(await statuses()).toEqual({ 'myteam.one': 'staged', 'myteam.two': 'staged', 'myteam.three': 'staged', 'myteam/build': 'abandoned' });
+    await h.restart({ noEngine: true });
+    expect(await statuses()).toEqual(Object.fromEntries(ids.map((each) => [each, 'abandoned'])));
+    expect(await h.registry.fileHash('nodeType', 'myteam.one', 1)).toBeUndefined();
+    expect(await h.registry.fileHash('template', 'myteam/build', 1)).toBeUndefined();
+  });
+
+  it('dropping a group: only staged versions, only by the engine, unknown versions refused', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    h.writer.stop();
+    await importAll();
+    const bundle = three();
+    const keys = [...bundle.embedded, bundle.content].map((definition) => ({ kind: definition.kind, id: definition.id, version: 1, hash: definitionHash(definition) }));
+    expect((await h.exec('definition.abandonMany', { items: keys, reason: 'x' }, HUMAN)).ok).toBe(false);
+    expect(await h.exec('definition.abandonMany', { items: [{ ...keys[0], hash: definitionHash(buildTemplate()) }], reason: 'x' }, SYSTEM)).toMatchObject({ ok: false, error: { code: 'not_found' } });
+    expect(await statuses()).toEqual(Object.fromEntries(ids.map((each) => [each, 'staged'])));
+    expect((await h.exec('definition.abandonMany', { items: keys, reason: 'x' }, SYSTEM)).ok).toBe(true);
+    expect(await statuses()).toEqual(Object.fromEntries(ids.map((each) => [each, 'abandoned'])));
+    // Again: nothing left to drop, nothing recorded.
+    const before = await h.store.lastSequence();
+    expect((await h.exec('definition.abandonMany', { items: keys, reason: 'x' }, SYSTEM)).ok).toBe(true);
+    expect(await h.store.lastSequence()).toBe(before);
+  });
 });

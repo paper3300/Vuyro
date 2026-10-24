@@ -127,12 +127,26 @@ export class DefinitionWriter {
       }
       staged.push(stagedFrom(event));
     }
-    // Versions an import staged together are finished together, as when the engine had not stopped.
+    // Versions an import staged together are finished together, as when the engine had not stopped. If part of the
+    // group was already dropped (an older engine dropped them one at a time and stopped in between), the rest is
+    // dropped too: a group is never activated without all of its members.
+    const droppedRequests = await this.droppedRequests();
     for (const group of byRequest(staged)) {
-      const ok = await this.materialize(group);
+      const requestId = group[0]?.requestId;
+      const ok = requestId !== undefined && droppedRequests.has(requestId) ? await this.fail(group, [], 'another definition of the same import was abandoned') : await this.materialize(group);
       for (const each of group) (ok ? activated : abandoned).push(`${each.kind} ${each.id}@${String(each.version)}`);
     }
     return { activated, abandoned };
+  }
+
+  /** Commands that staged a version that was later abandoned. */
+  private async droppedRequests(): Promise<Set<string>> {
+    const requests = new Set<string>();
+    for (const row of await this.options.registry.rows('abandoned')) {
+      const event = findStagedEvent(await this.options.store.readAggregate(definitionAggregate(row.kind, row.id)), row.version, row.hash);
+      if (event?.requestId !== undefined) requests.add(event.requestId);
+    }
+    return requests;
   }
 
   /** Compares the files on disk with the registered versions. Changes nothing except leftover temp files. */
@@ -218,9 +232,28 @@ export class DefinitionWriter {
 
   private async fail(group: readonly Staged[], written: readonly string[], reason: string): Promise<false> {
     for (const path of written) await this.options.fs.rm(path, { force: true }).catch(() => undefined);
-    for (const staged of group) await this.abandon(staged, reason);
+    await this.abandonGroup(group, reason);
     for (const staged of group) this.settle(staged.hash, { ok: false, reason });
     return false;
+  }
+
+  /** Drops a whole group in one commit, so a stop in the middle never leaves part of it staged. */
+  private async abandonGroup(group: readonly Staged[], reason: string): Promise<void> {
+    const [only] = group;
+    if (group.length === 1 && only !== undefined) {
+      await this.abandon(only, reason);
+      return;
+    }
+    const items = group.map((staged) => ({ kind: staged.kind, id: staged.id, version: staged.version, hash: staged.hash }));
+    const response = await this.options.bus.execute(
+      {
+        requestId: `def-abandon-many-${sha256Hex(items.map((item) => `${item.hash}@${String(item.version)}`).join(',')).slice(0, 40)}`,
+        type: 'definition.abandonMany',
+        payload: { items, reason: reason.slice(0, 1024) },
+      },
+      SYSTEM,
+    );
+    if (!response.ok) this.report(new Error(response.error.message), `abandoning ${items.map((item) => `${item.kind} ${item.id}@${String(item.version)}`).join(', ')}`);
   }
 
   private async abandon(row: { kind: DefinitionKind; id: string; version: number; hash: string }, reason: string): Promise<void> {
