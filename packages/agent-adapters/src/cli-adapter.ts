@@ -5,6 +5,7 @@ import { CodexStreamNormalizer, codexArgs } from './codex.ts';
 import { AGENT_ENV } from './agent-env.ts';
 import { codexHome, codexUserHooks, codexWindowsSandbox } from './codex-home.ts';
 import { claudeHookArgs, codexHookArgs, type HookCli, hookCommandLine } from './hooks.ts';
+import { prependPath } from './cli-shims.ts';
 import { agentEnvironment, resolveExecutable } from './environment.ts';
 import type { AgentAdapter, AgentRunHandle, AgentStartRequest } from './index.ts';
 import { clip, LIMITS } from './limits.ts';
@@ -41,6 +42,8 @@ export interface CliAgentAdapterOptions {
   readonly vuyroHook?: HookCli;
   /** The user's Codex folder, read for the hook's safety checks. Default `CODEX_HOME` of `baseEnv`, else `~/.codex`. */
   readonly codexHome?: string;
+  /** Folders put first on the agent's PATH: the engine's `vuyro` shims (`vuyroShims`), so the agent's shell finds the CLI. */
+  readonly pathDirs?: readonly string[];
 }
 
 /** `-c` overrides that register `vuyro mcp` with Codex and forward the run variables to it. */
@@ -127,7 +130,7 @@ export class CliAgentAdapter implements AgentAdapter {
 
   start(request: AgentStartRequest): AgentRunHandle {
     const { clock, runner } = this.options;
-    const env = agentEnvironment(this.options.baseEnv ?? process.env, request.env);
+    const env = prependPath(agentEnvironment(this.options.baseEnv ?? process.env, request.env), this.options.pathDirs ?? []);
     const command = (this.options.resolve ?? resolveExecutable)(this.options.command ?? this.spec.command, env);
     const home = this.provider === 'codex' ? (this.options.codexHome ?? codexHome(this.options.baseEnv ?? process.env)) : undefined;
     // Fail closed: the hook trust bypass would run the user's own Codex hooks unchecked (the engine checks this too).

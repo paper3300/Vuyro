@@ -1,5 +1,5 @@
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { type DomainEvent, RPC_METHODS, RPC_NOTIFICATIONS } from '@vuyro/contracts';
 import { EngineClient, EngineRequestError, EngineUnavailableError } from '../src/client/engine-client.ts';
@@ -257,6 +257,16 @@ describe.runIf(process.platform === 'win32')('engine daemon', () => {
       expect(templates.map((row) => row.status)).toEqual(['active']);
       await h.restart();
       expect((await (await h.ui()).request<{ projects: unknown[] }>(RPC_METHODS.projects, {})).projects).toHaveLength(1);
+    }, 30_000);
+
+    it('writes the vuyro shims for agents at every start, from the CLI it was given', async () => {
+      h = await openDaemonHarness({ vuyroCli: { command: 'C:\\node\\node.exe', args: ['C:\\app\\cli\\bin.js'] } });
+      const bin = enginePaths(h.dataDir).bin;
+      expect(readFileSync(join(bin, 'vuyro.cmd'), 'utf8')).toBe('@"C:\\node\\node.exe" "C:\\app\\cli\\bin.js" %*\r\n');
+      expect(readFileSync(join(bin, 'vuyro'), 'utf8')).toContain("exec 'C:/node/node.exe' 'C:/app/cli/bin.js' \"$@\"");
+      await h.restart({ vuyroCli: { command: 'C:\\node\\node.exe', args: ['C:\\moved\\bin.js'] } });
+      expect(readFileSync(join(bin, 'vuyro.cmd'), 'utf8')).toContain('C:\\moved\\bin.js');
+      expect(readdirSync(bin).sort()).toEqual(['vuyro', 'vuyro.cmd']);
     }, 30_000);
 
     it('does not touch the runs while another engine holds the data directory', async () => {

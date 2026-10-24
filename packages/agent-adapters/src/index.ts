@@ -69,6 +69,7 @@ export { ClaudeStreamNormalizer, claudeArgs } from './claude.ts';
 export { CodexStreamNormalizer, codexArgs } from './codex.ts';
 export { CliAgentAdapter, codexMcpArgs, DEFAULT_CLAUDE_ARGS, DEFAULT_CODEX_ARGS } from './cli-adapter.ts';
 export type { CliAgentAdapterOptions } from './cli-adapter.ts';
+export { prependPath, vuyroShims } from './cli-shims.ts';
 export { agentEnvironment, envValue, ExecutableNotFoundError, resolveExecutable } from './environment.ts';
 export { codexHome, codexUserHooks, codexWindowsSandbox } from './codex-home.ts';
 export { CLAUDE_EDIT_TOOLS, claudeHookArgs, CODEX_EDIT_TOOLS, codexHookArgs, hookCommandLine } from './hooks.ts';

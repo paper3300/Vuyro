@@ -1,0 +1,12 @@
+{
+  "name": "@vuyro/demo-tools",
+  "version": "0.0.0",
+  "description": "Demo helpers: makes the sample repository the demo's agents work on (outside this repository)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "create-sample": "node scripts/create-sample.ts"
+  }
+}

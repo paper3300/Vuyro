@@ -1,7 +1,7 @@
 import type { RunObservation } from '@vuyro/contracts';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   agentEnvironment,
@@ -15,6 +15,7 @@ import {
   FakeProcessRunner,
   type FakeScript,
   resolveExecutable,
+  vuyroShims,
 } from '../src/index.ts';
 import type { AgentStartRequest } from '../src/index.ts';
 import { ManualClock } from './helpers/manual-clock.ts';
@@ -180,6 +181,23 @@ describe('agent environment', () => {
       { VUYRO_RUN_TOKEN: 'vrt_mine', VUYRO_PIPE: '\\\\.\\pipe\\p' },
     );
     expect(env).toEqual({ PATH: 'C:\\bin', HOME: 'C:\\home', VUYRO_RUN_TOKEN: 'vrt_mine', VUYRO_PIPE: '\\\\.\\pipe\\p' });
+  });
+
+  it("puts the engine's vuyro folder first on the agent's PATH", async () => {
+    const clock = new ManualClock();
+    const runner = new FakeProcessRunner(clock);
+    runner.enqueue({ steps: [{ stdout: RESULT }, { exit: 0 }] });
+    const adapter = CliAgentAdapter.claude({ runner, clock, resolve: (command) => `C:\\bin\\${command}.exe`, baseEnv: { Path: 'C:\\bin' }, pathDirs: ['C:\\data\\bin'] });
+    await drain(adapter.start(request()).observations);
+    expect(runner.spawned[0]?.spec.env?.Path).toBe(`C:\\data\\bin${delimiter}C:\\bin`);
+    expect(runner.spawned[0]?.spec.env?.PATH).toBeUndefined();
+  });
+
+  it('vuyro shims quote the CLI for cmd and sh', () => {
+    expect(vuyroShims({ command: 'C:\\Program Files\\nodejs\\node.exe', args: ["D:\\it's 100%\\bin.js"] })).toEqual({
+      'vuyro.cmd': `@"C:\\Program Files\\nodejs\\node.exe" "D:\\it's 100%%\\bin.js" %*\r\n`,
+      vuyro: `#!/bin/sh\nexec 'C:/Program Files/nodejs/node.exe' 'D:/it'\\''s 100%/bin.js' "$@"\n`,
+    });
   });
 
   it('the adapter passes the filtered environment to the process', async () => {

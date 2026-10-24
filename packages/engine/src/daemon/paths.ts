@@ -15,6 +15,8 @@ export interface EnginePaths {
   readonly sharedLogs: string;
   /** Git worktrees the engine makes in worktree mode. Short on purpose: Windows paths have a length limit. */
   readonly worktrees: string;
+  /** The `vuyro` shims put first on every agent's PATH (written at start when the engine knows its CLI). */
+  readonly bin: string;
 }
 
 /** `%LOCALAPPDATA%\Vuyro` (local to this PC, not roamed). */
@@ -34,6 +36,7 @@ export function enginePaths(dataDir: string): EnginePaths {
     log: join(root, 'logs', 'engine.log'),
     sharedLogs: join(root, 'logs', 'shared'),
     worktrees: join(root, 'wt'),
+    bin: join(root, 'bin'),
   };
 }
 

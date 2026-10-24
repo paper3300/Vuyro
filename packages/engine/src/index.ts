@@ -74,7 +74,7 @@ export type { Execution, Lane, NodeProgress, TicketWorkflow } from './workflow/s
 export { parseDuration } from './workflow/duration.ts';
 
 // M3: engine daemon, client, statistics.
-export { startEngineDaemon, engineVersion } from './daemon/daemon.ts';
+export { startEngineDaemon, engineVersion, writeVuyroShims } from './daemon/daemon.ts';
 export type { EngineDaemon, EngineDaemonOptions } from './daemon/daemon.ts';
 export { daemonEntryPath, launchEngineDaemon } from './daemon/launch.ts';
 export type { LaunchOptions, LaunchResult } from './daemon/launch.ts';
