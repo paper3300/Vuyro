@@ -200,6 +200,25 @@ describe('agent environment', () => {
     });
   });
 
+  it("drops the variables of the session that started the engine, keeps the user's settings", () => {
+    const launching = {
+      CLAUDECODE: '1',
+      CLAUDE_CODE_ENTRYPOINT: 'cli',
+      CLAUDE_CODE_SESSION_ID: 's',
+      CLAUDE_CODE_CHILD_SESSION: '1',
+      CLAUDE_CODE_SESSION_ATTENDED: '1',
+      CLAUDE_CODE_MESSAGING_SOCKET: 'pipe-name',
+      CLAUDE_CODE_MESSAGING_TOKEN: 'secret',
+      CLAUDE_CODE_EXECPATH: 'claude.exe',
+      CLAUDE_PID: '1',
+      CLAUDE_EFFORT: 'high',
+      HERDR_ENV: '1',
+      HERDR_PANE_ID: 'p',
+    };
+    const kept = { CLAUDE_CODE_GIT_BASH_PATH: 'C:/Git/bin/bash.exe', CLAUDE_CODE_USE_BEDROCK: '1', ANTHROPIC_BASE_URL: 'https://example.invalid', PATH: 'C:/bin' };
+    expect(agentEnvironment({ ...launching, ...kept }, { VUYRO_RUN_TOKEN: 'vrt_mine' })).toEqual({ ...kept, VUYRO_RUN_TOKEN: 'vrt_mine' });
+  });
+
   it('the adapter passes the filtered environment to the process', async () => {
     const { adapter, runner } = setup({ steps: [{ stdout: RESULT }, { exit: 0 }] }, { baseEnv: { PATH: 'C:\\bin', VUYRO_HUMAN_CREDENTIAL: 'vhc_secret' } });
     await drain(adapter.start(request()).observations);

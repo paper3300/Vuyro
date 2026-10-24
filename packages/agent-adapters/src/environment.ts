@@ -5,11 +5,21 @@ import { delimiter, isAbsolute, join } from 'node:path';
 const RESERVED = /^VUYRO_/i;
 
 /**
+ * Variables that belong to the session that started the engine, not to the user's settings: an agent CLI session
+ * (Claude Code marks its children as nested sessions and hands them its own messaging socket and token) or a
+ * terminal multiplexer's pane. Measured (M7a): an engine started from such a terminal passed them all to its agents.
+ * User settings such as `CLAUDE_CODE_GIT_BASH_PATH` or `CLAUDE_CODE_USE_BEDROCK` are kept.
+ */
+const LAUNCHING_SESSION =
+  /^(CLAUDECODE|CLAUDE_PID|CLAUDE_EFFORT|CLAUDE_CODE_(ENTRYPOINT|EXECPATH|SESSION_ID|CHILD_SESSION|SESSION_ATTENDED|MESSAGING_SOCKET|MESSAGING_TOKEN)|HERDR_\w+)$/i;
+
+/**
  * Environment of an agent process: the user's environment (the CLI needs its login, proxy and tool
  * settings) without any inherited `VUYRO_*` variable, plus what the engine sets for this run.
  *
  * Inherited `VUYRO_*` values are dropped on purpose: a human credential exported in the terminal that
- * started the engine (`VUYRO_HUMAN_CREDENTIAL`), or another run's token, must never reach an agent.
+ * started the engine (`VUYRO_HUMAN_CREDENTIAL`), or another run's token, must never reach an agent. So are the
+ * variables of the session that started the engine (`LAUNCHING_SESSION`).
  */
 export function agentEnvironment(
   base: Readonly<Record<string, string | undefined>>,
@@ -17,7 +27,7 @@ export function agentEnvironment(
 ): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(base)) {
-    if (value === undefined || RESERVED.test(name)) continue;
+    if (value === undefined || RESERVED.test(name) || LAUNCHING_SESSION.test(name)) continue;
     env[name] = value;
   }
   for (const [name, value] of Object.entries(run)) env[name] = value;
