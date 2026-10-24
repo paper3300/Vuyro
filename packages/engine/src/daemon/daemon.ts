@@ -192,7 +192,12 @@ export async function startEngineDaemon(options: EngineDaemonOptions = {}): Prom
     const vuyroHook = options.vuyroCli === undefined ? {} : { vuyroHook: { command: options.vuyroCli.command, args: options.vuyroCli.args } };
     // Agents run `vuyro …` from their shell: this engine's CLI goes first on their PATH, checked before every start.
     const shims = options.vuyroCli === undefined ? undefined : new VuyroShims(paths.bin, options.vuyroCli, options.shimSecurity);
-    shims?.ensure();
+    try {
+      shims?.ensure();
+    } catch (error) {
+      // The engine still starts; every agent start checks again and fails with this reason until it is fixed.
+      reportError(error as Error, 'preparing the vuyro shims for agents');
+    }
     const pathDirs = shims === undefined ? {} : { pathDirs: () => [shims.ensure()] };
     const adapters = options.adapters ?? {
       claude: CliAgentAdapter.claude({ runner: processRunner, clock, ...vuyroHook, ...pathDirs }),

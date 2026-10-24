@@ -107,7 +107,7 @@ export function restrictDirectoryToCurrentUser(path: string): ObjectSecurity {
   const userSid = getCurrentUserSid();
   if (!/^S-1-\d+(-\d+)+$/.test(userSid)) throw new Error(`Not a SID: ${userSid}`);
   const security = withFileHandle(path, (READ_CONTROL | WRITE_DAC) >>> 0, (handle) => setDaclOnHandle(handle, `D:P(A;OICI;FA;;;${userSid})`), FILE_FLAG_BACKUP_SEMANTICS);
-  if (!isCurrentUserOnly(security.sddl)) throw new Error(`Directory DACL was not restricted to the current user: ${path}`);
+  if (!isPrivateToCurrentUser(security)) throw new Error(`Directory is not the current user's alone (owner and DACL): ${path}`);
   return security;
 }
 
@@ -116,10 +116,14 @@ export function readDirectorySecurity(path: string): ObjectSecurity {
   return withFileHandle(path, READ_CONTROL, readSecurity, FILE_FLAG_BACKUP_SEMANTICS);
 }
 
-/** Whether a descriptor's DACL is protected and allows exactly the current user. */
-export function isCurrentUserOnly(sddl: string): boolean {
-  const trustees = allowedTrustees(sddl);
-  return trustees.length === 1 && trustees[0] === getCurrentUserSid() && sddl.includes('D:P');
+/**
+ * Whether the current user owns the object and its protected DACL allows exactly that user. The owner counts: an owner
+ * can always rewrite the DACL, so another user's object is not private however its DACL reads now.
+ */
+export function isPrivateToCurrentUser(security: ObjectSecurity): boolean {
+  const user = getCurrentUserSid();
+  const trustees = allowedTrustees(security.sddl);
+  return security.ownerSid === user && trustees.length === 1 && trustees[0] === user && security.sddl.includes('D:P');
 }
 
 /** Replaces the DACL through a handle that has WRITE_DAC and reads it back through the same handle. */
