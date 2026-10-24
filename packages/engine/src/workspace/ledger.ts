@@ -44,20 +44,26 @@ export interface EditRecord {
 
 /** Tickets remembered per path: the most recent ones. */
 const EDIT_HISTORY = 32;
+/** Paths remembered per space: the most recently edited ones (older edits can no longer be blamed). */
+export const EDIT_PATHS = 10_000;
 
 export const EMPTY_LEDGER: LedgerState = { entries: {}, known: {}, changed: {}, warned: {}, worktrees: {}, kept: {}, approved: {}, edits: {}, claimed: {} };
 
-function remember(
+export function remember(
   history: Readonly<Record<string, Readonly<Record<string, EditRecord>>>>,
   space: string,
   path: string,
   ticketId: string,
+  limit = EDIT_PATHS,
 ): Readonly<Record<string, Readonly<Record<string, EditRecord>>>> {
   const key = pathKey(path);
   const bySpace = history[space] ?? {};
   const previous = Object.hasOwn(bySpace, key) ? bySpace[key] : undefined;
   const tickets = [...(previous?.tickets ?? []).filter((id) => id !== ticketId), ticketId].slice(-EDIT_HISTORY);
-  return { ...history, [space]: { ...bySpace, [key]: { path, tickets } } };
+  // Most recent last (string keys keep their insertion order); the oldest paths go beyond the limit.
+  const kept = Object.entries(bySpace).filter(([name]) => name !== key);
+  const trimmed = kept.length >= limit ? kept.slice(kept.length - limit + 1) : kept;
+  return { ...history, [space]: Object.fromEntries([...trimmed, [key, { path, tickets }]]) };
 }
 
 /** What a `worktree.kept` record says, for recording it again only when it changes. */

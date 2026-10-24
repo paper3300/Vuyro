@@ -222,6 +222,15 @@ export const EVENT_CATALOG = {
     version: 1,
     schema: Type.Object({ projectId: IdSchema, ...ProjectWorkspaceFields }, strict),
   },
+  /**
+   * A shared node was defined in the project for the first time (M5). The project knows its shared nodes so that only
+   * one batch at a time builds its folder.
+   */
+  'project.sharedNodeAdded': {
+    aggregateType: 'project',
+    version: 1,
+    schema: Type.Object({ projectId: IdSchema, name: SharedNodeNameSchema }, strict),
+  },
   /** The app layer of the settings (replaced as a whole). */
   'app.configured': {
     aggregateType: 'settings',

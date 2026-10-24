@@ -21,6 +21,8 @@ export interface ProjectState {
   readonly baseRef?: string;
   readonly watch?: WatchSettings;
   readonly settings?: WorkspaceSettings;
+  /** Its shared nodes (M5), in the order they were defined. */
+  readonly sharedNodes?: readonly string[];
 }
 
 export const projectAggregate: AggregateDefinition<ProjectState> = {
@@ -28,6 +30,7 @@ export const projectAggregate: AggregateDefinition<ProjectState> = {
   initial: { exists: false, name: '' },
   evolve(state, event) {
     if (event.type === 'project.created') return { exists: true, name: event.data.name };
+    if (event.type === 'project.sharedNodeAdded') return { ...state, sharedNodes: [...(state.sharedNodes ?? []), event.data.name] };
     if (event.type !== 'project.configured') return state;
     // Absent = unchanged, null = cleared.
     const { data } = event;
@@ -42,6 +45,7 @@ export const projectAggregate: AggregateDefinition<ProjectState> = {
       ...(baseRef === undefined ? {} : { baseRef }),
       ...(watch === undefined ? {} : { watch }),
       ...(settings === undefined ? {} : { settings }),
+      ...(state.sharedNodes === undefined ? {} : { sharedNodes: state.sharedNodes }),
     };
   },
 };

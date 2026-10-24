@@ -41,7 +41,7 @@ export function scanErrors(output: string, root: string | undefined, caseInsensi
     const line = raw.trim().slice(0, MAX_LINE_LENGTH);
     lines.push(line);
     for (const match of line.matchAll(FILE_AT_LINE)) {
-      const path = workspacePath(match[1] ?? '', root, caseInsensitive);
+      const path = workspacePath(withFolder(line.slice(0, match.index), match[1] ?? ''), root, caseInsensitive);
       if (path === undefined) continue;
       const key = pathKey(path, caseInsensitive);
       const found = files.get(key);
@@ -53,6 +53,19 @@ export function scanErrors(output: string, root: string | undefined, caseInsensi
     }
   }
   return { lines, files: [...files.values()] };
+}
+
+/**
+ * A path with spaces (`D:\Other Project\src\a.cpp(3)`) matches only from after the last space (`src\a.cpp`): put the
+ * absolute folder in front of it again, so it is judged as the absolute path it is (and dropped when it is outside the
+ * project) rather than read as a relative path of the project.
+ */
+const ABSOLUTE_BEFORE = /(?:^|[\s"'=])((?:[A-Za-z]:[\\/]|\\\\|\/)[^"'<>|()\r\n]*\s)$/;
+
+function withFolder(before: string, token: string): string {
+  if (/^(?:[A-Za-z]:[\\/]|[\\/])/.test(token)) return token;
+  const folder = ABSOLUTE_BEFORE.exec(before)?.[1];
+  return folder === undefined ? token : `${folder}${token}`;
 }
 
 /** Explicit file names a script reported (`errorFiles` in its JSON result), as workspace paths. */

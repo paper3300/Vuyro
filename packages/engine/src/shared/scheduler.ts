@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { type ArtifactRef, type CommandResponse, type CommandType, type DomainEvent, type ExpressionContext, resolveTemplateValue } from '@vuyro/contracts';
 import { projectAggregate, type ProjectState } from '../commands/aggregates.ts';
 import type { CommandBus } from '../commands/command-bus.ts';
@@ -13,6 +13,7 @@ import { type CompiledNode, compileSharedNode } from '../workflow/compile.ts';
 import type { DefinitionResolver } from '../workflow/definitions.ts';
 import { resolveScript, type ScriptExit, startScript } from '../workflow/script-runner.ts';
 import { EMPTY_TICKET, evolveTicket, execution, type TicketWorkflow } from '../workflow/state.ts';
+import { CASE_INSENSITIVE, insideRoot, pathKey } from '../workspace/paths.ts';
 import { EMPTY_SHARED_NODE, evolveSharedNode, type RunningBatch, runningBatches, type SharedNodeState } from './state.ts';
 
 /**
@@ -105,17 +106,21 @@ export class SharedNodeScheduler {
     if (this.stopped) return;
     const released = new Set<string>();
     const resumed = new Set<string>();
+    const ended = new Set<string>();
     for (const event of events) {
       if (event.aggregateType === 'shared') this.touch(event.aggregateId);
+      // The project folder is free again: another shared node's requests may go.
+      if (event.type === 'sharedNode.batchFinished') ended.add(event.data.projectId);
       // Released paths may be what a waiting batch needs.
       else if (event.type === 'checkout.released') released.add(event.data.projectId);
       // A paused request that goes on keeps its place in the queue: it may complete a batch.
       else if (event.type === 'node.resumed') resumed.add(event.aggregateId);
     }
-    if (released.size === 0 && resumed.size === 0) return;
+    if (released.size === 0 && resumed.size === 0 && ended.size === 0) return;
     this.enqueue(async () => {
       const projects = new Map<string, (state: SharedNodeState) => boolean>();
-      for (const projectId of released) projects.set(projectId, (state) => state.waiting !== undefined);
+      for (const projectId of ended) projects.set(projectId, (state) => state.queue.length > 0);
+      for (const projectId of released) if (!projects.has(projectId)) projects.set(projectId, (state) => state.waiting !== undefined);
       for (const ticketId of resumed) {
         const row = await this.options.store.queryOne<{ project_id: string }>('SELECT project_id FROM p_tickets WHERE ticket_id = ?', [ticketId]);
         if (row !== undefined && !projects.has(row.project_id)) projects.set(row.project_id, (state) => state.queue.some((entry) => entry.ticketId === ticketId));
@@ -247,12 +252,18 @@ export class SharedNodeScheduler {
       await finish({ kind: 'script', exitCode: null, error: 'the program resolved to an empty string' });
       return;
     }
-    // A batch builds the project folder (shared mode): never the engine's own working directory.
-    if (project.root === undefined && invocation.cwd === undefined) {
+    // A batch builds the project folder (shared mode), the folder its protected paths are in: never the engine's own
+    // working directory, and a script's own `cwd` only inside the project folder.
+    if (project.root === undefined) {
       await finish({ kind: 'script', exitCode: null, error: "the project has no workspace folder to run the batch in (set it with 'vuyro project configure --root')" });
       return;
     }
-    const child = startScript(this.options.processRunner, this.options.clock, invocation, project.root);
+    const cwd = batchFolder(project.root, invocation.cwd);
+    if (cwd === undefined) {
+      await finish({ kind: 'script', exitCode: null, error: `the script's working folder '${invocation.cwd ?? ''}' is not inside the project folder` });
+      return;
+    }
+    const child = startScript(this.options.processRunner, this.options.clock, { program: invocation.program, args: invocation.args, env: invocation.env, timeoutMs: invocation.timeoutMs }, cwd);
     live.kill = () => {
       child.kill();
     };
@@ -337,6 +348,14 @@ export class SharedNodeScheduler {
     if (!response.ok) this.options.reportError(new Error(`${type}: ${response.error.code} ${response.error.message}`), `shared node step '${step}'`);
     return response;
   }
+}
+
+/** Where a batch runs: the project folder, or the script's own `cwd` when it is inside it (relative or absolute). */
+export function batchFolder(root: string, cwd: string | undefined, caseInsensitive = CASE_INSENSITIVE): string | undefined {
+  if (cwd === undefined || ['', '.', './', '.\\'].includes(cwd.trim())) return root;
+  if (pathKey(resolve(root, cwd), caseInsensitive) === pathKey(resolve(root), caseInsensitive)) return root;
+  const inside = insideRoot(root, cwd, caseInsensitive);
+  return inside === undefined ? undefined : join(root, ...inside.split('/'));
 }
 
 /** Deterministic: a step retried after a crash is the same command. */

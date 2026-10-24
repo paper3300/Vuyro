@@ -25,7 +25,7 @@ import { effectiveSettings, mergeSettings, nodeSettings } from '../workspace/set
 import { appSettingsAggregate, projectAggregate, sharedNodeAggregate, type TicketState, ticketAggregate, workspaceAggregate } from './aggregates.ts';
 import type { CommandHandler, HandlerContext, Loaded } from './handlers.ts';
 import { isFailure, openWorkflow, scriptOutput } from './workflow-handlers.ts';
-import { claimItems, decideClaims, servicesOf } from './workspace-handlers.ts';
+import { type ClaimItem, claimItems, decideClaims, servicesOf } from './workspace-handlers.ts';
 
 /**
  * Shared node commands (M5, [[명령·이벤트 계약]] §15, [[공유·권한·BlackBoard 설계]] §4).
@@ -96,10 +96,20 @@ function unsupported(spec: SharedNodeSpec): string[] {
   if (trigger.count === undefined && trigger.window === undefined && trigger.afterPrevious !== true) {
     warnings.push("no automatic trigger this version runs: batches start only when a person runs them ('sharedNode.run')");
   }
-  if (spec.onBatchFailure === 'ask' || spec.onBatchFailure === 'bisect' || spec.onBatchFailure === 'agent') {
-    warnings.push(`onBatchFailure '${spec.onBatchFailure}' is not supported yet: a failed batch is settled as 'allFail' (every ticket gets the failure)`);
-  }
+  if ((spec.protect ?? []).some((claim) => claim.ttl !== undefined)) warnings.push('protect ttl is ignored: a batch holds its protected paths until it ends');
   return warnings;
+}
+
+/** Parts of a spec this version refuses: they would run differently from what they say (D-047, D-054). */
+function refused(spec: SharedNodeSpec): { path: string; message: string }[] {
+  const issues: { path: string; message: string }[] = [];
+  if (spec.onBatchFailure === 'ask' || spec.onBatchFailure === 'bisect' || spec.onBatchFailure === 'agent') {
+    issues.push({ path: '/spec/onBatchFailure', message: `'${spec.onBatchFailure}' is not supported yet (use 'blame' or 'allFail')` });
+  }
+  if (spec.maxConcurrent > 1) {
+    issues.push({ path: '/spec/maxConcurrent', message: 'batches build the shared project folder: only one runs at a time (more needs worktree integration, after MVP)' });
+  }
+  return issues;
 }
 
 function sameJson(a: unknown, b: unknown): boolean {
@@ -114,6 +124,8 @@ export const sharedNodeDefine: CommandHandler<'sharedNode.define', SharedNodeSta
     const project = await ctx.load(projectAggregate, payload.projectId);
     if (!project.state.exists) return fail('not_found', `project ${payload.projectId} does not exist`);
     const { spec } = payload;
+    const issues = refused(spec);
+    if (issues.length > 0) return fail('validation_failed', `shared node '${spec.name}' asks for what this version does not do`, { issues });
     if (ctx.definitions === undefined) return fail('invariant_violated', 'this engine has no definition store');
     let pinned;
     try {
@@ -132,9 +144,15 @@ export const sharedNodeDefine: CommandHandler<'sharedNode.define', SharedNodeSta
       return { ok: true, appends: [], result: { name: spec.name, version: shared.state.version, warnings } };
     }
     const version = shared.state.version + 1;
+    const known = (project.state.sharedNodes ?? []).includes(spec.name);
     return {
       ok: true,
-      appends: [sharedStream(shared, [{ type: 'sharedNode.defined', data: { projectId: payload.projectId, name: spec.name, version, spec, nodeType } }])],
+      appends: [
+        sharedStream(shared, [{ type: 'sharedNode.defined', data: { projectId: payload.projectId, name: spec.name, version, spec, nodeType } }]),
+        ...(known
+          ? []
+          : [{ aggregateType: 'project', aggregateId: project.aggregateId, expectedRevision: project.revision, events: [{ type: 'project.sharedNodeAdded', data: { projectId: payload.projectId, name: spec.name } }] } satisfies StreamAppend]),
+      ],
       result: { name: spec.name, version, warnings },
     };
   },
@@ -260,6 +278,16 @@ async function startBatch(ctx: HandlerContext, shared: Loaded<SharedNodeState>, 
   const { spec } = definition;
   const running = runningBatches(state).length;
   if (running >= spec.maxConcurrent) return manual ? fail('invariant_violated', `${running} batch(es) running (maxConcurrent ${spec.maxConcurrent})`) : notStarted('a batch is running');
+  // Shared mode: every shared node of the project builds the same folder, so only one batch runs there at a time.
+  const project = await ctx.load(projectAggregate, state.projectId);
+  for (const other of project.state.sharedNodes ?? []) {
+    if (other === state.name) continue;
+    const busy = runningBatches((await ctx.load(sharedNodeAggregate, sharedNodeAggregateId(state.projectId, other))).state)[0];
+    if (busy !== undefined) {
+      const reason = `batch ${busy.batchId} of shared node '${other}' is building the project folder`;
+      return manual ? fail('invariant_violated', reason) : notStarted(reason);
+    }
+  }
 
   // Requests whose execution ended or was replaced leave the queue; paused ones keep their place but wait.
   const dropped: Holder[] = [];
@@ -297,10 +325,18 @@ async function startBatch(ctx: HandlerContext, shared: Loaded<SharedNodeState>, 
   let entries: readonly string[] = [];
   let overlaps: readonly { path: string; entryId: string; entryPath: string; holder: Holder }[] = [];
 
-  // Protect the sources while the batch runs (§4.3): shared claims, held by every member.
-  const items = claimItems(spec.protect ?? []);
-  if (isFailure(items)) return items;
-  const project = await ctx.load(projectAggregate, state.projectId);
+  // Protect the sources while the batch runs (§4.3): shared claims, held by every member until the batch ends (a ttl
+  // would let them lapse in the middle of a long build).
+  const claimed = claimItems(spec.protect ?? []);
+  if (isFailure(claimed)) return claimed;
+  const items = claimed.map((item): ClaimItem => ({
+    path: item.path,
+    mode: item.mode,
+    kind: item.kind,
+    release: item.release,
+    ...(item.onConflict === undefined ? {} : { onConflict: item.onConflict }),
+    ...(item.pauseMode === undefined ? {} : { pauseMode: item.pauseMode }),
+  }));
   const first = members[0];
   if (items.length > 0 && project.state.root !== undefined && first !== undefined) {
     const app = await ctx.load(appSettingsAggregate, APP_SETTINGS_AGGREGATE_ID);

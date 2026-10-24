@@ -134,12 +134,10 @@ describe('shared node guards', { timeout: 30_000 }, () => {
   it('the commands themselves refuse to start a batch while one runs or the node is blocked (the scheduler checks the same first)', async () => {
     await open(undefined, true);
     await defineShared(h, projectId, buildSpec({ batchTrigger: { count: 1 } }));
-    await saveQuickFlow(h, 'build2', 'myteam/quick-flow-2');
-    await defineShared(h, projectId, buildSpec({ name: 'build2', batchTrigger: { afterPrevious: true }, maxConcurrent: 2 }));
     const a = await startTicket(h, projectId, 'A', {}, 'myteam/quick-flow');
     const b = await startTicket(h, projectId, 'B', {}, 'myteam/quick-flow');
-    const start = async (shared = 'build') => {
-      const response = await h.exec('sharedNode.start', { projectId, name: shared }, SYSTEM);
+    const start = async () => {
+      const response = await h.exec('sharedNode.start', { projectId, name: 'build' }, SYSTEM);
       expectOk(response);
       return (response as { result: { started: boolean; batch?: number; reason?: string } }).result;
     };
@@ -147,8 +145,8 @@ describe('shared node guards', { timeout: 30_000 }, () => {
       const response = await h.exec('sharedNode.run', { projectId, name: 'build' });
       return response.ok ? `started ${String((response.result as { batch?: number }).batch)}` : response.error.message;
     };
-    const enqueue = async (ticketId: string, shared = 'build') => {
-      expectOk(await h.exec('sharedNode.enqueue', { projectId, name: shared, ticketId, nodeId: 'build', lane: 'main', run: 1 }, SYSTEM));
+    const enqueue = async (ticketId: string) => {
+      expectOk(await h.exec('sharedNode.enqueue', { projectId, name: 'build', ticketId, nodeId: 'build', lane: 'main', run: 1 }, SYSTEM));
     };
     await enqueue(a);
     expect(await start()).toMatchObject({ started: true, batch: 1 });
@@ -162,13 +160,6 @@ describe('shared node guards', { timeout: 30_000 }, () => {
     expect(await start()).toMatchObject({ started: true, batch: 2, reason: 'retry' });
     expect((await sharedState(h, projectId)).running[2]?.members.map((member) => member.ticketId)).toEqual([a, b]);
 
-    // afterPrevious waits for the previous batch even when there is room for two.
-    const c = await startTicket(h, projectId, 'C', {}, 'myteam/quick-flow-2');
-    const d = await startTicket(h, projectId, 'D', {}, 'myteam/quick-flow-2');
-    await enqueue(c, 'build2');
-    expect(await start('build2')).toMatchObject({ started: true, reason: 'afterPrevious' });
-    await enqueue(d, 'build2');
-    expect(await start('build2')).toMatchObject({ started: false });
   });
 
   it('never runs more batches at once than maxConcurrent: requests that come during a batch wait for it', async () => {
@@ -261,6 +252,109 @@ describe('shared node guards', { timeout: 30_000 }, () => {
     const started = await h.store.query<{ data: string }>("SELECT data FROM events WHERE type = 'sharedNode.batchStarted'");
     expect((JSON.parse(started[0]?.data ?? '{}') as { overlaps?: { path: string }[] }).overlaps?.map((overlap) => overlap.path)).toEqual(['src/**']);
     expect((await h.ticket(a)).status).toBe('done');
+  });
+
+  it('two shared nodes of one project never build its folder at the same time: the second waits for the first', async () => {
+    await open();
+    await saveQuickFlow(h, 'test', 'myteam/test-flow');
+    await defineShared(h, projectId, buildSpec({ batchTrigger: { count: 1 } }));
+    await defineShared(h, projectId, buildSpec({ name: 'test', node: { type: 'vuyro.script', version: 1, params: { program: 'test-tool' } }, batchTrigger: { count: 1 } }));
+    enqueueBuild(h, buildPasses());
+    enqueueBuild(h, buildPasses(), 'test-tool');
+    const a = await startTicket(h, projectId, 'A', {}, 'myteam/quick-flow');
+    const b = await startTicket(h, projectId, 'B', {}, 'myteam/test-flow');
+    await h.drive();
+    const rows = await h.store.query<{ type: string; timestamp: number }>("SELECT type, timestamp FROM events WHERE type IN ('sharedNode.batchStarted', 'sharedNode.batchFinished') ORDER BY sequence");
+    expect(rows.map((row) => row.type)).toEqual(['sharedNode.batchStarted', 'sharedNode.batchFinished', 'sharedNode.batchStarted', 'sharedNode.batchFinished']);
+    expect(rows[2]?.timestamp).toBeGreaterThanOrEqual(rows[1]?.timestamp ?? Number.MAX_SAFE_INTEGER);
+    expect(h.processes.spawned.map((spawn) => spawn.spec.command)).toEqual(['build-tool', 'test-tool']);
+    expect((await h.ticket(a)).status).toBe('done');
+    expect((await h.ticket(b)).status).toBe('done');
+  });
+
+  it("a person's run waits for another shared node's batch in the same folder", async () => {
+    await open(undefined, true);
+    await saveQuickFlow(h, 'test', 'myteam/test-flow');
+    await defineShared(h, projectId, buildSpec({ batchTrigger: { manual: true } }));
+    await defineShared(h, projectId, buildSpec({ name: 'test', batchTrigger: { manual: true } }));
+    const a = await startTicket(h, projectId, 'A', {}, 'myteam/quick-flow');
+    const b = await startTicket(h, projectId, 'B', {}, 'myteam/test-flow');
+    for (const [ticketId, name] of [[a, 'build'], [b, 'test']] as const) {
+      expectOk(await h.exec('sharedNode.enqueue', { projectId, name, ticketId, nodeId: 'build', lane: 'main', run: 1 }, SYSTEM));
+    }
+    expect((await h.ok('sharedNode.run', { projectId, name: 'build' })).result).toMatchObject({ started: true });
+    const refused = await h.exec('sharedNode.run', { projectId, name: 'test' });
+    expect(refused.ok ? 'started' : refused.error.message).toMatch(/batch build-1 of shared node 'build' is building the project folder/);
+    expectOk(await h.exec('sharedNode.finish', { projectId, name: 'build', batch: 1, result: { kind: 'script', exitCode: 0 } }, SYSTEM));
+    expect((await h.ok('sharedNode.run', { projectId, name: 'test' })).result).toMatchObject({ started: true });
+  });
+
+  it("runs the batch in the project folder; a script's own working folder only inside it", async () => {
+    await open();
+    await save(h, {
+      vuyro: 'export',
+      formatVersion: 1,
+      kind: 'nodeType',
+      id: 'myteam.build',
+      version: 1,
+      name: 'Build',
+      content: {
+        type: 'myteam.build',
+        version: 1,
+        label: 'Build',
+        completion: 'script',
+        inputs: [{ name: 'in', label: 'In' }],
+        outputs: [
+          { name: 'done', label: 'Done' },
+          { name: 'error', label: 'Error' },
+        ],
+        params: [{ name: 'dir', label: 'Folder', required: true, schema: { type: 'string' } }],
+        script: { program: 'build-tool', cwd: '{{ params.dir }}' },
+      },
+    });
+    const cases: [string, string | undefined][] = [
+      ['sub', join(root, 'sub')],
+      [join(root, 'sub'), join(root, 'sub')],
+      ['.', root],
+      ['..', undefined],
+      [join(h.dir, 'elsewhere'), undefined],
+    ];
+    const results: (string | undefined)[] = [];
+    for (const [index, [dir]] of cases.entries()) {
+      const name = `b${String(index)}`;
+      await saveQuickFlow(h, name, `myteam/flow-${String(index)}`);
+      await defineShared(h, projectId, buildSpec({ name, node: { type: 'myteam.build', version: 1, params: { dir } }, batchTrigger: { count: 1 } }));
+      enqueueBuild(h, buildPasses());
+      const spawned = h.processes.spawned.length;
+      const ticketId = await startTicket(h, projectId, `T${String(index)}`, {}, `myteam/flow-${String(index)}`);
+      await h.drive();
+      results.push(h.processes.spawned.length > spawned ? h.processes.spawned.at(-1)?.spec.cwd : undefined);
+      const port = currentExecution(await h.ticket(ticketId), 'build', 'main')?.output?.port;
+      expect(port, dir).toBe(cases[index]?.[1] === undefined ? 'error' : 'done');
+    }
+    expect(results).toEqual(cases.map(([, cwd]) => cwd));
+    const outside = currentExecution(await h.ticket((await h.store.query<{ ticket_id: string }>("SELECT ticket_id FROM p_tickets WHERE title = 'T4'"))[0]?.ticket_id ?? ''), 'build', 'main');
+    expect((outside?.output?.items[0]?.data as { error: string }).error).toMatch(/not inside the project folder/);
+  });
+
+  it('a batch holds its protected paths until it ends, whatever ttl the spec gives them', async () => {
+    await open();
+    const defined = await defineShared(h, projectId, buildSpec({ batchTrigger: { count: 1 }, protect: [{ path: 'src/**', mode: 'shared', ttl: '1m' }] }));
+    expect(defined.warnings.join('\n')).toMatch(/protect ttl is ignored/);
+    const seen: number[] = [];
+    enqueueBuild(h, [
+      { ...during(h, async () => {
+        const ledger = await h.store.query<{ entry_id: string }>('SELECT entry_id FROM p_checkouts WHERE project_id = ?', [projectId]);
+        seen.push(ledger.length);
+      }), delayMs: 3 * MINUTE },
+      ...buildPasses(),
+    ]);
+    await startTicket(h, projectId, 'A', {}, 'myteam/quick-flow');
+    await h.drive();
+    expect(seen).toEqual([1]);
+    expect(await h.store.query("SELECT 1 FROM events WHERE type = 'checkout.released' AND data LIKE '%expired%'")).toEqual([]);
+    const acquired = await h.store.query<{ data: string }>("SELECT data FROM events WHERE type = 'checkout.acquired'");
+    expect(acquired.map((row) => (JSON.parse(row.data) as { entries: { expiresAt?: number }[] }).entries.map((entry) => entry.expiresAt ?? 'none'))).toEqual([['none']]);
   });
 
   it('a batch is never run twice by one engine, even when not even its interruption can be recorded', async () => {

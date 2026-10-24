@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { CheckoutEntry, Holder } from '@vuyro/contracts';
 import { blameMembers, reportedFiles, scanErrors } from '../src/shared/blame.ts';
-import { EMPTY_LEDGER, evolveLedger, type LedgerState } from '../src/workspace/ledger.ts';
+import { EMPTY_LEDGER, evolveLedger, type LedgerState, remember } from '../src/workspace/ledger.ts';
 
 /** `blame` (M5, [[공유·권한·BlackBoard 설계]] §4.5): which files a failed batch's errors name, and whose they are. */
 
@@ -61,6 +61,17 @@ describe('error lines', () => {
     expect(scan.lines.some((line) => line.startsWith('warning'))).toBe(false);
   });
 
+  it('reads paths with spaces as the absolute paths they are: outside the project they are dropped, inside they count', () => {
+    const win = process.platform === 'win32';
+    const spaced = win ? 'C:\\work\\my game' : '/work/my game';
+    const other = win ? 'D:\\Other Project\\src\\a.cpp' : '/other place/src/a.cpp';
+    const inside = win ? `${spaced}\\src\\a.cpp` : `${spaced}/src/a.cpp`;
+    const scan = scanErrors([`${other}(3): error C2065: x`, `${inside}(4): error C2065: y`, `"${other}"(5): error: z`].join('\n'), spaced, true);
+    expect(scan.files.map((file) => file.path)).toEqual(['src/a.cpp']);
+    expect(scan.files[0]?.lines).toEqual([`${inside}(4): error C2065: y`]);
+    expect(scan.lines).toHaveLength(3);
+  });
+
   it('takes the files a script reported itself, as workspace paths', () => {
     expect(reportedFiles(['src/a.c', abs('src/b.c'), '../escape.c', 'src/a.c', 'src\\c.c'], ROOT, true)).toEqual(['src/a.c', 'src/b.c', 'src/c.c']);
   });
@@ -92,6 +103,13 @@ describe('blame', () => {
     const blame = blameMembers(ledger, 'root', ['Source/UI/Menu.cpp'], [member(T1), member(T2), member(T3)]);
     expect(blame.blamed).toEqual([member(T1)]);
     expect(blame.evidence).toBe('claim');
+  });
+
+  it('keeps the most recently edited paths only (bounded history)', () => {
+    let history = {};
+    for (const path of ['a', 'b', 'c', 'a', 'd']) history = remember(history, 'root', `src/${path}.c`, T1, 3);
+    // 'a' was edited again, so 'b' is the oldest and goes.
+    expect(Object.values((history as Record<string, Record<string, { path: string }>>).root ?? {}).map((record) => record.path)).toEqual(['src/c.c', 'src/a.c', 'src/d.c']);
   });
 
   it('remembers edits found afterwards (changes attributed to a checkout) and finds nobody for untouched files', () => {

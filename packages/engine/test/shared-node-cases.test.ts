@@ -181,16 +181,16 @@ describe('shared nodes', { timeout: 30_000 }, () => {
       expect(data).toMatchObject({ blamedBy: 'none' });
     });
 
-    it("a declared 'ask' policy is accepted with a warning and settled as allFail", async () => {
+    it('refuses what would run differently from what it says: unsupported failure policies, more than one batch at a time', async () => {
       await open();
-      const defined = await defineShared(h, projectId, buildSpec({ onBatchFailure: 'ask', batchTrigger: { count: 1 } }));
-      expect(defined.warnings.join('\n')).toMatch(/'ask' is not supported yet/);
-      h.setBehavior(devAgents(h, { A: [edits('src/a.c')] }));
-      enqueueBuild(h, buildFails('src/a.c(1): error: x'));
-      enqueueBuild(h, buildPasses());
-      await ticket('A');
-      await h.drive();
-      expect((await sharedState(h, projectId)).recent.map((batch) => batch.policy ?? batch.outcome)).toEqual(['allFail', 'succeeded']);
+      for (const onBatchFailure of ['ask', 'bisect', 'agent'] as const) {
+        const refused = failure(await h.exec('sharedNode.define', { projectId, spec: buildSpec({ onBatchFailure }) }));
+        expect(refused.code, onBatchFailure).toBe('validation_failed');
+        expect(JSON.stringify(refused.details), onBatchFailure).toMatch(/is not supported yet/);
+      }
+      const concurrent = failure(await h.exec('sharedNode.define', { projectId, spec: buildSpec({ maxConcurrent: 2 }) }));
+      expect(JSON.stringify(concurrent.details)).toMatch(/only one runs at a time/);
+      expect((await sharedState(h, projectId)).exists).toBe(false);
     });
 
     it('a person can unblock a node blocked by a blamed ticket: the waiting tickets build without it, and the blamed ticket raised its priority', async () => {
@@ -470,7 +470,7 @@ describe('shared nodes', { timeout: 30_000 }, () => {
 
       expect((await defineShared(h, projectId)).version).toBe(1);
       expect((await defineShared(h, projectId)).version).toBe(1);
-      expect((await defineShared(h, projectId, buildSpec({ maxConcurrent: 2 }))).version).toBe(2);
+      expect((await defineShared(h, projectId, buildSpec({ label: 'Build machine' }))).version).toBe(2);
       const rows = await h.store.query<{ name: string; version: number }>('SELECT name, version FROM p_shared_nodes WHERE aggregate_id = ?', [sharedNodeAggregateId(projectId, 'build')]);
       expect(rows).toEqual([{ name: 'build', version: 2 }]);
     });
