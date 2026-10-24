@@ -840,7 +840,7 @@ export class WorkspaceCoordinator {
   private async resumeWaiting(projectId: string): Promise<void> {
     const ledger = await this.ledger(projectId);
     const holds = await this.holdingView(ledger);
-    const waiting: { ticketId: string; exec: Execution; priority: number }[] = [];
+    const waiting: { ticketId: string; exec: Execution; priority: number; revision: number }[] = [];
     for (const ticketId of await this.openTickets(projectId)) {
       const state = await this.ticket(ticketId);
       for (const [nodeId, progress] of Object.entries(state.nodes)) {
@@ -851,15 +851,16 @@ export class WorkspaceCoordinator {
             const entry = ledger.entries[conflict.entryId];
             return entry !== undefined && holds(entry) !== 'gone';
           });
-          if (!stillHeld) waiting.push({ ticketId, exec, priority: state.priority });
+          if (!stillHeld) waiting.push({ ticketId, exec, priority: state.priority, revision: this.tickets.get(ticketId)?.revision ?? 0 });
         }
       }
     }
     waiting.sort((a, b) => b.priority - a.priority);
-    for (const { ticketId, exec } of waiting) {
+    for (const { ticketId, exec, revision } of waiting) {
       const response = await this.options.bus.execute(
         {
-          requestId: requestId('resume', ticketId, exec.nodeId, exec.lane, exec.run, JSON.stringify(exec.claimWait?.conflicts.map((conflict) => conflict.entryId))),
+          // The ticket revision makes every pause its own request (a lane may wait for a claim more than once).
+          requestId: requestId('resume', ticketId, exec.nodeId, exec.lane, exec.run, revision),
           type: 'node.resume',
           payload: { ticketId, nodeId: exec.nodeId, lane: exec.lane },
         },

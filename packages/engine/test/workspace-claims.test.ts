@@ -93,6 +93,8 @@ describe('claims and their conflict policies', () => {
     expect(order.slice(0, 6)).toEqual(['node.started:a', 'node.paused:b', 'node.completed:a', 'node.resumed:b', 'node.started:b', 'node.completed:b']);
     const resumed = events.find((event) => event.type === 'node.resumed');
     expect(resumed?.actor).toEqual({ kind: 'system', component: 'workspace' });
+    // The engine resumed it because the paths are free: no override, its start checks the claims again.
+    expect(resumed?.data).not.toHaveProperty('override');
     expect(await heldPaths(h, projectId)).toEqual([]);
     const released = (await ledgerEvents(h, projectId)).filter((event) => event.type === 'checkout.released').map((event) => (event.data as { reason: string }).reason);
     expect(released).toEqual(['nodeDone', 'nodeDone']);
@@ -248,6 +250,21 @@ describe('claims and their conflict policies', () => {
     expect((await h.ticket(high)).status).toBe('done');
   });
 
+  it('priorityWins never lets a lower or equal priority take paths over', async () => {
+    await open(working({ a: 10 }));
+    await save(h, editorType('test.editor', [{ path: 'src/**', mode: 'exclusive', pauseMode: 'immediate' }]));
+    await save(h, template('myteam/one', [{ id: 'a', type: 'test.editor', version: 1 }, { id: 'end', type: 'vuyro.end', version: 1 }], [edge('a', 'done', 'end')], { onConflict: 'priorityWins' }));
+    const projectId = await projectAt(h, root);
+    const high = await ticketIn(h, projectId, 'myteam/one', { priority: 5 });
+    await h.activity.idle();
+    const low = await ticketIn(h, projectId, 'myteam/one', { priority: 1 });
+    const same = await ticketIn(h, projectId, 'myteam/one', { priority: 5 });
+    await h.activity.idle();
+    expect([await h.status(high, 'a'), await h.status(low, 'a'), await h.status(same, 'a')]).toEqual(['running', 'paused', 'paused']);
+    await h.drive();
+    for (const ticketId of [high, low, same]) expect((await h.ticket(ticketId)).status).toBe('done');
+  });
+
   it('ticketDone claims outlive their node: later nodes of the same ticket go ahead, other tickets wait for the ticket', async () => {
     await open(working({ a: 10, c: 10 }));
     await save(h, editorType('test.keeper', [{ path: 'src/**', mode: 'exclusive', release: 'ticketDone' }]));
@@ -349,6 +366,77 @@ describe('claims and their conflict policies', () => {
     expect(configured.ok ? 'ok' : configured.error.code).toBe('forbidden');
     const recorded = await h.exec('workspace.record', { projectId, op: 'release', ids: ['01900000-0000-7000-8000-000000000000'], reason: 'manual' }, HUMAN);
     expect(recorded.ok ? 'ok' : recorded.error.code).toBe('forbidden');
+  });
+
+  it("an agent's release lets go of its checkouts, never of its node's claims", async () => {
+    let released: unknown;
+    await open(async (s) => {
+      const response = await s.vuyro('checkout.release', { ticketId: s.request.ticketId, nodeId: s.request.nodeId });
+      released = response.ok ? response.result : response.error.code;
+      await s.sleep(MINUTE);
+      expectOk(await s.vuyro('node.done', { ticketId: s.request.ticketId, nodeId: s.request.nodeId, port: 'done' }));
+      return undefined;
+    });
+    await save(h, editorType('test.editor', [{ path: 'src/**', mode: 'exclusive' }]));
+    await save(h, template('myteam/one', [{ id: 'a', type: 'test.editor', version: 1 }, { id: 'end', type: 'vuyro.end', version: 1 }], [edge('a', 'done', 'end')]));
+    const projectId = await projectAt(h, root);
+    await ticketIn(h, projectId, 'myteam/one');
+    await h.activity.idle();
+    expect(released).toEqual({ released: 0 });
+    expect(await heldPaths(h, projectId)).toEqual(['a:src/**']);
+    await h.drive();
+  });
+
+  it('an entry of an execution that ended blocks nothing, even before the engine records its release', async () => {
+    // No engine: nothing releases entries after the fact; the decision itself must see that the holder ended.
+    h = await openWorkflowHarness({ noEngine: true });
+    root = join(h.dir, 'ws');
+    mkdirSync(root, { recursive: true });
+    await save(h, {
+      vuyro: 'export',
+      formatVersion: 1,
+      kind: 'nodeType',
+      id: 'test.build',
+      version: 1,
+      name: 'Build',
+      content: {
+        type: 'test.build',
+        version: 1,
+        label: 'Build',
+        completion: 'script',
+        inputs: [{ name: 'in', label: 'In' }],
+        outputs: [
+          { name: 'done', label: 'Done' },
+          { name: 'error', label: 'Error' },
+        ],
+        params: [],
+        script: { program: 'build' },
+        claims: [{ path: 'src/**', mode: 'exclusive' }],
+      },
+    });
+    await save(
+      h,
+      template(
+        'myteam/builds',
+        [
+          { id: 'a', type: 'test.build', version: 1 },
+          { id: 'b', type: 'test.build', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [edge('a', 'done', 'end'), edge('b', 'done', 'end')],
+      ),
+    );
+    const projectId = await projectAt(h, root);
+    const ticketId = await ticketIn(h, projectId, 'myteam/builds');
+    const system = { kind: 'internal', component: 'workflow' } as const;
+    const start = (nodeId: string) => h.ok('node.start', { ticketId, nodeId, lane: 'main', run: 1, attempt: 1 }, system);
+    expect((await start('a')).result).toEqual({});
+    expect((await start('b')).result).toEqual({ blocked: 'wait' });
+    await h.ok('node.finish', { ticketId, nodeId: 'a', lane: 'main', run: 1, attempt: 1, result: { kind: 'script', exitCode: 0 } }, system);
+    // a's entry is still in the ledger (nobody released it), but a has ended.
+    expect(await heldPaths(h, projectId)).toEqual(['a:src/**']);
+    await h.ok('node.resume', { ticketId, nodeId: 'b' }, system);
+    expect((await start('b')).result).toEqual({});
   });
 
   it('a ticket pins the app and project settings it was created with', async () => {

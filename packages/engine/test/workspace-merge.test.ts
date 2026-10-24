@@ -119,6 +119,21 @@ describe('merge conflicts at the join', { timeout: 120_000 }, () => {
     expect(currentExecution(await h.ticket(ticketId), 'join', 'main')?.merge).not.toHaveProperty('resolvedBy');
   });
 
+  it('agent: staging a file that still has conflict markers is not a resolution', async () => {
+    t = await startParallel({
+      settings: { workspaceMode: 'worktree', onMergeConflict: 'agent' },
+      dev: CONFLICTING,
+      resolver: (s) => {
+        git(s.request.cwd ?? '', 'add', 'src/app.txt');
+      },
+    });
+    const { h, ticketId } = t;
+    await h.drive();
+    expect(await h.status(ticketId, 'join')).toBe('review');
+    expect(currentExecution(await h.ticket(ticketId), 'join', 'main')?.merge).toEqual(expect.objectContaining({ conflicts: [{ branch: `vuyro/${ticketId}/dev-2`, files: ['src/app.txt'] }] }));
+    expect(currentExecution(await h.ticket(ticketId), 'join', 'main')?.merge).not.toHaveProperty('resolvedBy');
+  });
+
   it('a person hands a held merge to an agent by rejecting it with instructions', async () => {
     let instructions = '';
     t = await startParallel({

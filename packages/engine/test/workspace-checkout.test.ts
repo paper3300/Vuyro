@@ -3,7 +3,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { type DomainEvent, workspaceAggregateId } from '@vuyro/contracts';
 import { EngineQueries } from '../src/daemon/queries.ts';
-import type { ScriptedBehavior, ScriptedSession } from '../src/workflow/scripted-agent.ts';
+import { parcelWatcher } from '../src/workspace/watcher.ts';
+import { type ScriptedBehavior, ScriptedAgentAdapter, type ScriptedSession } from '../src/workflow/scripted-agent.ts';
 import { currentExecution } from '../src/workflow/state.ts';
 import { CLI } from './helpers/engine-harness.ts';
 import { openWorkflowHarness, SYSTEM, type WorkflowHarness } from './helpers/workflow-harness.ts';
@@ -436,6 +437,79 @@ describe('checkouts before edits and changes found afterwards', () => {
     expect(h.adapter.started.slice(2).map((request) => request.checkoutHook)).toEqual([undefined, undefined]);
   });
 
+  it('leaves the hook out of a Codex run when the workspace has Codex hooks of its own, and says so on the run', async () => {
+    let codex: ScriptedAgentAdapter | undefined;
+    h = await openWorkflowHarness({
+      adapters: ({ clock, bus }) => {
+        codex = new ScriptedAgentAdapter({ provider: 'codex', clock, bus, behavior: (s) => done(s).then(() => undefined) });
+        return { codex };
+      },
+    });
+    repo = gitRepo(join(h.dir, 'repo'));
+    await save(
+      h,
+      template('myteam/codex', [{ id: 'a', type: 'vuyro.agent', version: 1, params: { instructions: 'a', provider: 'codex' } }, { id: 'end', type: 'vuyro.end', version: 1 }], [edge('a', 'done', 'end')]),
+    );
+    const projectId = await projectAt(h, repo);
+    await ticketIn(h, projectId, 'myteam/codex');
+    await h.drive();
+    mkdirSync(join(repo, '.codex'));
+    writeFileSync(join(repo, '.codex', 'hooks.json'), '{"PreToolUse": []}\n');
+    await ticketIn(h, projectId, 'myteam/codex');
+    await h.drive();
+    expect(codex?.started.map((request) => request.checkoutHook)).toEqual([true, undefined]);
+    const warnings = await h.store.query<{ message: string }>("SELECT json_extract(data, '$.message') AS message FROM events WHERE type = 'run.warningRecorded'");
+    expect(warnings.map((row) => row.message)).toEqual([expect.stringContaining('the workspace has its own Codex hooks')]);
+  });
+
+  it('an agent may not name another lane of its node, and a replaced run may not check out', async () => {
+    const answers: string[] = [];
+    await open({
+      a: [async (s) => done(s)],
+      b: [async (s) => done(s)],
+      work: [
+        async (s) => {
+          if (s.request.lane === '1') {
+            const response = await s.vuyro('checkout.acquire', { ticketId: s.request.ticketId, nodeId: 'work', lane: '2', paths: ['src/app.txt'] });
+            answers.push(`lane:${response.ok ? 'ok' : response.error.code}`);
+          }
+          await done(s);
+        },
+      ],
+      slow: [
+        async (s) => {
+          // Replaced by newer input while it runs: its run is cancelled, and its call comes in before the run settles.
+          await s.sleep(60 * MINUTE);
+          const response = await s.vuyro('checkout.acquire', { ticketId: s.request.ticketId, nodeId: 'slow', paths: ['src/app.txt'] });
+          answers.push(`replaced:${response.ok ? 'ok' : response.error.code}`);
+          return 'cancelled';
+        },
+        async (s) => done(s),
+      ],
+    });
+    await save(
+      h,
+      template(
+        'myteam/lanes',
+        [
+          { id: 'one', type: 'vuyro.human-task', version: 1 },
+          { id: 'two', type: 'vuyro.human-task', version: 1 },
+          { id: 'work', type: 'vuyro.agent', version: 1, params: { instructions: 'w' }, ports: { in: { mode: 'each' } } },
+          { id: 'slow', type: 'vuyro.agent', version: 1, params: { instructions: 's' } },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [edge('one', 'done', 'work'), edge('one', 'done', 'slow'), edge('two', 'done', 'slow'), edge('work', 'done', 'end'), edge('slow', 'done', 'end')],
+      ),
+    );
+    const projectId = await projectAt(h, repo);
+    const ticketId = await ticketIn(h, projectId, 'myteam/lanes');
+    await h.ok('node.done', { ticketId, nodeId: 'one', port: 'done', items: [{ data: { n: 1 } }, { data: { n: 2 } }] });
+    await h.activity.idle();
+    await h.ok('node.done', { ticketId, nodeId: 'two', port: 'done' });
+    await h.drive();
+    expect(answers.sort()).toEqual(['lane:out_of_scope', 'replaced:invariant_violated']);
+  });
+
   it('records the release of what a node checked out when it ends, and an agent may release its own checkouts early', async () => {
     let released: unknown;
     await open({
@@ -479,5 +553,35 @@ describe('checkouts before edits and changes found afterwards', () => {
     await h.drive();
     expect((await changes(h, projectId)).map((change) => `${change.attribution}:${change.path}`)).toEqual(['checkout:notes.txt']);
     rmSync(plain, { recursive: true, force: true });
+  });
+
+  it('the file watcher finds a change while an agent runs, before it ends', async () => {
+    h = await openWorkflowHarness({
+      behavior: script({
+        a: [
+          async (s) => {
+            await s.sleep(30 * MINUTE);
+            await done(s);
+          },
+        ],
+        b: [async (s) => done(s)],
+      }),
+      watcher: parcelWatcher(),
+    });
+    repo = gitRepo(join(h.dir, 'repo'));
+    await twoAgents(h);
+    const projectId = await projectAt(h, repo);
+    await ticketIn(h, projectId, 'myteam/pair');
+    await h.activity.idle();
+    // Real time: the watcher subscribes, then sees the edit; the scan waits a (virtual) second for more events.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    writeFileSync(join(repo, 'README.md'), '# edited while a runs\n');
+    for (let attempt = 0; attempt < 100 && (h.clock.nextDueAt() ?? Infinity) > h.clock.now() + 1000; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    await h.clock.advance(1000);
+    await h.activity.idle();
+    expect(await changes(h, projectId)).toEqual([{ path: 'README.md', attribution: 'unattributed', node: null, scan: 'watch', suspects: ['a'] }]);
+    await h.drive();
   });
 });

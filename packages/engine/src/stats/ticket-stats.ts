@@ -72,10 +72,11 @@ export function computeTicketStats(input: TicketStatsInput): TicketStats {
     return found;
   };
   // An executor node is one the template says runs an agent or script; without the template, one that ever started.
+  // A join that merged worktree branches ran the engine's merge step (M4): it counts as an executor too.
   const startedNodes = new Set(input.ticketEvents.filter((event) => event.type === 'node.started').map((event) => (event.data as { nodeId: string }).nodeId));
   const isExecutor = (nodeId: string): boolean => {
     const kind = input.nodeKinds?.[nodeId];
-    return kind === undefined ? startedNodes.has(nodeId) : kind === 'agent' || kind === 'script';
+    return kind === undefined || kind === 'join' ? startedNodes.has(nodeId) : kind === 'agent' || kind === 'script';
   };
   const categoryOf = (nodeId: string, status: string): Category | undefined => {
     switch (status) {
