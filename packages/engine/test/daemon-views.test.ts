@@ -1,10 +1,14 @@
+import { mkdirSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { AgentAdapter, AgentStartRequest } from '@vuyro/agent-adapters';
 import { type BoardResult, type DefinitionListing, type ExportResult, type ImportPreview, RPC_METHODS, type RunEventsResult, type TemplateSummary } from '@vuyro/contracts';
 import type { TicketDetail } from '../src/daemon/queries.ts';
 import { systemClock } from '../src/runtime/clock.ts';
 import { type ScriptedBehavior, ScriptedAgentAdapter } from '../src/workflow/scripted-agent.ts';
-import { type DaemonHarness, openDaemonHarness } from './helpers/daemon-harness.ts';
+import { type DaemonHarness, oneAgentTemplate, openDaemonHarness } from './helpers/daemon-harness.ts';
+import { enginePaths } from '../src/daemon/paths.ts';
+import { ticketKey } from '../src/workspace/layout.ts';
 
 /**
  * What the desktop app reads (M6): the templates to pick from, a project's board in one request, and a ticket's
@@ -58,6 +62,33 @@ async function until<T>(read: () => Promise<T>, ok: (value: T) => boolean): Prom
 }
 
 describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
+  it("an agent of a project without a folder works in its ticket's own empty folder, not where the engine started", async () => {
+    const seen: (string | undefined)[] = [];
+    const agent = lateAdapter(async (session) => {
+      seen.push(session.request.cwd);
+      await session.vuyro('node.done', { ticketId: session.request.ticketId, nodeId: session.request.nodeId, port: 'done', summary: 'ok' });
+      return undefined;
+    });
+    h = await openDaemonHarness({ adapters: { claude: agent.adapter } });
+    agent.bind(h);
+    await h.saveDefinition(oneAgentTemplate());
+    const ui = await h.ui();
+    const { result: bare } = await ui.execute({ requestId: rid(), type: 'project.create', payload: { name: 'no folder' } });
+    const { result: ticket } = await ui.execute({ requestId: rid(), type: 'ticket.create', payload: { projectId: (bare as { projectId: string }).projectId, title: 'Bare', template: { id: 'test/one-agent' } } });
+    await until(async () => seen.length, (count) => count === 1);
+    const expected = join(enginePaths(h.dataDir).work, ticketKey((ticket as { ticketId: string }).ticketId));
+    expect(seen).toEqual([expected]);
+    expect(readdirSync(expected)).toEqual([]);
+    // A project with a folder works there.
+    const folder = join(h.dataDir, 'project-folder');
+    mkdirSync(folder);
+    const { result: rooted } = await ui.execute({ requestId: rid(), type: 'project.create', payload: { name: 'with folder' } });
+    await ui.execute({ requestId: rid(), type: 'project.configure', payload: { projectId: (rooted as { projectId: string }).projectId, root: folder } });
+    await ui.execute({ requestId: rid(), type: 'ticket.create', payload: { projectId: (rooted as { projectId: string }).projectId, title: 'Rooted', template: { id: 'test/one-agent' } } });
+    await until(async () => seen.length, (count) => count === 2);
+    expect(seen[1]).toBe(folder);
+  });
+
   it('lists active templates with nodes in stage order and loops marked', async () => {
     h = await openDaemonHarness();
     const ui = await h.ui();

@@ -1,5 +1,5 @@
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import type net from 'node:net';
 import { AGENT_ENV, type AgentAdapter, CliAgentAdapter } from '@vuyro/agent-adapters';
 import { type AgentProvider, type EngineStatus, SchemaValidator } from '@vuyro/contracts';
@@ -25,6 +25,7 @@ import { defaultDataDir, defaultPipePath, type EnginePaths, enginePaths } from '
 import { EngineQueries } from './queries.ts';
 import { PairingGate, RpcConnection } from './rpc-server.ts';
 import { type ShimSecurity, VuyroShims } from './vuyro-shims.ts';
+import { ticketKey } from '../workspace/layout.ts';
 
 export interface EngineDaemonOptions {
   /** Default `%LOCALAPPDATA%\Vuyro`. */
@@ -223,7 +224,9 @@ export async function startEngineDaemon(options: EngineDaemonOptions = {}): Prom
       // The agent's `vuyro` calls must reach this engine, whatever its data directory and pipe.
       agentEnv: { [AGENT_ENV.pipe]: pipePath, [AGENT_ENV.dataDir]: paths.dataDir },
       ...(options.maxConcurrent === undefined ? {} : { maxConcurrent: options.maxConcurrent }),
-      ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
+      // Without a project folder an agent would work wherever the engine was started (the app's folder, a terminal's):
+      // it gets an empty folder of its ticket instead ([[결정 대기]] D-072).
+      workspace: options.workspace ?? ((target) => ticketWorkFolder(paths.work, target.ticketId)),
       workspaces,
       ...(options.git === undefined ? {} : { git: options.git }),
       ...(watcher === null ? {} : { watcher }),
@@ -282,4 +285,11 @@ export async function startEngineDaemon(options: EngineDaemonOptions = {}): Prom
     await closeParts().catch(() => undefined);
     throw error;
   }
+}
+
+/** `<work>/<ticket key>`, made if missing: where a ticket of a project without a folder works. */
+function ticketWorkFolder(work: string, ticketId: string): string {
+  const dir = join(work, ticketKey(ticketId));
+  mkdirSync(dir, { recursive: true });
+  return dir;
 }

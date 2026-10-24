@@ -17,6 +17,8 @@ export interface EnginePaths {
   readonly worktrees: string;
   /** The `vuyro` shims put first on every agent's PATH (written at start when the engine knows its CLI). */
   readonly bin: string;
+  /** A folder per ticket (`<ticket key>`) where its agents and scripts work when the project has no folder. */
+  readonly work: string;
 }
 
 /** `%LOCALAPPDATA%\Vuyro` (local to this PC, not roamed). */
@@ -37,6 +39,7 @@ export function enginePaths(dataDir: string): EnginePaths {
     sharedLogs: join(root, 'logs', 'shared'),
     worktrees: join(root, 'wt'),
     bin: join(root, 'bin'),
+    work: join(root, 'work'),
   };
 }
 
