@@ -65,6 +65,7 @@ Vuyro는 작업(티켓)이 기획부터 QA까지 거치는 단계를 그래프�
 - `pnpm install && pnpm -r build && pnpm -r test && pnpm lint`가 마일스톤 공통 완료 기준이다. `pnpm lint`는 ESLint와 패키지별 타입 검사를 함께 돈다.
 - 소스(`.ts`)는 Node 24로 바로 실행된다. 예: `pnpm --filter @vuyro/engine spike:sqlite`.
 - 데스크톱 셸 확인: `VUYRO_SMOKE=1 pnpm --filter @vuyro/desktop start` (처음 실행할 때 Electron 바이너리를 받는다).
+- 데모: `Docs/데모 실행 안내.md`. 샘플 저장소는 `node tools/demo/scripts/create-sample.ts <저장소 밖 빈 폴더>`, 압축하지 않은 설치본은 `pnpm --filter @vuyro/desktop package:dir`.
 
 ## 금지
 

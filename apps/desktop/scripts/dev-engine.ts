@@ -54,13 +54,14 @@ async function devWork(session: Parameters<ScriptedBehavior>[0]): Promise<string
   const checkout = await session.vuyro('checkout.acquire', { ticketId, nodeId, paths: [file], source: 'agent' });
   if (!checkout.ok || !(checkout.result as { granted: boolean }).granted) return undefined;
   const title = ticketTitle(prompt);
+  // A project without a folder works in an empty folder of its ticket.
+  mkdirSync(dirname(file), { recursive: true });
   if (fanOut) {
     const text = existsSync(file) ? readFileSync(file, 'utf8') : '';
     const line = `// lane ${lane} (${title}) run ${String(run)}`;
     writeFileSync(file, Number(lane) % 2 === 1 ? `${line}\n${text}` : `${text}${line}\n`);
     await session.sleep(4000);
   } else {
-    mkdirSync(dirname(file), { recursive: true });
     const broken = title.includes('[broken]') && run === 1;
     writeFileSync(file, broken ? `// ${title}\nexport const note = ;\n` : `// ${title}\nexport const note = ${JSON.stringify(title)};\n`);
   }
