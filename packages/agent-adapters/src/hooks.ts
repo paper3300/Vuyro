@@ -22,13 +22,35 @@ export const CODEX_EDIT_TOOLS = 'apply_patch';
 /** Seconds the CLI waits for the hook. */
 const HOOK_TIMEOUT_S = 60;
 
-/** One command line for the CLI to run: forward slashes, and quotes only where a part has spaces. */
+/** Parts left unquoted: no shell (sh or PowerShell) reads anything special in them. */
+const PLAIN = /^[\w:./-]+$/;
+
+/**
+ * The hook command for a POSIX shell: Claude runs hook commands through Git Bash on Windows (measured, M7a), and
+ * Codex runs `command` through sh elsewhere. Forward slashes; single quotes around any part with a space or a
+ * character the shell would read ($, quotes, backslash…).
+ */
 export function hookCommandLine(cli: HookCli, provider: AgentProvider): string {
   const quote = (part: string): string => {
     const slashed = part.replace(/\\/g, '/');
-    return /[\s"]/.test(slashed) ? `"${slashed.replace(/"/g, '\\"')}"` : slashed;
+    return PLAIN.test(slashed) ? slashed : `'${slashed.replace(/'/g, `'\\''`)}'`;
   };
   return [cli.command, ...cli.args, 'hook', 'pretooluse', '--provider', provider].map(quote).join(' ');
+}
+
+/**
+ * The hook command for Codex's `commandWindows`, which Codex runs through Windows PowerShell (measured, M7a). A line
+ * that starts with a quoted path is a PowerShell syntax error, and Codex lets the edit through when a hook fails to
+ * run, so the line always starts with the call operator and single-quotes every part that is not a plain word.
+ */
+export function hookCommandLineWindows(cli: HookCli, provider: AgentProvider): string {
+  const quote = (part: string): string => {
+    const slashed = part.replace(/\\/g, '/');
+    return PLAIN.test(slashed) ? slashed : `'${slashed.replace(/'/g, "''")}'`;
+  };
+  const [command = '', ...rest] = [cli.command, ...cli.args].map((part) => part.replace(/\\/g, '/'));
+  // The command name is always quoted after `&`, so the line has one shape whatever the path.
+  return ['&', `'${command.replace(/'/g, "''")}'`, ...rest.map(quote), 'hook', 'pretooluse', '--provider', provider].join(' ');
 }
 
 /** `--settings` with a PreToolUse hook on Claude's file tools. Applies even with `--setting-sources ""`. */
@@ -47,12 +69,13 @@ export function claudeHookArgs(commandLine: string): string[] {
  * ([[결정 대기]] D-031, [[초기 검증 결과]] M4). Without the user's config Codex would treat `workspace-write` as
  * read-only on Windows, so the user's Windows sandbox setting is carried over.
  */
-export function codexHookArgs(commandLine: string, options: { readonly windowsSandbox: string }): string[] {
+export function codexHookArgs(lines: { readonly command: string; readonly commandWindows: string }, options: { readonly windowsSandbox: string }): string[] {
   // JSON strings are valid TOML basic strings.
-  const command = JSON.stringify(commandLine);
+  const command = JSON.stringify(lines.command);
+  const commandWindows = JSON.stringify(lines.commandWindows);
   return [
     '-c',
-    `hooks.PreToolUse=[{matcher=${JSON.stringify(CODEX_EDIT_TOOLS)}, hooks=[{type="command", command=${command}, commandWindows=${command}, timeout=${HOOK_TIMEOUT_S}}]}]`,
+    `hooks.PreToolUse=[{matcher=${JSON.stringify(CODEX_EDIT_TOOLS)}, hooks=[{type="command", command=${command}, commandWindows=${commandWindows}, timeout=${HOOK_TIMEOUT_S}}]}]`,
     '--ignore-user-config',
     '-c',
     `windows.sandbox=${JSON.stringify(options.windowsSandbox)}`,

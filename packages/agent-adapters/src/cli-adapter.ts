@@ -4,7 +4,7 @@ import type { Clock, TimerHandle } from './clock.ts';
 import { CodexStreamNormalizer, codexArgs } from './codex.ts';
 import { AGENT_ENV } from './agent-env.ts';
 import { codexHome, codexUserHooks, codexWindowsSandbox } from './codex-home.ts';
-import { claudeHookArgs, codexHookArgs, type HookCli, hookCommandLine } from './hooks.ts';
+import { claudeHookArgs, codexHookArgs, type HookCli, hookCommandLine, hookCommandLineWindows } from './hooks.ts';
 import { prependPath } from './cli-shims.ts';
 import { agentEnvironment, resolveExecutable } from './environment.ts';
 import type { AgentAdapter, AgentRunHandle, AgentStartRequest } from './index.ts';
@@ -135,11 +135,16 @@ export class CliAgentAdapter implements AgentAdapter {
     const home = this.provider === 'codex' ? (this.options.codexHome ?? codexHome(this.options.baseEnv ?? process.env)) : undefined;
     // Fail closed: the hook trust bypass would run the user's own Codex hooks unchecked (the engine checks this too).
     const userHooks = request.checkoutHook === true && home !== undefined && codexUserHooks(home);
-    const hook = request.checkoutHook === true && this.options.vuyroHook !== undefined && !userHooks ? hookCommandLine(this.options.vuyroHook, this.provider) : undefined;
+    const hookCli = request.checkoutHook === true && !userHooks ? this.options.vuyroHook : undefined;
+    const hook = hookCli === undefined ? undefined : hookCommandLine(hookCli, this.provider);
     const extraArgs = [
       ...(this.options.extraArgs ?? this.spec.extraArgs),
       ...(this.provider === 'codex' && this.options.vuyroMcp !== undefined ? codexMcpArgs(this.options.vuyroMcp) : []),
-      ...(hook === undefined ? [] : this.provider === 'claude' ? claudeHookArgs(hook) : codexHookArgs(hook, { windowsSandbox: codexWindowsSandbox(home ?? '') })),
+      ...(hookCli === undefined || hook === undefined
+        ? []
+        : this.provider === 'claude'
+          ? claudeHookArgs(hook)
+          : codexHookArgs({ command: hook, commandWindows: hookCommandLineWindows(hookCli, this.provider) }, { windowsSandbox: codexWindowsSandbox(home ?? '') })),
     ];
     const args = [...(this.options.prefixArgs ?? []), ...this.spec.args(request, extraArgs)];
     const normalizer = this.spec.normalizer(request);

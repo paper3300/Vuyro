@@ -306,7 +306,7 @@ describe('automatic checkout hook (M4)', () => {
     const { args } = await argsFor('claude', { checkoutHook: true }, hookCli);
     const settings = JSON.parse(args[args.indexOf('--settings') + 1] ?? '{}') as { hooks: { PreToolUse: { matcher: string; hooks: { type: string; command: string }[] }[] } };
     expect(settings.hooks.PreToolUse).toEqual([
-      { matcher: 'Write|Edit|MultiEdit|NotebookEdit', hooks: [{ type: 'command', command: '"C:/Program Files/nodejs/node.exe" C:/vuyro/bin.js hook pretooluse --provider claude', timeout: 60 }] },
+      { matcher: 'Write|Edit|MultiEdit|NotebookEdit', hooks: [{ type: 'command', command: "'C:/Program Files/nodejs/node.exe' C:/vuyro/bin.js hook pretooluse --provider claude", timeout: 60 }] },
     ]);
     expect(args.join(' ')).not.toContain('vrt_token');
   });
@@ -316,7 +316,8 @@ describe('automatic checkout hook (M4)', () => {
     const index = args.findIndex((arg) => arg.startsWith('hooks.PreToolUse='));
     expect(args[index - 1]).toBe('-c');
     expect(args[index]).toBe(
-      'hooks.PreToolUse=[{matcher="apply_patch", hooks=[{type="command", command="\\"C:/Program Files/nodejs/node.exe\\" C:/vuyro/bin.js hook pretooluse --provider codex", commandWindows="\\"C:/Program Files/nodejs/node.exe\\" C:/vuyro/bin.js hook pretooluse --provider codex", timeout=60}]}]',
+      // commandWindows runs in Windows PowerShell (measured, M7a): a line that starts with a quoted path does not run there.
+      `hooks.PreToolUse=[{matcher="apply_patch", hooks=[{type="command", command="'C:/Program Files/nodejs/node.exe' C:/vuyro/bin.js hook pretooluse --provider codex", commandWindows="& 'C:/Program Files/nodejs/node.exe' C:/vuyro/bin.js hook pretooluse --provider codex", timeout=60}]}]`,
     );
     expect(args).toContain('--dangerously-bypass-hook-trust');
     // The bypass runs every enabled hook: the user's config.toml (its hooks, its plugins' hooks) is not loaded, and the

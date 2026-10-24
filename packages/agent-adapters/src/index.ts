@@ -72,6 +72,6 @@ export type { CliAgentAdapterOptions } from './cli-adapter.ts';
 export { prependPath, vuyroShims } from './cli-shims.ts';
 export { agentEnvironment, envValue, ExecutableNotFoundError, resolveExecutable } from './environment.ts';
 export { codexHome, codexUserHooks, codexWindowsSandbox } from './codex-home.ts';
-export { CLAUDE_EDIT_TOOLS, claudeHookArgs, CODEX_EDIT_TOOLS, codexHookArgs, hookCommandLine } from './hooks.ts';
+export { CLAUDE_EDIT_TOOLS, claudeHookArgs, CODEX_EDIT_TOOLS, codexHookArgs, hookCommandLine, hookCommandLineWindows } from './hooks.ts';
 export type { HookCli } from './hooks.ts';
 export { clip, fitValue, LIMITS } from './limits.ts';
