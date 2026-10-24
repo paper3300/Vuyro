@@ -140,18 +140,19 @@ export const sharedNodeDefine: CommandHandler<'sharedNode.define', SharedNodeSta
     const nodeType = { type: spec.node.type, version: spec.node.version, hash: pinned.hash };
     const warnings = unsupported(spec);
     const existing = currentDefinition(shared.state);
+    const known = (project.state.sharedNodes ?? []).includes(spec.name);
+    const register: StreamAppend[] = known
+      ? []
+      : [{ aggregateType: 'project', aggregateId: project.aggregateId, expectedRevision: project.revision, events: [{ type: 'project.sharedNodeAdded', data: { projectId: payload.projectId, name: spec.name } }] }];
     if (existing !== undefined && sameJson(existing.spec, spec) && sameJson(existing.nodeType, nodeType)) {
-      return { ok: true, appends: [], result: { name: spec.name, version: shared.state.version, warnings } };
+      return { ok: true, appends: register, result: { name: spec.name, version: shared.state.version, warnings } };
     }
     const version = shared.state.version + 1;
-    const known = (project.state.sharedNodes ?? []).includes(spec.name);
     return {
       ok: true,
       appends: [
         sharedStream(shared, [{ type: 'sharedNode.defined', data: { projectId: payload.projectId, name: spec.name, version, spec, nodeType } }]),
-        ...(known
-          ? []
-          : [{ aggregateType: 'project', aggregateId: project.aggregateId, expectedRevision: project.revision, events: [{ type: 'project.sharedNodeAdded', data: { projectId: payload.projectId, name: spec.name } }] } satisfies StreamAppend]),
+        ...register,
       ],
       result: { name: spec.name, version, warnings },
     };
@@ -276,15 +277,19 @@ async function startBatch(ctx: HandlerContext, shared: Loaded<SharedNodeState>, 
     return manual ? fail('invariant_violated', reason) : notStarted(reason);
   }
   const { spec } = definition;
+  // Shared mode: every batch builds the project folder, so one runs there at a time, whatever a stored definition says
+  // (D-054 is enforced here, not only when a definition is saved): this node's own batches, and the folder's lock in
+  // the project's ledger, held by whichever shared node's batch builds it now.
   const running = runningBatches(state).length;
-  if (running >= spec.maxConcurrent) return manual ? fail('invariant_violated', `${running} batch(es) running (maxConcurrent ${spec.maxConcurrent})`) : notStarted('a batch is running');
-  // Shared mode: every shared node of the project builds the same folder, so only one batch runs there at a time.
+  if (running > 0) return manual ? fail('invariant_violated', `batch ${runningBatches(state)[0]?.batchId ?? ''} is running`) : notStarted('a batch is running');
   const project = await ctx.load(projectAggregate, state.projectId);
-  for (const other of project.state.sharedNodes ?? []) {
-    if (other === state.name) continue;
-    const busy = runningBatches((await ctx.load(sharedNodeAggregate, sharedNodeAggregateId(state.projectId, other))).state)[0];
-    if (busy !== undefined) {
-      const reason = `batch ${busy.batchId} of shared node '${other}' is building the project folder`;
+  const ledger = await ctx.load(workspaceAggregate, workspaceAggregateId(state.projectId));
+  const building = ledger.state.building;
+  if (building !== undefined) {
+    const holder = building.sharedNode === state.name ? state : (await ctx.load(sharedNodeAggregate, sharedNodeAggregateId(state.projectId, building.sharedNode))).state;
+    // A lock whose batch is no longer running is stale (it ended without unlocking): the folder is free.
+    if (Object.hasOwn(holder.running, building.batch)) {
+      const reason = `batch ${building.batchId} of shared node '${building.sharedNode}' is building the project folder`;
       return manual ? fail('invariant_violated', reason) : notStarted(reason);
     }
   }
@@ -322,6 +327,8 @@ async function startBatch(ctx: HandlerContext, shared: Loaded<SharedNodeState>, 
   const batch = state.batches + 1;
   const batchId = batchIdOf(state.name, batch);
   const appends: StreamAppend[] = [];
+  const lock: NewEvent = { type: 'workspace.buildStarted', data: { projectId: state.projectId, sharedNode: state.name, batch, batchId } };
+  let ledgerEvents: NewEvent[] = [lock];
   let entries: readonly string[] = [];
   let overlaps: readonly { path: string; entryId: string; entryPath: string; holder: Holder }[] = [];
 
@@ -382,10 +389,12 @@ async function startBatch(ctx: HandlerContext, shared: Loaded<SharedNodeState>, 
         result: { started: false, reason: error },
       };
     }
-    if (decision.ledgerEvents.length > 0) appends.push(ledgerAppend);
+    ledgerEvents = [...ledgerEvents, ...decision.ledgerEvents];
     entries = decision.entryIds ?? [];
     overlaps = decision.outcome === 'overlap' ? decision.conflicts : [];
   }
+
+  appends.push({ aggregateType: 'workspace', aggregateId: ledger.aggregateId, expectedRevision: ledger.revision, events: ledgerEvents });
 
   const byTicket = new Map<string, { ticket: Loaded<TicketState>; draft: WorkflowDraft }>();
   for (const member of members) {
@@ -511,13 +520,16 @@ export const sharedNodeFinish: CommandHandler<'sharedNode.finish', SharedNodeSta
     const ticketIds = [...new Set(running.members.map((member) => member.ticketId))];
     const share = { batchId, batch: ticketIds };
 
-    // The batch's protected paths go with it.
+    // The batch's protected paths and the project folder go with it.
     const ledger = await ctx.load(workspaceAggregate, workspaceAggregateId(state.projectId));
     const release = running.entries.filter((id) => Object.hasOwn(ledger.state.entries, id));
-    const ledgerAppends: StreamAppend[] =
-      release.length === 0
-        ? []
-        : [{ aggregateType: 'workspace', aggregateId: ledger.aggregateId, expectedRevision: ledger.revision, events: [{ type: 'checkout.released', data: { projectId: state.projectId, ids: release, reason: 'nodeDone' } }] }];
+    const ledgerEvents: NewEvent[] = [
+      ...(release.length === 0 ? [] : [{ type: 'checkout.released', data: { projectId: state.projectId, ids: release, reason: 'nodeDone' } } satisfies NewEvent]),
+      ...(ledger.state.building?.sharedNode === state.name && ledger.state.building.batch === payload.batch
+        ? [{ type: 'workspace.buildEnded', data: { projectId: state.projectId, sharedNode: state.name, batch: payload.batch } } satisfies NewEvent]
+        : []),
+    ];
+    const ledgerAppends: StreamAppend[] = ledgerEvents.length === 0 ? [] : [{ aggregateType: 'workspace', aggregateId: ledger.aggregateId, expectedRevision: ledger.revision, events: ledgerEvents }];
 
     const requeue = (list: readonly LiveMember[], reason: string): void => {
       for (const member of list) draftOf(member).emit({ type: 'node.requeued', data: { ...member.request, reason } });

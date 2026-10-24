@@ -35,6 +35,8 @@ export interface LedgerState {
   readonly edits: Readonly<Record<string, Readonly<Record<string, EditRecord>>>>;
   /** Which tickets held exclusive claims on a pattern, per space and pattern key (the weaker `blame` evidence). */
   readonly claimed: Readonly<Record<string, Readonly<Record<string, EditRecord>>>>;
+  /** The shared node's batch building the project folder now (M5): one at a time. */
+  readonly building?: { readonly sharedNode: string; readonly batch: number; readonly batchId: string };
 }
 
 export interface EditRecord {
@@ -138,6 +140,11 @@ export function evolveLedger(state: LedgerState, event: NewEvent | DomainEvent):
       const [a, b] = event.data.spaces;
       return { ...state, warned: { ...state.warned, [warnKey(event.data.path, a, b)]: true } };
     }
+    case 'workspace.buildStarted':
+      return { ...state, building: { sharedNode: event.data.sharedNode, batch: event.data.batch, batchId: event.data.batchId } };
+    case 'workspace.buildEnded':
+      if (state.building?.sharedNode !== event.data.sharedNode || state.building.batch !== event.data.batch) return state;
+      return Object.fromEntries(Object.entries(state).filter(([name]) => name !== 'building')) as unknown as LedgerState;
     case 'worktree.created':
       return { ...state, worktrees: { ...state.worktrees, [event.data.worktree.key]: event.data.worktree }, kept: without(state.kept, [event.data.worktree.key]) };
     case 'worktree.kept':

@@ -780,6 +780,21 @@ export const EVENT_CATALOG = {
       strict,
     ),
   },
+  /**
+   * A shared node's batch started building the project folder (M5). One batch at a time per folder: a batch starts only
+   * while no other running batch holds it.
+   */
+  'workspace.buildStarted': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object({ projectId: IdSchema, sharedNode: SharedNodeNameSchema, batch: Type.Integer({ minimum: 1 }), batchId: Type.String({ minLength: 1, maxLength: 128 }) }, strict),
+  },
+  /** That batch ended (succeeded, failed or interrupted): the project folder is free. */
+  'workspace.buildEnded': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object({ projectId: IdSchema, sharedNode: SharedNodeNameSchema, batch: Type.Integer({ minimum: 1 }) }, strict),
+  },
   /** The engine did not carry out an approved clean-up: the worktree changed since it was shown, is in use, or failed. */
   'worktree.cleanupSkipped': {
     aggregateType: 'workspace',

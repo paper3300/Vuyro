@@ -1,6 +1,7 @@
+import { mkdirSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { CommandResponse } from '@vuyro/contracts';
+import { type CommandResponse, sharedNodeAggregateId } from '@vuyro/contracts';
 import type { TransportIdentity } from '../src/commands/caller.ts';
 import { currentExecution } from '../src/workflow/state.ts';
 import {
@@ -152,7 +153,7 @@ describe('shared node guards', { timeout: 30_000 }, () => {
     expect(await start()).toMatchObject({ started: true, batch: 1 });
     await enqueue(b);
     expect(await start()).toMatchObject({ started: false, reason: 'a batch is running' });
-    expect(await run()).toMatch(/1 batch\(es\) running/);
+    expect(await run()).toMatch(/batch build-1 is running/);
     expectOk(await h.exec('sharedNode.finish', { projectId, name: 'build', batch: 1, result: { kind: 'interrupted', reason: 'test' } }, SYSTEM));
     expect(await start()).toMatchObject({ started: false, reason: expect.stringMatching(/blocked: batch 1 was interrupted/) as string });
     expect(await run()).toMatch(/blocked: batch 1 was interrupted/);
@@ -272,6 +273,48 @@ describe('shared node guards', { timeout: 30_000 }, () => {
     expect((await h.ticket(b)).status).toBe('done');
   });
 
+  it('definitions stored before one-batch-per-folder (maxConcurrent 2, not in the project list) still build one batch at a time', async () => {
+    await open();
+    await saveQuickFlow(h, 'test', 'myteam/test-flow');
+    const pinned = await h.registry.pinnedNodeType('vuyro.script', 1);
+    const define = (name: string, program: string, maxConcurrent: number) =>
+      h.store.append({
+        actor: { kind: 'system', component: 'test' },
+        streams: [
+          {
+            aggregateType: 'shared',
+            aggregateId: sharedNodeAggregateId(projectId, name),
+            expectedRevision: 0,
+            events: [
+              {
+                type: 'sharedNode.defined',
+                data: {
+                  projectId,
+                  name,
+                  version: 1,
+                  spec: buildSpec({ name, node: { type: 'vuyro.script', version: 1, params: { program } }, batchTrigger: { count: 1 }, maxConcurrent }),
+                  nodeType: { type: 'vuyro.script', version: 1, hash: pinned?.hash ?? '' },
+                },
+              },
+            ],
+          },
+        ],
+      });
+    await define('build', 'build-tool', 2);
+    await define('test', 'test-tool', 1);
+    enqueueBuild(h, buildPasses());
+    enqueueBuild(h, buildPasses());
+    enqueueBuild(h, buildPasses(), 'test-tool');
+    await startTicket(h, projectId, 'A', {}, 'myteam/quick-flow');
+    await driveUntil(h, h.clock.now() + MINUTE);
+    await startTicket(h, projectId, 'B', {}, 'myteam/quick-flow');
+    await startTicket(h, projectId, 'C', {}, 'myteam/test-flow');
+    await h.drive();
+    const rows = await h.store.query<{ type: string }>("SELECT type FROM events WHERE type IN ('sharedNode.batchStarted', 'sharedNode.batchFinished') ORDER BY sequence");
+    expect(rows.map((row) => row.type.replace('sharedNode.batch', ''))).toEqual(['Started', 'Finished', 'Started', 'Finished', 'Started', 'Finished']);
+    expect(h.processes.spawned).toHaveLength(3);
+  });
+
   it("a person's run waits for another shared node's batch in the same folder", async () => {
     await open(undefined, true);
     await saveQuickFlow(h, 'test', 'myteam/test-flow');
@@ -312,12 +355,18 @@ describe('shared node guards', { timeout: 30_000 }, () => {
         script: { program: 'build-tool', cwd: '{{ params.dir }}' },
       },
     });
+    mkdirSync(join(root, 'sub'));
+    mkdirSync(join(h.dir, 'elsewhere'));
+    // A junction (a symbolic link elsewhere) whose name is inside the project but that leads outside it.
+    symlinkSync(join(h.dir, 'elsewhere'), join(root, 'link'), 'junction');
     const cases: [string, string | undefined][] = [
       ['sub', join(root, 'sub')],
       [join(root, 'sub'), join(root, 'sub')],
       ['.', root],
       ['..', undefined],
       [join(h.dir, 'elsewhere'), undefined],
+      ['link', undefined],
+      ['missing', undefined],
     ];
     const results: (string | undefined)[] = [];
     for (const [index, [dir]] of cases.entries()) {
@@ -335,6 +384,12 @@ describe('shared node guards', { timeout: 30_000 }, () => {
     expect(results).toEqual(cases.map(([, cwd]) => cwd));
     const outside = currentExecution(await h.ticket((await h.store.query<{ ticket_id: string }>("SELECT ticket_id FROM p_tickets WHERE title = 'T4'"))[0]?.ticket_id ?? ''), 'build', 'main');
     expect((outside?.output?.items[0]?.data as { error: string }).error).toMatch(/not inside the project folder/);
+    const errorOf = async (title: string) => {
+      const [row] = await h.store.query<{ ticket_id: string }>('SELECT ticket_id FROM p_tickets WHERE title = ?', [title]);
+      return (currentExecution(await h.ticket(row?.ticket_id ?? ''), 'build', 'main')?.output?.items[0]?.data as { error: string }).error;
+    };
+    expect(await errorOf('T5')).toMatch(/leads outside the project folder/);
+    expect(await errorOf('T6')).toMatch(/does not exist/);
   });
 
   it('a batch holds its protected paths until it ends, whatever ttl the spec gives them', async () => {

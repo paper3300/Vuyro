@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { realpath } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { type ArtifactRef, type CommandResponse, type CommandType, type DomainEvent, type ExpressionContext, resolveTemplateValue } from '@vuyro/contracts';
 import { projectAggregate, type ProjectState } from '../commands/aggregates.ts';
@@ -182,7 +183,8 @@ export class SharedNodeScheduler {
     }
     const definition = Object.hasOwn(state.definitions, state.version) ? state.definitions[state.version] : undefined;
     if (state.blocked !== undefined || state.queue.length === 0 || definition === undefined) return;
-    if (runningBatches(state).length >= definition.spec.maxConcurrent) return;
+    // One batch at a time (D-054), whatever a stored definition says; the command checks the folder too.
+    if (runningBatches(state).length > 0) return;
     // Every attempt is a new question (its answer depends on the tickets, the ledger and the clock, not only on this
     // aggregate), so it never gets an earlier "not yet" back. A start the engine resends after a crash is decided again
     // from the state, which already holds the batch it started.
@@ -261,6 +263,12 @@ export class SharedNodeScheduler {
     const cwd = batchFolder(project.root, invocation.cwd);
     if (cwd === undefined) {
       await finish({ kind: 'script', exitCode: null, error: `the script's working folder '${invocation.cwd ?? ''}' is not inside the project folder` });
+      return;
+    }
+    // The names say inside; the disk must agree (a junction or symbolic link may point anywhere).
+    const real = await realFolder(project.root, cwd);
+    if (real !== 'inside') {
+      await finish({ kind: 'script', exitCode: null, error: real === 'missing' ? `the batch's working folder '${cwd}' does not exist` : `the batch's working folder '${cwd}' leads outside the project folder` });
       return;
     }
     const child = startScript(this.options.processRunner, this.options.clock, { program: invocation.program, args: invocation.args, env: invocation.env, timeoutMs: invocation.timeoutMs }, cwd);
@@ -356,6 +364,18 @@ export function batchFolder(root: string, cwd: string | undefined, caseInsensiti
   if (pathKey(resolve(root, cwd), caseInsensitive) === pathKey(resolve(root), caseInsensitive)) return root;
   const inside = insideRoot(root, cwd, caseInsensitive);
   return inside === undefined ? undefined : join(root, ...inside.split('/'));
+}
+
+/** Whether `folder` really is the project folder or inside it, once links are followed. */
+export async function realFolder(root: string, folder: string, caseInsensitive = CASE_INSENSITIVE): Promise<'inside' | 'outside' | 'missing'> {
+  let realRoot: string;
+  let real: string;
+  try {
+    [realRoot, real] = await Promise.all([realpath(root), realpath(folder)]);
+  } catch {
+    return 'missing';
+  }
+  return pathKey(real, caseInsensitive) === pathKey(realRoot, caseInsensitive) || insideRoot(realRoot, real, caseInsensitive) !== undefined ? 'inside' : 'outside';
 }
 
 /** Deterministic: a step retried after a crash is the same command. */
