@@ -58,6 +58,12 @@ export const ParamSpecSchema = Type.Object(
     description: Type.Optional(Type.String({ maxLength: 2048 })),
     schema: JsonSchemaObjectSchema,
     required: Type.Optional(Type.Boolean()),
+    /**
+     * The value is a secret (a token, a password): exporting always replaces it, in the type's default and in every
+     * template's value, with a `${secret:…}` placeholder (M6b review). The declaration is the authority; guessing from
+     * names and values only adds to it.
+     */
+    secret: Type.Optional(Type.Boolean()),
   },
   { additionalProperties: false },
 );

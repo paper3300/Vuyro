@@ -143,7 +143,15 @@ const draftValidator = new SchemaValidator();
 // ---------------------------------------------------------------------------
 // Definitions
 
-async function compileDefinition(ctx: HandlerContext, definition: DefinitionEnvelope): Promise<Failure | undefined> {
+/**
+ * Checks a definition before it is staged. Templates are compiled against the active node types, or against
+ * `staged` (node types staged by the same import) first.
+ */
+async function compileDefinition(
+  ctx: HandlerContext,
+  definition: DefinitionEnvelope,
+  staged: ReadonlyMap<string, CompiledNodeType> = new Map(),
+): Promise<Failure | { ok: true; nodeType?: CompiledNodeType }> {
   const resolver = ctx.definitions;
   if (resolver === undefined) return fail('invariant_violated', 'this engine has no definition store');
   const issue = (message: string, issues: { path: string; message: string }[]) =>
@@ -153,8 +161,9 @@ async function compileDefinition(ctx: HandlerContext, definition: DefinitionEnve
     if (content.type !== definition.id || content.version !== definition.version) {
       return fail('validation_failed', 'content type and version must match the envelope id and version', { issues: [{ path: '/definition/content', message: 'mismatch' }] });
     }
-    const { issues } = compileNodeType(content, resolver.dataValidator);
-    return issues.length > 0 ? issue(`node type ${content.type}@${content.version} is not valid`, issues) : undefined;
+    const { nodeType, issues } = compileNodeType(content, resolver.dataValidator);
+    if (issues.length > 0 || nodeType === undefined) return issue(`node type ${content.type}@${content.version} is not valid`, issues);
+    return { ok: true, nodeType };
   }
   const { content } = definition;
   if (content.id !== definition.id || content.version !== definition.version) {
@@ -164,6 +173,11 @@ async function compileDefinition(ctx: HandlerContext, definition: DefinitionEnve
   for (const node of content.nodes) {
     const key = nodeTypeKey(node.type, node.version);
     if (types.has(key)) continue;
+    const own = staged.get(key);
+    if (own !== undefined) {
+      types.set(key, own);
+      continue;
+    }
     try {
       const type = await resolver.nodeType(node.type, node.version);
       if (type !== undefined) types.set(key, type);
@@ -173,7 +187,7 @@ async function compileDefinition(ctx: HandlerContext, definition: DefinitionEnve
     }
   }
   const { issues } = compileWorkflow(content, types, resolver.dataValidator);
-  return issues.length > 0 ? issue(`template ${content.id}@${content.version} is not valid`, issues) : undefined;
+  return issues.length > 0 ? issue(`template ${content.id}@${content.version} is not valid`, issues) : { ok: true };
 }
 
 function stageHandler<T extends 'nodeType.save' | 'template.save'>(kind: DefinitionKind): CommandHandler<T, DefinitionState> {
@@ -197,8 +211,8 @@ function stageHandler<T extends 'nodeType.save' | 'template.save'>(kind: Definit
         }
         return { ok: true, appends: [], result: { ...key, status: existing.status === 'active' ? 'active' : 'staged' } };
       }
-      const invalid = await compileDefinition(ctx, definition);
-      if (invalid !== undefined) return invalid;
+      const compiled = await compileDefinition(ctx, definition);
+      if (!compiled.ok) return compiled;
       return {
         ok: true,
         appends: [
@@ -214,6 +228,67 @@ function stageHandler<T extends 'nodeType.save' | 'template.save'>(kind: Definit
     },
   };
 }
+
+/**
+ * `definition.import`: every definition of one import staged in one commit, or none (M6b review). Node types come
+ * first so the templates are checked against them. A version that exists with other content, or an id or version the
+ * preview promised that is no longer free (`expect`), refuses the whole import: the person previews again.
+ */
+export const definitionImport: CommandHandler<'definition.import', DefinitionState> = {
+  scope: () => ({}),
+  decide: async (ctx, payload) => {
+    const indexed = payload.items.map((item, index) => ({ item, index }));
+    const ordered = [...indexed.filter(({ item }) => item.definition.kind === 'nodeType'), ...indexed.filter(({ item }) => item.definition.kind === 'template')];
+    const streams = new Map<string, { loaded: Loaded<DefinitionState>; events: NewEvent[] }>();
+    const staged = new Map<string, CompiledNodeType>();
+    const seen = new Set<string>();
+    const saved: { kind: DefinitionKind; id: string; version: number; hash: string; status: 'staged' | 'active' }[] = [];
+    for (const { item, index } of ordered) {
+      const definition: DefinitionEnvelope = item.definition;
+      const { kind } = definition;
+      const label = `${kind} ${definition.id}@${String(definition.version)}`;
+      const at = (message: string) => [{ path: `/items/${String(index)}`, message }];
+      if (seen.has(label)) return fail('validation_failed', `${label} is in the import twice`, { issues: at('duplicate') });
+      seen.add(label);
+      const hash = definitionHash(definition);
+      if (definition.checksum !== undefined && definition.checksum !== hash) {
+        return fail('validation_failed', `checksum of ${label} does not match the content`, { issues: at('checksum mismatch') });
+      }
+      const aggregateId = definitionAggregateId(kind, definition.id);
+      const entry = streams.get(aggregateId) ?? { loaded: await ctx.load(definitionAggregate, aggregateId), events: [] };
+      streams.set(aggregateId, entry);
+      const live = Object.entries(entry.loaded.state.versions)
+        .filter(([, version]) => version.status !== 'abandoned')
+        .map(([version, state]) => ({ version: Number(version), ...state }));
+      if (item.expect === 'newId' && live.length > 0) {
+        return fail('invariant_violated', `${kind} ${definition.id} exists now; preview the import again`, { issues: at('id taken') });
+      }
+      if (item.expect === 'newVersion' && live.some((version) => version.version >= definition.version)) {
+        return fail('invariant_violated', `${label} is no longer the newest version; preview the import again`, { issues: at('not newest') });
+      }
+      const existing = live.find((version) => version.version === definition.version);
+      if (existing !== undefined && existing.hash !== hash) {
+        return fail('invariant_violated', `${label} already exists with other content; preview the import again`, { issues: at('other content'), existingHash: existing.hash });
+      }
+      const compiled = await compileDefinition(ctx, definition, staged);
+      if (!compiled.ok) {
+        const issues = (compiled.error.details as { issues?: { path: string; message: string }[] } | undefined)?.issues ?? [];
+        return fail(compiled.error.code, `${label}: ${compiled.error.message}`, { issues: issues.map((entry) => ({ path: `/items/${String(index)}${entry.path}`, message: entry.message })) });
+      }
+      if (compiled.nodeType !== undefined) staged.set(nodeTypeKey(definition.id, definition.version), compiled.nodeType);
+      if (existing !== undefined) {
+        saved.push({ kind, id: definition.id, version: definition.version, hash, status: existing.status === 'active' ? 'active' : 'staged' });
+        continue;
+      }
+      entry.events.push({ type: 'definition.staged', data: { kind, id: definition.id, version: definition.version, hash, name: definition.name, definition } });
+      saved.push({ kind, id: definition.id, version: definition.version, hash, status: 'staged' });
+    }
+    const appends: StreamAppend[] = [...streams.entries()]
+      .filter(([, entry]) => entry.events.length > 0)
+      .map(([aggregateId, entry]) => ({ aggregateType: 'definition', aggregateId, expectedRevision: entry.loaded.revision, events: entry.events }));
+    return { ok: true, appends, result: { saved } };
+  },
+};
 
 function definitionTarget(payload: { kind: DefinitionKind; id: string }) {
   return { definition: definitionAggregate, aggregateId: definitionAggregateId(payload.kind, payload.id) };
@@ -232,6 +307,17 @@ export const definitionActivate: CommandHandler<'definition.activate', Definitio
     const fileHash = await ctx.definitions?.fileHash(payload.kind, payload.id, payload.version);
     if (fileHash !== payload.hash) {
       return fail('invariant_violated', `the file of ${payload.kind} ${payload.id}@${payload.version} does not match the staged hash`, { fileHash: fileHash ?? null });
+    }
+    // A template staged with the node types of its import becomes usable only once they are: if one of them could
+    // not be written, the template is abandoned too instead of becoming an active template nobody can run.
+    if (payload.kind === 'template' && ctx.definitions !== undefined) {
+      const file = await ctx.definitions.readFile('template', payload.id, payload.version);
+      if (file.kind === 'template') {
+        for (const node of file.content.nodes) {
+          const type = await ctx.definitions.nodeType(node.type, node.version).catch(() => undefined);
+          if (type === undefined) return fail('invariant_violated', `template ${payload.id}@${payload.version} needs node type ${nodeTypeKey(node.type, node.version)}, which is not active`);
+        }
+      }
     }
     return {
       ok: true,

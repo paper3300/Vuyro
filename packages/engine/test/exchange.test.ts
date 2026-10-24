@@ -1,6 +1,7 @@
 import { writeFileSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ExportBundle, ImportChoice, ImportPreview, NodeTypeDefinition, TemplateDefinition } from '@vuyro/contracts';
+import { MemoryFileSystem } from '../src/runtime/fs.ts';
 import { definitionHash, definitionPath } from '../src/workflow/definitions.ts';
 import { bundleHash, ExchangeError, exportDefinition, previewImport, redactNodeType } from '../src/workflow/exchange.ts';
 import { nextRequestId } from './helpers/engine-harness.ts';
@@ -77,17 +78,21 @@ const preview = (text: string, choices?: Record<string, ImportChoice>): Promise<
 const json = (value: unknown) => JSON.stringify(value);
 
 describe('export', () => {
-  it('leaves script environment values and secret-looking param values out, says where, and checksums the result', async () => {
+  it('replaces script environment values and secret-looking param values with placeholders, says where, and checksums the result', async () => {
     h = await openWorkflowHarness({ noEngine: true });
     await save(buildType());
     await save(buildTemplate());
     const type = await exportDefinition(h.registry, { kind: 'nodeType', id: 'myteam.build' });
     const document = type.document as NodeTypeDefinition;
-    expect(document.content.script?.env).toBeUndefined();
-    expect(document.content.params.find((param) => param.name === 'apiToken')?.schema).toEqual({ type: 'string' });
+    expect(document.content.script?.env).toEqual({ BUILD_TOKEN: '${secret:myteam.build.env.BUILD_TOKEN}', MODE: '${secret:myteam.build.env.MODE}' });
+    expect(document.content.params.find((param) => param.name === 'apiToken')?.schema).toEqual({ type: 'string', default: '${secret:myteam.build.apiToken}' });
     expect(document.content.params.find((param) => param.name === 'target')?.schema.default).toBe('Editor');
-    expect(document.requires?.credentials).toEqual(['env:BUILD_TOKEN', 'env:MODE', 'param:apiToken']);
-    expect(type.redacted.map((field) => field.path)).toEqual(['/content/script/env/BUILD_TOKEN', '/content/script/env/MODE', '/content/params/1/schema/default']);
+    expect(document.requires?.credentials).toEqual(['myteam.build.apiToken', 'myteam.build.env.BUILD_TOKEN', 'myteam.build.env.MODE']);
+    expect(type.redacted.map((field) => [field.path, field.reason])).toEqual([
+      ['/content/params/1/schema/default', 'name'],
+      ['/content/script/env/BUILD_TOKEN', 'env'],
+      ['/content/script/env/MODE', 'env'],
+    ]);
     expect(document.checksum).toBe(definitionHash(document));
     expect(json(document)).not.toMatch(/tok-123|tok-456/);
     expect(type.fileName).toBe('myteam.build@1.json');
@@ -96,16 +101,69 @@ describe('export', () => {
     expect(bundle.kind).toBe('bundle');
     expect(bundle.embedded.map((each) => `${each.id}@${each.version}`)).toEqual(['myteam.build@1', 'vuyro.end@1']);
     expect(bundle.requires?.nodeTypes).toEqual({ 'myteam.build': 1, 'vuyro.end': 1 });
-    expect(bundle.requires?.credentials).toEqual(['param:build.apiToken', 'env:BUILD_TOKEN', 'env:MODE', 'param:apiToken']);
+    expect(bundle.requires?.credentials).toEqual(['build.apiToken', 'myteam.build.apiToken', 'myteam.build.env.BUILD_TOKEN', 'myteam.build.env.MODE']);
     expect(bundle.checksum).toBe(bundleHash(bundle));
     expect(bundle.content.checksum).toBe(definitionHash(bundle.content));
-    expect(bundle.content.requires?.credentials).toEqual(['param:build.apiToken']);
+    expect(bundle.content.requires?.credentials).toEqual(['build.apiToken']);
+    expect(bundle.content.content.nodes[0]?.params).toEqual({ target: 'Game', apiToken: '${secret:build.apiToken}' });
     expect(json(bundle)).not.toMatch(/tok-123|tok-456|secret-in-template/);
     for (const embedded of bundle.embedded) expect(embedded.checksum).toBe(definitionHash(embedded));
 
     const plain = (await exportDefinition(h.registry, { kind: 'template', id: 'myteam/build', embedNodeTypes: false })).document as TemplateDefinition;
     expect(plain.kind).toBe('template');
     expect(plain.checksum).toBe(definitionHash(plain));
+  });
+
+  it('a param the node type declares secret always leaves, whatever its name; expression-only environment values stay', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    const declared: NodeTypeDefinition = {
+      ...buildType(),
+      content: {
+        ...buildType().content,
+        params: [{ name: 'login', label: 'Login', secret: true, schema: { type: 'string', default: 'admin:hunter2' } }],
+        script: { program: 'tools/deploy.cmd', env: { LOGIN: '{{ params.login }}' } },
+      },
+    };
+    await save(declared);
+    await save({ ...buildTemplate(), content: { ...buildTemplate().content, nodes: [{ id: 'build', type: 'myteam.build', version: 1, params: { login: 'ci:pass-word' } }, { id: 'end', type: 'vuyro.end', version: 1 }] } });
+    const result = await exportDefinition(h.registry, { kind: 'template', id: 'myteam/build' });
+    const text = json(result.document);
+    expect(text).not.toMatch(/hunter2|pass-word/);
+    expect(result.redacted.map((field) => [field.label, field.reason])).toEqual([
+      ['myteam/build@1 · 노드 build의 파라미터 login', 'declared'],
+      ['myteam.build@1 · 파라미터 login의 기본값', 'declared'],
+    ]);
+    const embedded = (result.document as ExportBundle).embedded[0];
+    expect(embedded?.content.script?.env).toEqual({ LOGIN: '{{ params.login }}' });
+  });
+
+  it('finds tokens and keys by their look in arguments, descriptions and nested values, and replaces them', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    const github = `ghp_${'a1B2c3D4e5'.repeat(4)}`;
+    const key = '-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----';
+    const random = 'Zx9QvT3pL0mR7sYk2WnB8cJh5DfG1aUe';
+    const looks: NodeTypeDefinition = {
+      ...buildType(),
+      content: {
+        ...buildType().content,
+        params: [{ name: 'target', label: 'Target', description: `Call the API with Authorization: Bearer abcdefghijklmnop123456 and sk-${'q'.repeat(24)}.`, schema: { type: 'string', default: 'Editor' } }],
+        script: { program: 'tools/build.cmd', args: ['--token', github, `--aws=AKIAABCDEFGHIJKLMNOP`, `--slack=xoxb-123456789012-abc`] },
+        extensions: { myteam: { deep: [{ key }], note: random, commit: '0123456789abcdef0123456789abcdef' } },
+      },
+    };
+    await save(looks);
+    const result = await exportDefinition(h.registry, { kind: 'nodeType', id: 'myteam.build' });
+    const text = json(result.document);
+    for (const secret of [github, 'MIIEow', random, 'abcdefghijklmnop123456', 'AKIAABCDEFGHIJKLMNOP', 'xoxb-123456789012', `sk-${'q'.repeat(24)}`]) expect(text).not.toContain(secret);
+    // A plain hex commit id is not taken for a secret; ordinary words and expressions stay.
+    expect(text).toContain('0123456789abcdef0123456789abcdef');
+    expect(text).toContain('Authorization: Bearer ${secret:');
+    expect(result.redacted.every((field) => field.reason === 'pattern')).toBe(true);
+    expect(result.redacted.map((field) => field.looksLike).sort()).toEqual(['API 키 (sk-)', 'AWS 액세스 키', 'Bearer 토큰', 'GitHub 토큰', 'Slack 토큰', '개인 키', '긴 무작위 문자열'].sort());
+    expect(result.redacted.find((field) => field.looksLike === 'GitHub 토큰')).toMatchObject({ path: '/content/script/args/1', placeholder: '${secret:myteam.build.script.args.1}' });
+    // The importer is told what to fill in, also from the text when the list was edited away.
+    const imported = await preview(json({ ...(result.document as NodeTypeDefinition), requires: {}, checksum: undefined }));
+    expect(imported.credentials).toContain('myteam.build.script.args.1');
   });
 
   it('exports the default template unchanged apart from its requirements', async () => {
@@ -129,7 +187,7 @@ describe('export', () => {
   });
 
   it('a node type without secrets comes out the same', () => {
-    const plain: NodeTypeDefinition = { ...buildType(), content: { ...buildType().content, params: [], script: { program: 'x' } } };
+    const plain: NodeTypeDefinition = { ...buildType(), content: { ...buildType().content, params: [], claims: [], script: { program: 'x', args: ['--target', '{{ params.target }}'] } } };
     expect(redactNodeType(plain)).toEqual({ definition: plain, redacted: [] });
   });
 });
@@ -341,5 +399,100 @@ describe('import preview', () => {
     });
     expect(result.items.find((item) => item.id === 'myteam.pack')?.problems).toEqual(['myteam.same을(를) 이 파일의 다른 항목도 쓰려고 합니다.']);
     expect(result.canSave).toBe(false);
+  });
+});
+
+describe('saving an import (definition.import)', () => {
+  async function settled(): Promise<void> {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const staged = await h.store.query("SELECT id FROM p_definitions WHERE status = 'staged'");
+      if (staged.length === 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error('definitions never settled');
+  }
+  const status = async (id: string) => (await h.store.query<{ version: number; status: string }>('SELECT version, status FROM p_definitions WHERE id = ? ORDER BY version', [id])).map((row) => `${String(row.version)}:${row.status}`);
+  const bundleOf = (types: NodeTypeDefinition[], template = buildTemplate()): ExportBundle => ({ vuyro: 'export', formatVersion: 1, kind: 'bundle', id: template.id, version: template.version, name: template.name, content: template, embedded: types });
+  const items = (plan: ImportPreview) => plan.saves.map((each) => ({ definition: each.definition, ...(each.expect === undefined ? {} : { expect: each.expect }) }));
+
+  it('saves a bundle in one command: the template is checked against node types of the same import', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    const plan = await preview(json(bundleOf([buildType()])));
+    expect(plan.canSave).toBe(true);
+    expect(plan.saves.map((each) => each.expect)).toEqual(['newId', 'newId']);
+    const saved = await h.ok('definition.import', { items: items(plan) }, HUMAN);
+    expect((saved.result as { saved: { id: string; status: string }[] }).saved.map((each) => `${each.id}:${each.status}`)).toEqual(['myteam.build:staged', 'myteam/build:staged']);
+    await settled();
+    expect(await status('myteam.build')).toEqual(['1:active']);
+    expect(await status('myteam/build')).toEqual(['1:active']);
+  });
+
+  it('all or nothing: one item the engine refuses leaves every other item unsaved', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    const broken = { ...buildTemplate(), content: { ...buildTemplate().content, edges: [{ from: { node: 'build', port: 'nope' }, to: { node: 'end', port: 'in' } }] } };
+    const response = await h.exec('definition.import', { items: [{ definition: buildType() }, { definition: broken }] }, HUMAN);
+    expect(response).toMatchObject({ ok: false, error: { code: 'validation_failed' } });
+    expect(await status('myteam.build')).toEqual([]);
+    const twice = await h.exec('definition.import', { items: [{ definition: buildType() }, { definition: buildType() }] }, HUMAN);
+    expect(twice).toMatchObject({ ok: false, error: { code: 'validation_failed' } });
+    expect(await status('myteam.build')).toEqual([]);
+    const tampered = await h.exec('definition.import', { items: [{ definition: { ...buildType(), checksum: definitionHash(buildTemplate()) } }] }, HUMAN);
+    expect(tampered).toMatchObject({ ok: false, error: { code: 'validation_failed' } });
+    expect(await status('myteam.build')).toEqual([]);
+  });
+
+  it('a change after the preview refuses the whole import (other content, a taken new id, a newer version)', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    // Preview: a brand-new node type and template; meanwhile someone saves the node type with other content.
+    const fresh = await preview(json(bundleOf([buildType()])));
+    await save(buildType(1, 'tools/other.cmd'));
+    expect(await h.exec('definition.import', { items: items(fresh) }, HUMAN)).toMatchObject({ ok: false, error: { code: 'invariant_violated' } });
+    expect(await status('myteam/build')).toEqual([]);
+
+    // Preview: overwrite as a new version (v2); meanwhile a v3 appears, so v2 would not be the newest any more.
+    const overwrite = await preview(json(bundleOf([buildType(1, 'tools/new.cmd')])), { 'nodeType:myteam.build@1': { action: 'newVersion' } });
+    expect(overwrite.saves[0]).toMatchObject({ expect: 'newVersion', definition: { version: 2 } });
+    await save(buildType(3, 'tools/someone-else.cmd'));
+    expect(await h.exec('definition.import', { items: items(overwrite) }, HUMAN)).toMatchObject({ ok: false, error: { code: 'invariant_violated' } });
+    expect(await status('myteam/build')).toEqual([]);
+
+    // Preview: a new id; meanwhile that id is created.
+    const renamed = await preview(json(bundleOf([buildType(1, 'tools/new.cmd')])), { 'nodeType:myteam.build@1': { action: 'newId', id: 'myteam.renamed' } });
+    expect(renamed.saves[0]).toMatchObject({ expect: 'newId' });
+    await save({ ...buildType(3), id: 'myteam.renamed', content: { ...buildType(3).content, type: 'myteam.renamed' } });
+    expect(await h.exec('definition.import', { items: items(renamed) }, HUMAN)).toMatchObject({ ok: false, error: { code: 'invariant_violated' } });
+    expect(await status('myteam/build')).toEqual([]);
+
+    // Preview: a version the id does not have yet (v4, added as it is); meanwhile v4 appears with other content.
+    const added = await preview(json(bundleOf([buildType(4, 'tools/four.cmd')], { ...buildTemplate(4), version: 1, content: { ...buildTemplate(4).content, version: 1 } })));
+    expect(added.saves[0]).toMatchObject({ definition: { version: 4 } });
+    expect(added.saves[0]?.expect).toBeUndefined();
+    await save(buildType(4, 'tools/someone-else-four.cmd'));
+    expect(await h.exec('definition.import', { items: items(added) }, HUMAN)).toMatchObject({ ok: false, error: { code: 'invariant_violated' } });
+    expect(await status('myteam/build')).toEqual([]);
+  });
+
+  it("a new id that is another item's id in the file cannot be saved, and new versions skip the file's own versions", async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    const pack = { ...buildType(), id: 'myteam.pack', name: 'Pack', content: { ...buildType().content, type: 'myteam.pack' } };
+    const clash = await preview(json(bundleOf([buildType(), pack])), { 'nodeType:myteam.build@1': { action: 'newId', id: 'myteam.pack' } });
+    expect(clash.items.find((item) => item.id === 'myteam.build')?.problems).toEqual(['myteam.pack을(를) 이 파일의 다른 항목도 쓰려고 합니다.']);
+    expect(clash.canSave).toBe(false);
+    await save(buildType(1, 'tools/old.cmd'));
+    const versions = await preview(json(bundleOf([buildType(1, 'tools/new.cmd'), buildType(2, 'tools/two.cmd')])), { 'nodeType:myteam.build@1': { action: 'newVersion' } });
+    expect(versions.items.filter((item) => item.kind === 'nodeType').map((item) => item.target?.version)).toEqual([3, 2]);
+    expect(versions.items.every((item) => item.problems.length === 0)).toBe(true);
+  });
+
+  it('a node type whose file cannot be written takes the template of its import with it', async () => {
+    const fs = new MemoryFileSystem();
+    h = await openWorkflowHarness({ noEngine: true, fs });
+    fs.failNext('rename', `${definitionPath(h.registry.root, 'nodeType', 'myteam.build', 1)}.tmp`);
+    const plan = await preview(json(bundleOf([buildType()])));
+    expect((await h.exec('definition.import', { items: items(plan) }, HUMAN)).ok).toBe(true);
+    await settled();
+    expect(await status('myteam.build')).toEqual(['1:abandoned']);
+    expect(await status('myteam/build')).toEqual(['1:abandoned']);
+    expect(await h.store.queryOne("SELECT reason FROM p_definitions WHERE id = 'myteam/build'")).toMatchObject({ reason: expect.stringMatching(/needs node type myteam\.build@1/) as string });
   });
 });

@@ -29,6 +29,7 @@ import { canonicalJson, sha256Hex } from '../commands/fingerprint.ts';
 import { type CompiledNodeType, compileNodeType, compileWorkflow } from './compile.ts';
 import { workflowView } from '../daemon/workflow-view.ts';
 import { type DefinitionRow, definitionHash } from './definitions.ts';
+import { placeholdersIn, SecretScrubber, scrubNodeType, scrubTemplate } from './secrets.ts';
 
 /**
  * Exporting and importing definitions as JSON ([[공유·권한·BlackBoard 설계]] §1, [[명령·이벤트 계약]] §17).
@@ -48,9 +49,6 @@ export class ExchangeError extends Error {
     this.code = code;
   }
 }
-
-/** Parameter names whose values may be secrets: their values never leave in an export. */
-export const SECRET_NAME = /(token|secret|passw(or)?d|passphrase|api[-_]?key|access[-_]?key|private[-_]?key|credential)/i;
 
 /** What export and import read from this engine. */
 export interface ExchangeSource {
@@ -87,46 +85,10 @@ function credentialsOf(requires: DefinitionEnvelope['requires'], added: readonly
   return [...new Set([...(requires?.credentials ?? []), ...added])];
 }
 
-/** Script environment values and secret-looking param defaults leave the node type; the names stay as credentials. */
-export function redactNodeType(definition: NodeTypeDefinition, pointer = ''): { definition: NodeTypeDefinition; redacted: RedactedField[] } {
-  const redacted: RedactedField[] = [];
-  const credentials: string[] = [];
-  const at = `${definition.id}@${definition.version}`;
-  const content: NodeTypeSpec = structuredClone(definition.content);
-  if (content.script?.env !== undefined) {
-    for (const name of Object.keys(content.script.env)) {
-      redacted.push({ path: `${pointer}/content/script/env/${name}`, label: `${at} · 스크립트 환경 변수 ${name}` });
-      credentials.push(`env:${name}`);
-    }
-    delete content.script.env;
-  }
-  content.params.forEach((param, index) => {
-    if (SECRET_NAME.test(param.name) && Object.hasOwn(param.schema, 'default')) {
-      redacted.push({ path: `${pointer}/content/params/${index}/schema/default`, label: `${at} · 파라미터 ${param.name}의 기본값` });
-      credentials.push(`param:${param.name}`);
-      delete param.schema.default;
-    }
-  });
-  if (redacted.length === 0) return { definition, redacted };
-  const requires = { ...definition.requires, credentials: credentialsOf(definition.requires, credentials) };
-  return { definition: { ...definition, requires, content }, redacted };
-}
-
-/** Secret-looking param values of a template's nodes leave the template; the names stay as credentials. */
-export function redactTemplate(spec: TemplateSpec, pointer: string): { content: TemplateSpec; redacted: RedactedField[]; credentials: string[] } {
-  const redacted: RedactedField[] = [];
-  const credentials: string[] = [];
-  const content: TemplateSpec = structuredClone(spec);
-  content.nodes.forEach((node, index) => {
-    if (node.params === undefined) return;
-    for (const name of Object.keys(node.params)) {
-      if (!SECRET_NAME.test(name)) continue;
-      redacted.push({ path: `${pointer}/nodes/${index}/params/${name}`, label: `${spec.id}@${spec.version} · 노드 ${node.label ?? node.id}의 파라미터 ${name}` });
-      credentials.push(`param:${node.id}.${name}`);
-    }
-    node.params = Object.fromEntries(Object.entries(node.params).filter(([name]) => !SECRET_NAME.test(name)));
-  });
-  return { content, redacted, credentials };
+/** A definition with what the scrubber found named in `requires.credentials` (unchanged when it found nothing). */
+function withCredentials<T extends DefinitionEnvelope>(original: T, cleaned: T, found: readonly string[]): T {
+  if (found.length === 0) return original;
+  return { ...cleaned, requires: { ...original.requires, credentials: credentialsOf(original.requires, found) } };
 }
 
 /** `type → version` of the node types a template uses (the highest version when it uses several). */
@@ -137,12 +99,20 @@ export function requiredNodeTypes(spec: TemplateSpec): Record<string, number> {
 }
 
 function fileName(id: string, version: number): string {
-  return `${id.replace(/\//g, '.')}@${version}.json`;
+  return `${id.replace(/\//g, '.')}@${String(version)}.json`;
+}
+
+/** A node type for export, with what was replaced (secrets.ts). */
+export function redactNodeType(definition: NodeTypeDefinition, pointer = ''): { definition: NodeTypeDefinition; redacted: RedactedField[] } {
+  const scrubber = new SecretScrubber();
+  const cleaned = scrubNodeType(definition, pointer, scrubber);
+  return { definition: withCredentials(definition, cleaned, scrubber.credentials), redacted: scrubber.findings };
 }
 
 /**
  * The export of one active definition. A template is a bundle with the node types it uses unless
- * `embedNodeTypes` is false.
+ * `embedNodeTypes` is false. Secrets are replaced by placeholders and listed (secrets.ts); the app shows the list
+ * and the person confirms before the text is written or copied.
  */
 export async function exportDefinition(
   source: ExchangeSource,
@@ -154,21 +124,28 @@ export async function exportDefinition(
     return { document: withChecksum(definition), fileName: fileName(found.id, found.version), redacted };
   }
   const template = found;
-  const { content, redacted, credentials } = redactTemplate(template.content, request.embedNodeTypes === false ? '/content' : '/content/content');
-  // Unchanged when nothing was left out, so importing it here finds the same version.
-  const cleaned: TemplateDefinition = credentials.length === 0 ? template : { ...template, requires: { ...template.requires, credentials: credentialsOf(template.requires, credentials) }, content };
-  if (request.embedNodeTypes === false) return { document: withChecksum(cleaned), fileName: fileName(template.id, template.version), redacted };
-  const embedded: NodeTypeDefinition[] = [];
+  const types: NodeTypeDefinition[] = [];
   const seen = new Set<string>();
-  for (const node of content.nodes) {
+  for (const node of template.content.nodes) {
     const key = nodeTypeKey(node.type, node.version);
     if (seen.has(key)) continue;
     seen.add(key);
-    const type = (await active(source, 'nodeType', node.type, node.version)) as NodeTypeDefinition;
-    const redactedType = redactNodeType(type, `/embedded/${embedded.length}`);
-    redacted.push(...redactedType.redacted);
-    embedded.push(withChecksum(redactedType.definition));
+    types.push((await active(source, 'nodeType', node.type, node.version)) as NodeTypeDefinition);
   }
+  const declared = (type: string, version: number, param: string) =>
+    types.some((each) => each.id === type && each.version === version && each.content.params.some((spec) => spec.name === param && spec.secret === true));
+  const embed = request.embedNodeTypes !== false;
+  const scrubber = new SecretScrubber();
+  const content = scrubTemplate(template.content, embed ? '/content/content' : '/content', declared, scrubber);
+  // Unchanged when nothing was found, so importing it here finds the same version.
+  const cleaned = withCredentials(template, { ...template, content }, scrubber.credentials);
+  if (!embed) return { document: withChecksum(cleaned), fileName: fileName(template.id, template.version), redacted: scrubber.findings };
+  const redacted = [...scrubber.findings];
+  const embedded = types.map((type, index) => {
+    const result = redactNodeType(type, `/embedded/${String(index)}`);
+    redacted.push(...result.redacted);
+    return withChecksum(result.definition);
+  });
   const allCredentials = credentialsOf(cleaned.requires, embedded.flatMap((type) => type.requires?.credentials ?? []));
   const bundle: ExportBundle = {
     vuyro: 'export',
@@ -179,7 +156,7 @@ export async function exportDefinition(
     name: template.name,
     ...(template.description === undefined ? {} : { description: template.description }),
     ...(template.author === undefined ? {} : { author: template.author }),
-    requires: { nodeTypes: requiredNodeTypes(content), ...(allCredentials.length === 0 ? {} : { credentials: allCredentials }) },
+    requires: { nodeTypes: requiredNodeTypes(template.content), ...(allCredentials.length === 0 ? {} : { credentials: allCredentials }) },
     content: withChecksum(cleaned),
     embedded,
   };
@@ -341,9 +318,10 @@ export async function previewImport(source: ExchangeSource, text: string, choice
   const rows = (await source.rows()).filter((row) => row.status !== 'abandoned');
   const versionsOf = (kind: DefinitionKind, id: string) => rows.filter((row) => row.kind === kind && row.id === id);
 
-  // Where each entry goes.
+  // Where each entry goes. A new version is newer than every version here and in the file.
   const nextVersion = new Map<string, number>();
-  const claimedIds = new Set<string>();
+  const fileMax = new Map<string, number>();
+  for (const { kind, definition } of entries) fileMax.set(`${kind}:${definition.id}`, Math.max(fileMax.get(`${kind}:${definition.id}`) ?? 0, definition.version));
   const planned = entries.map((entry) => {
     const { definition } = entry;
     const existing = versionsOf(entry.kind, definition.id);
@@ -367,7 +345,7 @@ export async function previewImport(source: ExchangeSource, text: string, choice
     if (action === 'add') target = { id: definition.id, version: definition.version, name };
     else if (action === 'newVersion') {
       const key = `${entry.kind}:${definition.id}`;
-      const version = Math.max(nextVersion.get(key) ?? 0, definition.version, ...existing.map((row) => row.version)) + 1;
+      const version = Math.max(nextVersion.get(key) ?? fileMax.get(key) ?? 0, definition.version, ...existing.map((row) => row.version)) + 1;
       nextVersion.set(key, version);
       target = { id: definition.id, version, name };
     } else if (action === 'newId') {
@@ -377,15 +355,34 @@ export async function previewImport(source: ExchangeSource, text: string, choice
         problems.push(entry.kind === 'nodeType' ? '새 id를 적으세요(예: myteam.build).' : '새 id를 적으세요(예: myteam/ai-sdlc).');
       } else if (versionsOf(entry.kind, id).length > 0) {
         problems.push(`${id}은(는) 이미 있는 id입니다. 다른 id를 적거나 덮어쓰기(새 버전)를 고르세요.`);
-      } else if (claimedIds.has(`${entry.kind}:${id}`)) {
-        problems.push(`${id}을(를) 이 파일의 다른 항목도 쓰려고 합니다.`);
       } else {
-        claimedIds.add(`${entry.kind}:${id}`);
         target = { id, version: definition.version, name };
       }
     }
-    return { entry, state, actions, action, target, problems, hash, existing: existing.map((row) => row.version).sort((a, b) => a - b) };
+    // What the person saw, for the engine to check again when saving (the engine may change in between).
+    const expect: 'newId' | 'newVersion' | undefined = action === 'newId' || (action === 'add' && state === 'new') ? 'newId' : action === 'newVersion' ? 'newVersion' : undefined;
+    return { entry, state, actions, action, target, expect, problems, hash, existing: existing.map((row) => row.version).sort((a, b) => a - b) };
   });
+
+  // All final targets together (kept ids, new ids, new versions): one item per id@version, and a new id only for the
+  // item that takes it. Saving checks the same against the engine again, all or nothing.
+  const targetKey = (plan: (typeof planned)[number]) => (plan.target === undefined ? undefined : `${plan.entry.kind}:${plan.target.id}`);
+  const byVersion = new Map<string, number>();
+  for (const plan of planned) {
+    const key = targetKey(plan);
+    if (key === undefined || plan.target === undefined) continue;
+    const exact = `${key}@${String(plan.target.version)}`;
+    byVersion.set(exact, (byVersion.get(exact) ?? 0) + 1);
+  }
+  for (const plan of planned) {
+    const key = targetKey(plan);
+    if (key === undefined || plan.target === undefined) continue;
+    if (plan.action === 'newId' && planned.some((other) => other !== plan && targetKey(other) === key)) {
+      plan.problems.push(`${plan.target.id}을(를) 이 파일의 다른 항목도 쓰려고 합니다.`);
+    } else if ((byVersion.get(`${key}@${String(plan.target.version)}`) ?? 0) > 1) {
+      plan.problems.push(`${plan.target.id}@${String(plan.target.version)}에 이 파일의 두 항목이 저장됩니다. 한쪽을 새 id나 덮어쓰기(새 버전)로 바꾸세요.`);
+    }
+  }
 
   // Node types the import renames or re-versions: templates in the file follow them.
   const rewrites = new Map<string, { type: string; version: number }>();
@@ -452,7 +449,7 @@ export async function previewImport(source: ExchangeSource, text: string, choice
       const { nodeType, issues } = compileNodeType(definition.content, source.dataValidator);
       if (nodeType === undefined) plan.problems.push(...issueLines(issues));
       else compiledPlanned.set(nodeTypeKey(target.id, target.version), nodeType);
-      saves.push({ type: 'nodeType.save', definition });
+      saves.push({ type: 'nodeType.save', definition, ...(plan.expect === undefined ? {} : { expect: plan.expect }) });
       continue;
     }
     // Templates are compiled against the node types they would run with, also when skipped (for the picture).
@@ -484,7 +481,7 @@ export async function previewImport(source: ExchangeSource, text: string, choice
     const definition: TemplateDefinition = changed
       ? { ...stripChecksum(template), id: target.id, version: target.version, name: target.name, ...(requires === undefined ? {} : { requires }), content }
       : template;
-    saves.push({ type: 'template.save', definition });
+    saves.push({ type: 'template.save', definition, ...(plan.expect === undefined ? {} : { expect: plan.expect }) });
   }
 
   const items = planned.map((plan): ImportItem => {
@@ -538,7 +535,8 @@ export async function previewImport(source: ExchangeSource, text: string, choice
     ...(read.document === undefined ? {} : { document: read.document }),
     items,
     dependencies: [...dependencies.values()],
-    credentials: read.credentials ?? [],
+    // Named by the exporter, and any placeholder in the text even if the name list was edited away.
+    credentials: [...new Set([...(read.credentials ?? []), ...placeholdersIn(text)])],
     saves,
     canSave: !blocked && saves.length > 0,
   };

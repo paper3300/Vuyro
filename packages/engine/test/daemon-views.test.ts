@@ -284,7 +284,8 @@ describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
     const key = 'template:vuyro/ai-sdlc@1';
     const plan = await ui.request<ImportPreview>(RPC_METHODS.importPreview, { text, choices: { [key]: { action: 'newId', id: 'myteam/ai-sdlc', name: 'AI-Native SDLC (copy)' } } });
     expect(plan.canSave).toBe(true);
-    for (const save of plan.saves) await ui.execute({ requestId: rid(), type: save.type, payload: { definition: save.definition } });
+    const items = plan.saves.map((save) => ({ definition: save.definition, ...(save.expect === undefined ? {} : { expect: save.expect }) }));
+    await ui.execute({ requestId: rid(), type: 'definition.import', payload: { items } });
     await until(
       () => ui.request<{ definitions: DefinitionListing[] }>(RPC_METHODS.definitions, { kind: 'template' }),
       (value) => value.definitions.some((each) => each.id === 'myteam/ai-sdlc' && each.status === 'active'),
@@ -308,7 +309,7 @@ describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
     // Previews are reads: an unverified client may look, never save; and the text is checked as untrusted.
     const reader = await h.connect();
     expect((await reader.request<ImportPreview>(RPC_METHODS.importPreview, { text: '[]' })).readable).toBe(false);
-    await expect(reader.execute({ requestId: rid(), type: 'template.save', payload: { definition: plan.saves[0]?.definition } })).rejects.toMatchObject({ data: { code: 'forbidden' } });
+    await expect(reader.execute({ requestId: rid(), type: 'definition.import', payload: { items } })).rejects.toMatchObject({ data: { code: 'forbidden' } });
     await expect(ui.request(RPC_METHODS.importPreview, { text: 'x'.repeat(4 * 1024 * 1024 + 1) })).rejects.toMatchObject({ rpcCode: -32602 });
     await expect(ui.request(RPC_METHODS.exportDefinition, { kind: 'template', id: 'myteam/none' })).rejects.toMatchObject({ data: { code: 'not_found' } });
   });

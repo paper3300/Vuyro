@@ -1,7 +1,7 @@
 import { useQueryClient } from '@tanstack/react-query';
 import type { DefinitionListing, ImportAction, ImportChoice, ImportDependency, ImportItem, ImportPreview, NodeExecutionPreview } from '@vuyro/contracts';
 import { useEffect, useState } from 'react';
-import { bridge, call, execute } from '../api.ts';
+import { ApiError, bridge, call, execute } from '../api.ts';
 import { errorText } from '../format.ts';
 import { useImportPreview } from '../queries.ts';
 import { useCanWrite } from '../store.ts';
@@ -141,20 +141,28 @@ function ImportReview({
     setConfirmed(false);
   }, [choices]);
 
+  // One command stages every definition of the import or none; then the engine writes and activates them.
   const save = async (plan: ImportPreview) => {
     setSaving(true);
     setError(undefined);
-    const done: string[] = [];
     try {
+      const items = plan.saves.map((step) => ({ definition: step.definition, ...(step.expect === undefined ? {} : { expect: step.expect }) }));
+      await execute('definition.import', { items });
+      const labels: string[] = [];
       for (const step of plan.saves) {
         const definition = step.definition as { kind: string; id: string; version: number };
-        await execute(step.type, { definition: step.definition });
         await untilActive(definition.kind, definition.id, definition.version);
-        done.push(`${definition.id}@${String(definition.version)}`);
+        labels.push(`${definition.id}@${String(definition.version)}`);
       }
-      setSaved(done);
+      setSaved(labels);
     } catch (failure) {
-      setError(`${errorText(failure)}${done.length > 0 ? ` (이미 저장된 것: ${done.join(', ')})` : ''}`);
+      setError(
+        failure instanceof ApiError && failure.code === 'invariant_violated'
+          ? `그 사이 이 엔진의 정의가 바뀌어 아무것도 저장하지 않았습니다. 다시 미리보기 하세요. (${failure.message})`
+          : errorText(failure),
+      );
+      setConfirmed(false);
+      await preview.refetch();
     } finally {
       setSaving(false);
       await client.invalidateQueries({ queryKey: ['definitions'] });

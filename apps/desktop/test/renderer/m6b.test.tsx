@@ -249,7 +249,7 @@ const PREVIEW: ImportPreview = {
 describe('JSON import', () => {
   it('shows dependencies, conflicts and what each node runs before anything is saved; saving needs the person to confirm', async () => {
     const asked: unknown[] = [];
-    const saved = { type: 'nodeType.save' as const, definition: { kind: 'nodeType', id: 'myteam.build', version: 2 } };
+    const saved = { type: 'nodeType.save' as const, definition: { kind: 'nodeType', id: 'myteam.build', version: 2 }, expect: 'newVersion' as const };
     const savedTemplate = { type: 'template.save' as const, definition: { kind: 'template', id: 'myteam/build', version: 1 } };
     const { commands } = installBridge({
       'query.importPreview': (params) => {
@@ -297,10 +297,29 @@ describe('JSON import', () => {
     expect(save).toBeEnabled();
     await userEvent.click(save);
     expect(await screen.findByText('가져왔습니다: myteam.build@2, myteam/build@1')).toBeInTheDocument();
-    expect(commands).toEqual([
-      { type: 'nodeType.save', payload: { definition: saved.definition } },
-      { type: 'template.save', payload: { definition: savedTemplate.definition } },
-    ]);
+    // One command, all or nothing.
+    expect(commands).toEqual([{ type: 'definition.import', payload: { items: [{ definition: saved.definition, expect: 'newVersion' }, { definition: savedTemplate.definition }] } }]);
+  });
+
+  it('when the engine changed after the preview, nothing is saved and the preview is asked again', async () => {
+    let previews = 0;
+    const { commands } = installBridge({
+      'query.importPreview': () => {
+        previews += 1;
+        return { ...PREVIEW, items: [PREVIEW.items[1]], saves: [{ type: 'template.save', definition: { kind: 'template', id: 'myteam/build', version: 1 }, expect: 'newId' }], canSave: true };
+      },
+      'command.execute': () => Object.assign(new Error('template myteam/build exists now; preview the import again'), { code: 'invariant_violated' }),
+    });
+    renderWithClient(<ImportDialog onClose={() => undefined} />);
+    await userEvent.click(screen.getByLabelText('JSON 붙여넣기'));
+    await userEvent.paste('{}');
+    await userEvent.click(screen.getByRole('button', { name: '미리보기' }));
+    await userEvent.click(await screen.findByRole('checkbox', { name: /확인했습니다/ }));
+    await userEvent.click(screen.getByRole('button', { name: '가져오기 (1개 저장)' }));
+    expect(await screen.findByText(/그 사이 이 엔진의 정의가 바뀌어 아무것도 저장하지 않았습니다/)).toBeInTheDocument();
+    expect(commands).toHaveLength(1);
+    expect(previews).toBe(2);
+    expect(screen.getByRole('checkbox', { name: /확인했습니다/ })).not.toBeChecked();
   });
 
   it('a file the person picks is read by the main process; unreadable text says why and saves nothing', async () => {
@@ -384,11 +403,14 @@ describe('JSON import', () => {
 });
 
 describe('JSON export', () => {
-  it('says what was left out, then saves the file through the main process or copies it', async () => {
+  it('lists what was replaced (certain and suspected); only after the person checks it does the file or clipboard get it', async () => {
     const exported: ExportResult = {
       document: { vuyro: 'export', kind: 'bundle', id: 'myteam/build' },
       fileName: 'myteam.build@1.json',
-      redacted: [{ path: '/embedded/0/content/script/env/BUILD_TOKEN', label: 'myteam.build@1 · 스크립트 환경 변수 BUILD_TOKEN' }],
+      redacted: [
+        { path: '/embedded/0/content/script/env/BUILD_TOKEN', label: 'myteam.build@1 · 스크립트 환경 변수 BUILD_TOKEN', reason: 'env', placeholder: '${secret:myteam.build.env.BUILD_TOKEN}' },
+        { path: '/embedded/0/content/script/args/1', label: 'myteam.build@1', reason: 'pattern', looksLike: 'GitHub 토큰', placeholder: '${secret:myteam.build.script.args.1}' },
+      ],
     };
     const asked: unknown[] = [];
     const { saveJsonFile, copyText } = installBridge({
@@ -403,7 +425,15 @@ describe('JSON export', () => {
     expect(await screen.findByRole('group', { name: 'Build flow 미리보기' })).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: '내보낼 내용 만들기' }));
     expect(await screen.findByText('myteam.build@1 · 스크립트 환경 변수 BUILD_TOKEN')).toBeInTheDocument();
+    const note = screen.getByRole('note', { name: '바꾼 비밀값' });
+    expect(note).toHaveTextContent('비밀값이라 자리표시자로 바꿨습니다 (1)');
+    expect(note).toHaveTextContent('토큰·키로 의심되어 바꿨습니다 (1)');
+    expect(note).toHaveTextContent('GitHub 토큰');
+    expect(note).toHaveTextContent('→ ${secret:myteam.build.script.args.1}');
     expect(asked).toEqual([{ kind: 'template', id: 'myteam/build', version: 1, embedNodeTypes: true }]);
+    expect(screen.getByRole('button', { name: '파일로 저장…' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '클립보드에 복사' })).toBeDisabled();
+    await userEvent.click(screen.getByRole('checkbox', { name: /바꾼 목록과 내용을 확인했습니다/ }));
     await userEvent.click(screen.getByRole('button', { name: '파일로 저장…' }));
     expect(saveJsonFile).toHaveBeenCalledWith('myteam.build@1.json', JSON.stringify(exported.document, null, 2));
     expect(await screen.findByText('saved.json(으)로 저장했습니다.')).toBeInTheDocument();

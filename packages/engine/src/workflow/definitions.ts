@@ -76,6 +76,8 @@ export interface DefinitionResolver {
   workflow(pin: PinnedTemplate): Promise<CompiledWorkflow>;
   /** Reads a definition file and returns its hash (undefined if missing or unreadable). */
   fileHash(kind: DefinitionKind, id: string, version: number): Promise<string | undefined>;
+  /** Reads and shape-checks a definition file. Throws DefinitionLoadError. */
+  readFile(kind: DefinitionKind, id: string, version: number): Promise<DefinitionEnvelope>;
 }
 
 export interface DefinitionRegistryOptions {

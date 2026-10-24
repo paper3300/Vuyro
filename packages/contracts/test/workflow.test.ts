@@ -81,7 +81,7 @@ describe('workflow contracts', () => {
 
   it('opens node.done to node agents and keeps approvals and engine steps away from them', () => {
     expect(COMMAND_CATALOG['node.done'].access.nodeAgent).toBe('own-node');
-    for (const type of ['node.approve', 'node.reject', 'node.retry', 'node.pause', 'node.resume', 'nodeType.save', 'template.save'] as const) {
+    for (const type of ['node.approve', 'node.reject', 'node.retry', 'node.pause', 'node.resume', 'nodeType.save', 'template.save', 'definition.import'] as const) {
       expect(COMMAND_CATALOG[type].access.nodeAgent, type).toBe('deny');
     }
     for (const type of ['node.start', 'node.finish', 'definition.activate', 'definition.abandon'] as const) {

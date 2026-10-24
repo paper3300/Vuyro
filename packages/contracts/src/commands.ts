@@ -11,6 +11,7 @@ import {
   DEFINITION_ID_PATTERN,
   DEFINITION_KINDS,
   HashSchema,
+  DefinitionEnvelopeSchema,
   NodeTypeDefinitionSchema,
   TEMPLATE_ID_PATTERN,
   TemplateDefinitionSchema,
@@ -494,6 +495,35 @@ export const COMMAND_CATALOG = {
     summary: 'Save a workflow template version (stages it; the engine writes the file and activates it).',
     payload: Type.Object({ definition: TemplateDefinitionSchema }, strict),
     result: DefinitionSaveResult,
+  },
+  /**
+   * An import (M6b review): every definition of one file staged in one commit, all or nothing. Templates are checked
+   * against the node types of the same import. `expect` is what the person saw in the preview: `newId` = the id must
+   * have no versions yet; `newVersion` = the version must be newer than every version of the id. If the engine changed
+   * in between, the whole import is refused.
+   */
+  'definition.import': {
+    version: 1,
+    scope: 'app',
+    category: 'definition',
+    access: { nodeAgent: 'deny' },
+    summary: 'Save the definitions of one import together (all or nothing).',
+    payload: Type.Object(
+      {
+        items: Type.Array(
+          Type.Object(
+            {
+              definition: DefinitionEnvelopeSchema,
+              expect: Type.Optional(Type.Union([Type.Literal('newId'), Type.Literal('newVersion')])),
+            },
+            strict,
+          ),
+          { minItems: 1, maxItems: 201 },
+        ),
+      },
+      strict,
+    ),
+    result: Type.Object({ saved: Type.Array(DefinitionSaveResult) }, strict),
   },
   'definition.activate': {
     version: 1,

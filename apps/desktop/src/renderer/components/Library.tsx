@@ -1,4 +1,4 @@
-import type { DefinitionListing, ExportResult } from '@vuyro/contracts';
+import type { DefinitionListing, ExportResult, RedactedField } from '@vuyro/contracts';
 import { useState } from 'react';
 import { bridge, call } from '../api.ts';
 import { errorText } from '../format.ts';
@@ -103,12 +103,16 @@ export function ExportPanel({ row }: { row: DefinitionListing }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [done, setDone] = useState<string>();
+  const [checked, setChecked] = useState(false);
   const text = result === undefined ? undefined : JSON.stringify(result.document, null, 2);
+  // What was replaced must be looked at before the text leaves (a file or the clipboard).
+  const cleared = result !== undefined && (result.redacted.length === 0 || checked);
 
   const prepare = async () => {
     setBusy(true);
     setError(undefined);
     setDone(undefined);
+    setChecked(false);
     try {
       setResult(await call<ExportResult>('query.exportDefinition', { kind: row.kind, id: row.id, version: row.version, ...(row.kind === 'template' ? { embedNodeTypes: embed } : {}) }));
     } catch (failure) {
@@ -118,14 +122,14 @@ export function ExportPanel({ row }: { row: DefinitionListing }) {
     }
   };
   const save = async () => {
-    if (result === undefined || text === undefined) return;
+    if (result === undefined || text === undefined || !cleared) return;
     setError(undefined);
     const saved = await bridge().saveJsonFile(result.fileName, text);
     if (!saved.ok) setError(errorText(saved.error));
     else if (saved.value !== null) setDone(`${saved.value.name}(으)로 저장했습니다.`);
   };
   const copy = async () => {
-    if (text === undefined) return;
+    if (text === undefined || !cleared) return;
     setError(undefined);
     const copied = await bridge().copyText(text);
     if (!copied.ok) setError(errorText(copied.error));
@@ -158,19 +162,15 @@ export function ExportPanel({ row }: { row: DefinitionListing }) {
           {result.redacted.length === 0 ? (
             <p className="text-[13px] text-done">비밀값으로 보이는 내용이 없어 그대로 내보냅니다.</p>
           ) : (
-            <div role="note" className="rounded-lg border border-human/30 bg-human/10 px-3 py-2 text-[13px]">
-              <b className="text-human">비밀값일 수 있어 빼고 내보냅니다 ({result.redacted.length})</b>
-              <ul className="mt-1 list-disc pl-5">
-                {result.redacted.map((field) => (
-                  <li key={field.path}>{field.label}</li>
-                ))}
-              </ul>
-              <p className="mt-1 text-muted">받는 쪽에는 이름만 `requires.credentials`로 전해집니다. 값은 받는 사람이 채워야 합니다.</p>
-            </div>
+            <Redactions redacted={result.redacted} checked={checked} onCheck={setChecked} />
           )}
           <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={() => void save()}>파일로 저장…</Button>
-            <Button onClick={() => void copy()}>클립보드에 복사</Button>
+            <Button disabled={!cleared} title={cleared ? undefined : '바꾼 내용을 먼저 확인하세요'} onClick={() => void save()}>
+              파일로 저장…
+            </Button>
+            <Button disabled={!cleared} title={cleared ? undefined : '바꾼 내용을 먼저 확인하세요'} onClick={() => void copy()}>
+              클립보드에 복사
+            </Button>
             <Chip tone="wait">{result.fileName}</Chip>
           </div>
           {done !== undefined && <p className="text-[13px] text-done">{done}</p>}
@@ -182,5 +182,59 @@ export function ExportPanel({ row }: { row: DefinitionListing }) {
       )}
       <ErrorNote error={error} />
     </section>
+  );
+}
+
+const REASON: Readonly<Record<RedactedField['reason'], string>> = {
+  declared: '노드 타입이 비밀로 선언',
+  env: '스크립트 환경 변수',
+  name: '이름이 비밀처럼 보임',
+  pattern: '값이 토큰·키처럼 보임',
+};
+
+/**
+ * What the export replaced: certain (declared, environment, name) and suspected (by look). Placeholders take their
+ * place; the person confirms before the text leaves. Guessing is never complete, so the list says so.
+ */
+function Redactions({ redacted, checked, onCheck }: { redacted: readonly RedactedField[]; checked: boolean; onCheck: (checked: boolean) => void }) {
+  const removed = redacted.filter((field) => field.reason !== 'pattern');
+  const suspected = redacted.filter((field) => field.reason === 'pattern');
+  const list = (fields: readonly RedactedField[]) => (
+    <ul className="mt-1 flex flex-col gap-0.5">
+      {fields.map((field, index) => (
+        <li key={`${field.path}#${String(index)}`} className="flex flex-wrap gap-x-2">
+          <span>{field.label}</span>
+          <span className="text-muted">
+            {field.looksLike ?? REASON[field.reason]}
+            {field.placeholder === undefined ? ' · 값 뺌' : ''}
+          </span>
+          {field.placeholder !== undefined && <span className="font-mono text-[12px]">→ {field.placeholder}</span>}
+          <span className="font-mono text-[11px] text-muted">{field.path}</span>
+        </li>
+      ))}
+    </ul>
+  );
+  return (
+    <div role="note" aria-label="바꾼 비밀값" className="flex flex-col gap-2 rounded-lg border border-human/30 bg-human/10 px-3 py-2 text-[13px]">
+      {removed.length > 0 && (
+        <div>
+          <b className="text-human">비밀값이라 자리표시자로 바꿨습니다 ({removed.length})</b>
+          {list(removed)}
+        </div>
+      )}
+      {suspected.length > 0 && (
+        <div>
+          <b className="text-human">토큰·키로 의심되어 바꿨습니다 ({suspected.length})</b>
+          {list(suspected)}
+        </div>
+      )}
+      <p className="text-muted">
+        받는 쪽에는 자리표시자와 이름(`requires.credentials`)만 갑니다. 값은 받는 사람이 채웁니다. 추정은 완전하지 않습니다: 「내용 보기」로 남은 값이 없는지 보세요. 확실히 빼려면 노드 타입의 파라미터에 `secret: true`를 적으세요.
+      </p>
+      <label className="flex items-start gap-2">
+        <input type="checkbox" checked={checked} onChange={(event) => { onCheck(event.target.checked); }} className="mt-0.5" />
+        <span>바꾼 목록과 내용을 확인했습니다. 이대로 내보냅니다.</span>
+      </label>
+    </div>
   );
 }

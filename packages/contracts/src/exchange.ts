@@ -73,13 +73,29 @@ export const ExportDefinitionQuerySchema = Type.Object(
   { additionalProperties: false },
 );
 
-/** Something left out of an export because it may be a secret. */
+/**
+ * Something replaced in an export because it is or may be a secret. The value is never sent back: the export holds a
+ * `${secret:<name>}` placeholder (or nothing, for a non-text value) and `requires.credentials` lists the name.
+ * - declared: a param the node type marks `secret: true` (the authority).
+ * - env: a script environment value (values are not shown to the engine's guesswork; all leave).
+ * - name: a param whose name looks like a secret.
+ * - pattern: a value that looks like a token or key (known prefixes, private keys, long random text). A guess, so
+ *   the person checks the list before the file or clipboard gets it.
+ */
 export interface RedactedField {
   /** JSON pointer in the exported document. */
   readonly path: string;
   /** In words: which definition and which field (`p4.sync@1 · 환경 변수 P4PASSWD`). */
   readonly label: string;
+  readonly reason: 'declared' | 'env' | 'name' | 'pattern';
+  /** pattern: what it looked like (`GitHub 토큰`, `개인 키`, `긴 무작위 문자열`). */
+  readonly looksLike?: string;
+  /** The placeholder now in the export, if the value was text. */
+  readonly placeholder?: string;
 }
+
+/** `${secret:<name>}`: where an exported secret was. Importing lists them; the person fills them in. */
+export const SECRET_PLACEHOLDER_PATTERN = String.raw`\$\{secret:([A-Za-z0-9_.@-]{1,120})\}`;
 
 export interface ExportResult {
   /** The document to write or copy (a definition envelope or a bundle), with its checksum. */
@@ -210,8 +226,11 @@ export interface ImportPreview {
   readonly dependencies: readonly ImportDependency[];
   /** Secrets the exporter left out (`requires.credentials`): the import runs without them. */
   readonly credentials: readonly string[];
-  /** The commands that save the import, in order (node types first). Empty when nothing would be saved. */
-  readonly saves: readonly { readonly type: 'nodeType.save' | 'template.save'; readonly definition: Readonly<Record<string, unknown>> }[];
+  /**
+   * What the import saves, in order (node types first): the items of one `definition.import` command, which stages
+   * them together or not at all. `expect` carries what the preview promised (a new id, the newest version).
+   */
+  readonly saves: readonly { readonly type: 'nodeType.save' | 'template.save'; readonly definition: Readonly<Record<string, unknown>>; readonly expect?: 'newId' | 'newVersion' }[];
   /** Nothing blocks saving and something would be saved. */
   readonly canSave: boolean;
 }
