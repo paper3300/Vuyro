@@ -66,7 +66,7 @@ const projects: Projector = {
 
 const tickets: Projector = {
   name: 'tickets',
-  version: 4,
+  version: 5,
   tables: ['p_tickets', 'p_artifacts'],
   ddl: [
     `CREATE TABLE p_tickets (
@@ -75,6 +75,7 @@ const tickets: Projector = {
       title TEXT NOT NULL,
       description TEXT,
       status TEXT NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 0,
       template_id TEXT,
       template_version INTEGER,
       template_hash TEXT,
@@ -122,14 +123,15 @@ function ticketStatements(event: DomainEvent): SqliteStatement[] {
       return [
         {
           sql: `INSERT INTO p_tickets
-                  (ticket_id, project_id, title, description, status, template_id, template_version, template_hash,
+                  (ticket_id, project_id, title, description, status, priority, template_id, template_version, template_hash,
                    created_at, updated_at, revision)
-                VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)`,
+                VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)`,
           params: [
             event.data.ticketId,
             event.data.projectId,
             event.data.title,
             event.data.description ?? null,
+            event.data.priority ?? 0,
             event.data.template?.id ?? null,
             event.data.template?.version ?? null,
             event.data.template?.hash ?? null,
@@ -145,12 +147,14 @@ function ticketStatements(event: DomainEvent): SqliteStatement[] {
           sql: `UPDATE p_tickets SET
                   title = COALESCE(?, title),
                   description = CASE WHEN ? THEN ? ELSE description END,
+                  priority = COALESCE(?, priority),
                   updated_at = ?, revision = ?
                 WHERE ticket_id = ?`,
           params: [
             event.data.title ?? null,
             event.data.description === undefined ? 0 : 1,
             event.data.description ?? null,
+            event.data.priority ?? null,
             event.timestamp,
             event.revision,
             event.data.ticketId,

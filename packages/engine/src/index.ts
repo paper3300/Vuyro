@@ -86,6 +86,7 @@ export { HumanCredentials } from './daemon/credentials.ts';
 export type { CredentialKind } from './daemon/credentials.ts';
 export { EngineQueries } from './daemon/queries.ts';
 export type { ArtifactRow, ProjectRow, TicketDetail, TicketRow } from './daemon/queries.ts';
+export { workflowView } from './daemon/workflow-view.ts';
 export { EngineClient, EngineRequestError, EngineUnavailableError, resolveEngineLocation } from './client/engine-client.ts';
 export type { EngineClientOptions } from './client/engine-client.ts';
 export { computeTicketStats, unionLength } from './stats/ticket-stats.ts';

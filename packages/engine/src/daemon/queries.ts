@@ -1,11 +1,26 @@
-import type { DomainEvent, PinnedTemplate, SharedNodeView, TicketStats, WorktreeCleanupCandidate } from '@vuyro/contracts';
+import type {
+  BoardResult,
+  BoardTicketView,
+  DomainEvent,
+  HandoffItem,
+  ItemView,
+  PinnedTemplate,
+  ReviewView,
+  SharedNodeView,
+  TemplateSummary,
+  TicketStats,
+  WorkflowView,
+  WorktreeCleanupCandidate,
+} from '@vuyro/contracts';
 import type { Clock } from '../runtime/clock.ts';
 import { currentDefinition, EMPTY_SHARED_NODE, evolveSharedNode, runningBatches } from '../shared/state.ts';
 import { computeTicketStats, type NodeKind } from '../stats/ticket-stats.ts';
 import type { EventStore } from '../store/event-store.ts';
 import type { DefinitionResolver } from '../workflow/definitions.ts';
+import type { CompiledWorkflow } from '../workflow/compile.ts';
 import { ticketWaitReasons, type WaitReason } from '../workflow/machine.ts';
 import { EMPTY_TICKET, evolveTicket } from '../workflow/state.ts';
+import { workflowView } from './workflow-view.ts';
 
 /**
  * Read side of the daemon: what screens and the CLI ask for. Everything comes from the projections and the
@@ -24,6 +39,8 @@ export interface TicketRow {
   readonly title: string;
   readonly description: string | null;
   readonly status: string;
+  /** Higher first when tickets compete for a claim; the board orders cards by it. */
+  readonly priority: number;
   readonly template: { readonly id: string; readonly version: number; readonly hash: string } | null;
   readonly createdAt: number;
   readonly updatedAt: number;
@@ -70,6 +87,10 @@ export interface TicketDetail {
   readonly runs: readonly Record<string, unknown>[];
   /** What the open ticket waits for (empty when done, undefined when the workflow cannot be read). */
   readonly waitingFor?: readonly WaitReason[];
+  /** The pinned workflow as screens draw it (undefined when its files no longer match). */
+  readonly workflow?: WorkflowView;
+  /** What waits for a person now, with what they decide on. */
+  readonly reviews: readonly ReviewView[];
 }
 
 interface RawTicket {
@@ -78,6 +99,7 @@ interface RawTicket {
   title: string;
   description: string | null;
   status: string;
+  priority: number;
   template_id: string | null;
   template_version: number | null;
   template_hash: string | null;
@@ -247,9 +269,112 @@ export class EngineQueries {
       [ticketId],
     );
     const runs = await this.store.query<Record<string, unknown>>(`SELECT ${RUN_COLUMNS} FROM p_runs WHERE ticket_id = ? ORDER BY started_at, run_id`, [ticketId]);
-    const waitingFor = await this.waitReasons(ticketId, ticket);
+    const events = await this.store.readAggregate(ticketId);
+    let state = EMPTY_TICKET;
+    for (const event of events) state = evolveTicket(state, event);
+    let workflow: CompiledWorkflow | undefined;
+    try {
+      workflow = state.template === undefined ? undefined : await this.definitions.workflow(state.template);
+    } catch {
+      workflow = undefined; // Changed definition files: the detail shows what the events hold.
+    }
+    const waitingFor = ticket.status !== 'open' ? [] : workflow === undefined ? undefined : ticketWaitReasons(state, workflow);
     const parsedLanes = lanes.map((row) => ({ ...row, waitingFor: typeof row.waitingFor === 'string' ? (JSON.parse(row.waitingFor) as unknown) : null }));
-    return { ticket, lanes: parsedLanes, executions, runs, ...(waitingFor === undefined ? {} : { waitingFor }) };
+    const reviewing = lanes.filter((row) => row.status === 'review').map((row) => ({ nodeId: String(row.nodeId), lane: String(row.lane), run: Number(row.run) }));
+    return {
+      ticket,
+      lanes: parsedLanes,
+      executions,
+      runs,
+      ...(waitingFor === undefined ? {} : { waitingFor }),
+      ...(workflow === undefined || state.template === undefined ? {} : { workflow: workflowView(workflow, state.template) }),
+      reviews: reviewViews(events, reviewing, workflow),
+    };
+  }
+
+  /** Active templates, the latest version of each, for choosing one when a ticket is created. */
+  async templates(): Promise<TemplateSummary[]> {
+    const rows = await this.store.query<{ id: string; version: number; hash: string }>(
+      "SELECT id, version, hash FROM p_definitions d WHERE kind = 'template' AND status = 'active' AND version = (SELECT MAX(version) FROM p_definitions e WHERE e.kind = 'template' AND e.id = d.id AND e.status = 'active') ORDER BY id",
+    );
+    const summaries: TemplateSummary[] = [];
+    for (const row of rows) {
+      try {
+        const loaded = await this.definitions.template(row.id, row.version);
+        if (loaded === undefined) continue;
+        summaries.push(workflowView(loaded.workflow, loaded.pin));
+      } catch (error) {
+        summaries.push({ id: row.id, version: row.version, hash: row.hash, name: row.id, nodes: [], edges: [], problem: (error as Error).message });
+      }
+    }
+    return summaries;
+  }
+
+  /**
+   * A project's board: its tickets with their lanes and token totals, and the workflows they pinned. One query per
+   * table, so the board does not ask once per ticket.
+   */
+  async board(projectId: string): Promise<BoardResult> {
+    const tickets = await this.tickets(projectId);
+    const lanes = await this.store.query<{ ticketId: string; nodeId: string; lane: string; run: number; status: string; waitingFor: string | null; updatedAt: number }>(
+      `SELECT l.ticket_id AS ticketId, l.node_id AS nodeId, l.lane, l.run, l.status, l.waiting_for AS waitingFor, l.updated_at AS updatedAt
+         FROM p_node_lanes l JOIN p_tickets t ON t.ticket_id = l.ticket_id WHERE t.project_id = ? ORDER BY l.node_id, l.lane`,
+      [projectId],
+    );
+    const usage = await this.store.query<{ ticketId: string; input: number; cacheRead: number; cacheWrite: number; output: number; reasoning: number }>(
+      `SELECT r.ticket_id AS ticketId, SUM(r.tokens_input) AS input, SUM(r.tokens_cache_read) AS cacheRead, SUM(r.tokens_cache_write) AS cacheWrite,
+              SUM(r.tokens_output) AS output, SUM(COALESCE(r.tokens_reasoning, 0)) AS reasoning
+         FROM p_runs r JOIN p_tickets t ON t.ticket_id = r.ticket_id WHERE t.project_id = ? GROUP BY r.ticket_id`,
+      [projectId],
+    );
+    const lanesBy = new Map<string, BoardTicketView['lanes'][number][]>();
+    for (const row of lanes) {
+      const list = lanesBy.get(row.ticketId) ?? [];
+      list.push({ nodeId: row.nodeId, lane: row.lane, run: row.run, status: row.status, waitingFor: row.waitingFor === null ? null : (JSON.parse(row.waitingFor) as unknown), updatedAt: row.updatedAt });
+      lanesBy.set(row.ticketId, list);
+    }
+    const usageBy = new Map(usage.map((row) => [row.ticketId, row]));
+    const workflows: Record<string, WorkflowView> = {};
+    for (const ticket of tickets) {
+      const pin = ticket.template;
+      if (pin === null) continue;
+      const key = `${pin.id}@${pin.version}`;
+      if (Object.hasOwn(workflows, key)) continue;
+      try {
+        // Versions never change content, so the active version with the same hash is what the ticket pinned.
+        const loaded = await this.definitions.template(pin.id, pin.version);
+        if (loaded !== undefined && loaded.pin.hash === pin.hash) workflows[key] = workflowView(loaded.workflow, loaded.pin);
+      } catch {
+        // Files no longer match: the board falls back to the lanes it has.
+      }
+    }
+    return {
+      tickets: tickets.map((ticket): BoardTicketView => {
+        const totals = usageBy.get(ticket.ticketId);
+        return {
+          ticketId: ticket.ticketId,
+          projectId: ticket.projectId,
+          title: ticket.title,
+          status: ticket.status,
+          priority: ticket.priority,
+          template: ticket.template,
+          createdAt: ticket.createdAt,
+          updatedAt: ticket.updatedAt,
+          completedAt: ticket.completedAt,
+          revision: ticket.revision,
+          attention: ticket.attention,
+          lanes: lanesBy.get(ticket.ticketId) ?? [],
+          tokens: {
+            input: totals?.input ?? 0,
+            cacheRead: totals?.cacheRead ?? 0,
+            cacheWrite: totals?.cacheWrite ?? 0,
+            output: totals?.output ?? 0,
+            reasoning: totals?.reasoning ?? 0,
+          },
+        };
+      }),
+      workflows,
+    };
   }
 
   async artifacts(ticketId: string, nodeId?: string): Promise<ArtifactRow[]> {
@@ -295,18 +420,57 @@ export class EngineQueries {
     }
   }
 
-  private async waitReasons(ticketId: string, ticket: TicketRow): Promise<WaitReason[] | undefined> {
-    if (ticket.status !== 'open') return [];
-    const events = await this.store.readAggregate(ticketId);
-    let state = EMPTY_TICKET;
-    for (const event of events) state = evolveTicket(state, event);
-    if (state.template === undefined) return undefined;
-    try {
-      return ticketWaitReasons(state, await this.definitions.workflow(state.template));
-    } catch {
-      return undefined;
-    }
+}
+
+/**
+ * What each lane in review asks the person to decide: the output a review gate holds (from its last
+ * `node.reviewRequested`), or the input of a human node (from its activation).
+ */
+function reviewViews(events: readonly DomainEvent[], reviewing: readonly { nodeId: string; lane: string; run: number }[], workflow: CompiledWorkflow | undefined): ReviewView[] {
+  if (reviewing.length === 0) return [];
+  const key = (nodeId: string, run: number) => `${nodeId}\u0000${run}`;
+  const wanted = new Set(reviewing.map((entry) => key(entry.nodeId, entry.run)));
+  const activations = new Map<string, Extract<DomainEvent, { type: 'node.activated' }>>();
+  const held = new Map<string, Extract<DomainEvent, { type: 'node.reviewRequested' }>>();
+  for (const event of events) {
+    if (event.type === 'node.activated' && wanted.has(key(event.data.nodeId, event.data.run))) activations.set(key(event.data.nodeId, event.data.run), event);
+    if (event.type === 'node.reviewRequested' && wanted.has(key(event.data.nodeId, event.data.run))) held.set(key(event.data.nodeId, event.data.run), event);
   }
+  return reviewing.map((entry): ReviewView => {
+    const activation = activations.get(key(entry.nodeId, entry.run));
+    const gate = held.get(key(entry.nodeId, entry.run));
+    const feedback = activation?.data.feedback?.comment;
+    const base = { nodeId: entry.nodeId, lane: entry.lane, run: entry.run, ...(feedback === undefined ? {} : { feedback }) };
+    if (gate !== undefined) {
+      return {
+        ...base,
+        kind: 'gate',
+        output: { port: gate.data.output.port, items: gate.data.output.items.map(itemView) },
+        ...(gate.data.reason === undefined ? {} : { reason: gate.data.reason }),
+        ...(gate.data.merge === undefined ? {} : { merge: gate.data.merge }),
+      };
+    }
+    const outputs = workflow?.nodes.get(entry.nodeId)?.outputs;
+    const approval = outputs !== undefined && outputs.has('approve') && outputs.has('reject');
+    return { ...base, kind: approval ? 'approval' : 'task', inputs: Object.values(activation?.data.inputs ?? {}).flat().map(itemView) };
+  });
+}
+
+function itemView(item: HandoffItem): ItemView {
+  const artifacts =
+    item.artifacts === undefined
+      ? undefined
+      : Object.fromEntries(
+          Object.entries(item.artifacts).map(([slot, ref]) => [
+            slot,
+            { kind: ref.kind, uri: ref.uri, ...(ref.version === undefined ? {} : { version: ref.version }), ...(ref.title === undefined ? {} : { title: ref.title }) },
+          ]),
+        );
+  return {
+    ...(item.summary === undefined ? {} : { summary: item.summary }),
+    ...(Object.keys(item.data).length === 0 ? {} : { data: item.data }),
+    ...(artifacts === undefined ? {} : { artifacts }),
+  };
 }
 
 function artifactKey(row: Pick<ArtifactRow, 'kind' | 'uri' | 'version'>): string {
@@ -320,6 +484,7 @@ function toTicket(row: RawTicket): TicketRow {
     title: row.title,
     description: row.description,
     status: row.status,
+    priority: row.priority,
     template:
       row.template_id === null || row.template_version === null || row.template_hash === null
         ? null

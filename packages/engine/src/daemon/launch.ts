@@ -21,6 +21,13 @@ export interface LaunchOptions {
   readonly client?: ClientKind;
   /** The `vuyro` CLI script; agents that cannot reach the pipe from their sandbox run `vuyro mcp` from it. */
   readonly cliEntry?: string;
+  /**
+   * The Node executable that runs the engine. Default: this process's. A host that is not Node itself (the Electron
+   * app) must pass one: the engine runs on its own pinned Node, never on Electron's ([[기술 스택 결정]] §2).
+   */
+  readonly nodePath?: string;
+  /** The daemon entry script. Default `daemonEntryPath()`. Development hosts point it at a wrapper (fake agents). */
+  readonly entryPath?: string;
 }
 
 export interface LaunchResult {
@@ -38,10 +45,10 @@ export interface LaunchResult {
  */
 export async function launchEngineDaemon(options: LaunchOptions = {}): Promise<LaunchResult> {
   const location = resolveEngineLocation(options);
-  const args = [daemonEntryPath(), '--data-dir', location.dataDir, '--pipe', location.pipePath];
+  const args = [options.entryPath ?? daemonEntryPath(), '--data-dir', location.dataDir, '--pipe', location.pipePath];
   if (options.uiCredential !== undefined) args.push('--ui-credential-stdin');
   if (options.cliEntry !== undefined) args.push('--vuyro-cli', options.cliEntry);
-  const child = spawn(process.execPath, args, {
+  const child = spawn(options.nodePath ?? process.execPath, args, {
     detached: true,
     windowsHide: true,
     stdio: [options.uiCredential === undefined ? 'ignore' : 'pipe', 'ignore', 'ignore'],

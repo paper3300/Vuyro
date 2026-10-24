@@ -26,6 +26,8 @@ export const RPC_METHODS = {
   workspace: 'query.workspace',
   worktreeCleanup: 'query.worktreeCleanup',
   sharedNodes: 'query.sharedNodes',
+  templates: 'query.templates',
+  board: 'query.board',
 } as const;
 
 export type RpcMethod = (typeof RPC_METHODS)[keyof typeof RPC_METHODS];
@@ -168,6 +170,112 @@ export interface SharedNodeView {
   readonly running: readonly SharedBatchView[];
   /** The last batches, newest first (at most 20). */
   readonly recent: readonly SharedBatchView[];
+}
+
+/** Active templates, latest version of each (M6: ticket creation). */
+export const TemplatesQuerySchema = Type.Object({}, strict);
+/** A project's tickets with their lanes and token totals, and the workflows they pinned (M6: board). */
+export const BoardQuerySchema = Type.Object({ projectId: IdSchema }, strict);
+
+/**
+ * A workflow as screens draw it: its nodes in stage order (topological over forward edges, then position, then
+ * template order) and its edges. Built from the compiled template; the engine's graph model stays the meaning.
+ */
+export interface WorkflowNodeView {
+  readonly id: string;
+  readonly label: string;
+  readonly type: string;
+  readonly typeVersion: number;
+  readonly completion: string;
+  /** 'human': an agent's or script's result waits for a person (review gate). */
+  readonly review: 'none' | 'human';
+  readonly position?: { readonly x: number; readonly y: number };
+  readonly outputs: readonly { readonly name: string; readonly label?: string }[];
+  /** Input mode of the first input port ('each' = one lane per item). */
+  readonly inputMode: 'whole' | 'each' | 'none';
+}
+
+export interface WorkflowEdgeView {
+  readonly from: { readonly node: string; readonly port: string };
+  readonly to: { readonly node: string; readonly port: string };
+  /** Goes back upstream (rework loop). */
+  readonly back: boolean;
+  readonly label?: string;
+}
+
+export interface WorkflowView {
+  readonly id: string;
+  readonly version: number;
+  readonly hash: string;
+  readonly name: string;
+  readonly description?: string;
+  readonly nodes: readonly WorkflowNodeView[];
+  readonly edges: readonly WorkflowEdgeView[];
+}
+
+/** One template in `query.templates`. `problem` is set (and `nodes` empty) when its files cannot be used. */
+export interface TemplateSummary extends WorkflowView {
+  readonly problem?: string;
+}
+
+/** One output or input item shown to the person who decides (summary, data, artifacts). */
+export interface ItemView {
+  readonly summary?: string;
+  readonly data?: Readonly<Record<string, unknown>>;
+  readonly artifacts?: Readonly<Record<string, { readonly kind: string; readonly uri: string; readonly version?: string; readonly title?: string }>>;
+}
+
+/**
+ * Something waiting for a person on an open ticket: an approval node (approve / reject), a human task (finish on
+ * one of its ports), or a review gate holding an executor's result (approve sends it on, reject runs it again).
+ */
+export interface ReviewView {
+  readonly nodeId: string;
+  readonly lane: string;
+  readonly run: number;
+  readonly kind: 'approval' | 'task' | 'gate';
+  /** Gate: what the executor produced (the port it chose and its items). */
+  readonly output?: { readonly port: string; readonly items: readonly ItemView[] };
+  /** Approval and task: the input items. */
+  readonly inputs?: readonly ItemView[];
+  /** Gate: the output reached no edge (D-016); approving sends an empty delivery. */
+  readonly reason?: 'empty';
+  /** Gate: a join's merge stopped on conflicts (M4). */
+  readonly merge?: unknown;
+  /** The reviewer's comment that started this execution again, if any. */
+  readonly feedback?: string;
+}
+
+export interface BoardLaneView {
+  readonly nodeId: string;
+  readonly lane: string;
+  readonly run: number;
+  readonly status: string;
+  readonly waitingFor: unknown;
+  readonly updatedAt: number;
+}
+
+export interface BoardTicketView {
+  readonly ticketId: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly status: string;
+  readonly priority: number;
+  readonly template: { readonly id: string; readonly version: number; readonly hash: string } | null;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly completedAt: number | null;
+  readonly revision: number;
+  readonly attention: string | null;
+  readonly lanes: readonly BoardLaneView[];
+  /** Sum over the ticket's agent runs (input excludes cache, as in the events). */
+  readonly tokens: TokenTotals;
+}
+
+export interface BoardResult {
+  readonly tickets: readonly BoardTicketView[];
+  /** The workflows the tickets pinned, by `<id>@<version>` (missing when its files no longer match). */
+  readonly workflows: Readonly<Record<string, WorkflowView>>;
 }
 
 export interface SubscribeResult {

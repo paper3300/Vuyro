@@ -29,6 +29,8 @@ import {
   WorkspaceQuerySchema,
   WorktreeCleanupQuerySchema,
   SharedNodesQuerySchema,
+  TemplatesQuerySchema,
+  BoardQuerySchema,
 } from '@vuyro/contracts';
 import type { CommandBus } from '../commands/command-bus.ts';
 import type { TransportIdentity } from '../commands/caller.ts';
@@ -301,6 +303,11 @@ export class RpcConnection {
         const query = this.params(WorktreeCleanupQuerySchema, params);
         return { worktrees: await queries.worktreeCleanup(query.projectId, query.ticketId) };
       }
+      case RPC_METHODS.templates:
+        this.params(TemplatesQuerySchema, params);
+        return { templates: await queries.templates() };
+      case RPC_METHODS.board:
+        return queries.board(this.params(BoardQuerySchema, params).projectId);
       case RPC_METHODS.ticketStats: {
         const stats = await queries.ticketStats(this.params(TicketQuerySchema, params).ticketId);
         if (stats === undefined) throw new RpcError(commandError('not_found', 'no such ticket'));

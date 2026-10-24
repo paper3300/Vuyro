@@ -73,6 +73,7 @@ export class EngineClient {
   private readonly socket: net.Socket;
   private readonly pending = new Map<number, Pending>();
   private readonly handlers = new Map<string, Set<NotificationHandler>>();
+  private readonly closeListeners = new Set<(error: Error) => void>();
   private nextId = 1;
   private buffer = '';
   private closedError: Error | undefined;
@@ -187,6 +188,18 @@ export class EngineClient {
     return this.closedError !== undefined;
   }
 
+  /** Called once when the connection is gone, with why (immediately if it already is). */
+  onClose(listener: (error: Error) => void): () => void {
+    if (this.closedError !== undefined) {
+      listener(this.closedError);
+      return () => undefined;
+    }
+    this.closeListeners.add(listener);
+    return () => {
+      this.closeListeners.delete(listener);
+    };
+  }
+
   private attach(): void {
     this.socket.setEncoding('utf8');
     this.socket.on('data', (chunk: string) => {
@@ -232,5 +245,8 @@ export class EngineClient {
     this.closedError = error;
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
+    const listeners = [...this.closeListeners];
+    this.closeListeners.clear();
+    for (const listener of listeners) listener(error);
   }
 }
