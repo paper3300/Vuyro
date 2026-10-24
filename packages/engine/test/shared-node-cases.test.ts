@@ -22,7 +22,7 @@ import {
   sourceFolder,
   startTicket,
 } from './helpers/shared-fixtures.ts';
-import { openWorkflowHarness, SYSTEM, type WorkflowHarness, type WorkflowHarnessOptions } from './helpers/workflow-harness.ts';
+import { HUMAN, openWorkflowHarness, SYSTEM, type WorkflowHarness, type WorkflowHarnessOptions } from './helpers/workflow-harness.ts';
 import { edge, expectOk, projectAt, save, template } from './helpers/workspace-fixtures.ts';
 
 /**
@@ -470,6 +470,42 @@ describe('shared nodes', { timeout: 30_000 }, () => {
       expect((await defineShared(h, projectId, buildSpec({ maxConcurrent: 2 }))).version).toBe(2);
       const rows = await h.store.query<{ name: string; version: number }>('SELECT name, version FROM p_shared_nodes WHERE aggregate_id = ?', [sharedNodeAggregateId(projectId, 'build')]);
       expect(rows).toEqual([{ name: 'build', version: 2 }]);
+    });
+
+    it("a request node names its shared node literally, whatever its type's param schema allows", async () => {
+      await open();
+      const type = {
+        vuyro: 'export' as const,
+        formatVersion: 1 as const,
+        kind: 'nodeType' as const,
+        id: 'myteam.request',
+        version: 1,
+        name: 'Request',
+        content: {
+          type: 'myteam.request',
+          version: 1,
+          label: 'Request',
+          completion: 'shared' as const,
+          inputs: [{ name: 'in', label: 'In' }],
+          outputs: [
+            { name: 'done', label: 'Done' },
+            { name: 'error', label: 'Error' },
+          ],
+          params: [{ name: 'sharedNode', label: 'Shared node', required: true, schema: { type: 'string' } }],
+        },
+      };
+      await save(h, type);
+      const flow = template(
+        'myteam/dynamic',
+        [
+          { id: 'task', type: 'vuyro.human-task', version: 1 },
+          { id: 'build', type: 'myteam.request', version: 1, params: { sharedNode: '{{ input.data.target }}' } },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [edge('task', 'done', 'build'), edge('build', 'done', 'end')],
+      );
+      const refused = failure(await h.writer.save(flow, HUMAN, 'req-dynamic-template-1'));
+      expect(JSON.stringify(refused.details)).toMatch(/must name a shared node/);
     });
 
     it('writes each batch log and links it to every ticket of the batch', async () => {

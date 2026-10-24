@@ -82,6 +82,9 @@ describe('shared node: three tickets, one build, blame and rebuild', { timeout: 
 
     // One build for the three, then one for the three again.
     expect(h.processes.spawned.map((spawn) => spawn.spec.command)).toEqual(['build-tool', 'build-tool']);
+    // In the project folder, without a shell and without the engine's environment.
+    expect(h.processes.spawned.map((spawn) => spawn.spec.cwd)).toEqual([root, root]);
+    expect(h.processes.spawned[0]?.spec.env).toEqual({ PATH: '/bin' });
     expect(seen.duringBatch).toEqual(['running', 'running', 'running']);
     expect(seen.protect).toEqual(['shared:build', 'shared:build', 'shared:build']);
 
