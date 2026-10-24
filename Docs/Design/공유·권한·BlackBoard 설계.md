@@ -535,6 +535,7 @@ flowchart LR
   - `worktree` 통합 브랜치 머지
   - `bisect`, `agent`
   - 우선순위로 바로 실행(`expediteOnPriority`)
+- **구현(M5):** 계약은 [[명령·이벤트 계약]] §15, 정한 기본값은 [[결정 대기]] D-043~D-053. `ask`는 결정 인박스(M6)가 없어 아직 `allFail`로 처리한다(D-047).
 
 ## 5. 세 기능이 만나는 곳
 

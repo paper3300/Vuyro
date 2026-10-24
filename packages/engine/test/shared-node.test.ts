@@ -63,7 +63,7 @@ describe('shared node: three tickets, one build, blame and rebuild', { timeout: 
 
     // Batch 1 breaks in b.c; batch 2 passes. While batch 1 runs, the ledger holds the protected sources.
     enqueueBuild(h, [
-      during(async () => {
+      during(h, async () => {
         seen.duringBatch = await Promise.all(Object.values(tickets).map((ticketId) => h.status(ticketId, 'build')));
         let ledger = EMPTY_LEDGER;
         for (const event of await h.store.readAggregate(workspaceAggregateId(projectId))) ledger = evolveLedger(ledger, event);

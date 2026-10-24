@@ -74,8 +74,15 @@ export const buildFails = (...lines: string[]): FakeStep[] => [{ delayMs: 5 * MI
 /** A build that takes five minutes and passes. */
 export const buildPasses = (...steps: FakeStep[]): FakeStep[] => [{ delayMs: 5 * MINUTE, stdout: 'Building...' }, ...steps, { stdout: 'Build succeeded.' }, { exit: 0 }];
 
-/** Runs code inside the fake build while it runs (e.g. look at the ledger mid-batch). */
-export const during = (run: (process: FakeProcessContext) => Promise<void> | void): FakeStep => ({ run });
+/**
+ * Runs code inside the fake build while it runs (e.g. look at the ledger mid-batch). Counted as engine work, so the
+ * virtual clock does not jump ahead (to the script's time limit) while it waits on the store.
+ */
+export const during = (h: WorkflowHarness, run: (process: FakeProcessContext) => Promise<void> | void): FakeStep => ({
+  run: (process) => h.activity.track(async () => {
+    await run(process);
+  }),
+});
 
 export type DevStep = (s: ScriptedSession, title: string) => Promise<void>;
 

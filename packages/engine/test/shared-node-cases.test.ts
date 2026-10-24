@@ -368,6 +368,9 @@ describe('shared nodes', { timeout: 30_000 }, () => {
       await h.drive();
       expect((await sharedState(h, projectId)).queue.map((entry) => [titles.get(entry.ticketId), entry.run])).toEqual([['X', 2]]);
       expect(currentExecution(await h.ticket(x), 'build', 'main')?.run).toBe(2);
+      // The replaced run cannot be queued any more.
+      const stale = await h.exec('sharedNode.enqueue', { projectId, name: 'build', ticketId: x, nodeId: 'build', lane: 'main', run: 1 }, SYSTEM);
+      expect(failure(stale).code).toBe('not_found');
 
       // A paused request keeps its place but is not built: Y alone does not meet the count.
       await h.ok('node.pause', { ticketId: x, nodeId: 'build' });
@@ -512,7 +515,7 @@ describe('shared nodes', { timeout: 30_000 }, () => {
       const fs = new MemoryFileSystem();
       await open({ sharedLogs: { dir: join('/', 'logs'), fs } });
       await defineShared(h, projectId, buildSpec({ batchTrigger: { count: 1 } }));
-      enqueueBuild(h, buildPasses(during(() => undefined), { stdout: 'compiled 3 files' }));
+      enqueueBuild(h, buildPasses(during(h, () => undefined), { stdout: 'compiled 3 files' }));
       const a = await ticket('A', 'myteam/quick-flow');
       await h.drive();
       const log = currentExecution(await h.ticket(a), 'build', 'main')?.output?.items[0]?.artifacts?.log;
