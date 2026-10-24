@@ -91,3 +91,21 @@ export type { EngineClientOptions } from './client/engine-client.ts';
 export { computeTicketStats, unionLength } from './stats/ticket-stats.ts';
 export type { NodeKind, TicketStatsInput } from './stats/ticket-stats.ts';
 export { bindDescendantsToProcess, DataDirectoryLockedError, lockDataDirectory } from './platform/win32/process-guard.ts';
+
+// M4: workspaces and the internal checkout ledger.
+export { WorkspaceCoordinator, codexProjectHooks } from './workspace/coordinator.ts';
+export type { MergeAgentRequest, Prepared, PrepareTarget, WorkspaceCoordinatorOptions } from './workspace/coordinator.ts';
+export { GitClient, GitError, gitEnvironment, nodeGitExec } from './workspace/git.ts';
+export type { GitExec, GitResult, StatusEntry } from './workspace/git.ts';
+export { laneWorktree, locate, ticketKey, ticketWorktree } from './workspace/layout.ts';
+export type { LayoutOptions, Location, WorktreeName } from './workspace/layout.ts';
+export { EMPTY_LEDGER, evolveLedger, findConflicts } from './workspace/ledger.ts';
+export type { LedgerEntry, LedgerState } from './workspace/ledger.ts';
+export { globRegExp, insideRoot, matches, normalizeRelative, overlaps } from './workspace/paths.ts';
+export { hashFile, workspaceServices } from './workspace/services.ts';
+export type { WorkspaceServices } from './workspace/services.ts';
+export { DEFAULT_WATCH_EXCLUDE, effectiveSettings, mergeSettings, mergingJoins, nodeSettings } from './workspace/settings.ts';
+export type { EffectiveSettings } from './workspace/settings.ts';
+export { parcelWatcher } from './workspace/watcher.ts';
+export type { FileWatcher, WatchHandle } from './workspace/watcher.ts';
+export type { WorkspaceView } from './daemon/queries.ts';

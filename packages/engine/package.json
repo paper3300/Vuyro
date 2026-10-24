@@ -22,6 +22,7 @@
     "spike:sqlite": "node spikes/sqlite-wal-bench.ts"
   },
   "dependencies": {
+    "@parcel/watcher": "2.5.1",
     "@vuyro/agent-adapters": "workspace:*",
     "@vuyro/contracts": "workspace:*",
     "koffi": "^3.3.3"

@@ -33,6 +33,11 @@ export interface AgentStartRequest {
   readonly resume?: { readonly runId: string; readonly providerSessionId: string };
   /** Stop the run after this long (settles as failed, `timeout`). */
   readonly timeoutMs?: number;
+  /**
+   * Install the automatic checkout hook (M4): before each file edit the CLI runs `vuyro hook pretooluse`, which
+   * checks the file out for this run and blocks the edit when Vuyro's ledger refuses.
+   */
+  readonly checkoutHook?: boolean;
 }
 
 export interface AgentRunHandle {
@@ -65,4 +70,6 @@ export { CodexStreamNormalizer, codexArgs } from './codex.ts';
 export { CliAgentAdapter, codexMcpArgs, DEFAULT_CLAUDE_ARGS, DEFAULT_CODEX_ARGS } from './cli-adapter.ts';
 export type { CliAgentAdapterOptions } from './cli-adapter.ts';
 export { agentEnvironment, envValue, ExecutableNotFoundError, resolveExecutable } from './environment.ts';
+export { CLAUDE_EDIT_TOOLS, claudeHookArgs, CODEX_EDIT_TOOLS, codexHookArgs, hookCommandLine } from './hooks.ts';
+export type { HookCli } from './hooks.ts';
 export { clip, fitValue, LIMITS } from './limits.ts';

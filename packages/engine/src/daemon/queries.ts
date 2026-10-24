@@ -53,6 +53,14 @@ export interface ArtifactRow {
   readonly current: boolean;
 }
 
+export interface WorkspaceView {
+  readonly checkouts: readonly Record<string, unknown>[];
+  readonly blocks: readonly Record<string, unknown>[];
+  readonly changes: readonly Record<string, unknown>[];
+  readonly overlaps: readonly Record<string, unknown>[];
+  readonly worktrees: readonly Record<string, unknown>[];
+}
+
 export interface TicketDetail {
   readonly ticket: TicketRow;
   readonly lanes: readonly Record<string, unknown>[];
@@ -108,13 +116,60 @@ export class EngineQueries {
     return rows.map(toTicket);
   }
 
+  /**
+   * The project's workspace ledger: entries held now, recent refusals, changes found afterwards (by default only the
+   * flagged ones: unattributed, or changed while someone else held them), overlap warnings and the engine's worktrees.
+   */
+  async workspace(projectId: string, options: { ticketId?: string; changes: 'flagged' | 'all'; limit: number }): Promise<WorkspaceView> {
+    const byTicket = options.ticketId === undefined ? '' : ' AND ticket_id = ?';
+    const params = (...extra: (string | number)[]) => [projectId, ...(options.ticketId === undefined ? [] : [options.ticketId]), ...extra];
+    const checkouts = await this.store.query<Record<string, unknown>>(
+      `SELECT entry_id AS id, space, path, kind, mode, ticket_id AS ticketId, node_id AS nodeId, lane, run, release, on_conflict AS onConflict,
+              pause_mode AS pauseMode, priority, expires_at AS expiresAt, base_hash AS baseHash, pause_hash AS pauseHash, paused, retained,
+              acquired_at AS acquiredAt
+         FROM p_checkouts WHERE project_id = ?${byTicket} ORDER BY acquired_at, entry_id`,
+      params(),
+    );
+    const blocks = await this.store.query<Record<string, unknown>>(
+      `SELECT sequence, ticket_id AS ticketId, node_id AS nodeId, lane, run, space, paths, source, policy, outcome, deadlock, conflicts, at
+         FROM p_checkout_blocks WHERE project_id = ?${byTicket} ORDER BY sequence DESC LIMIT ?`,
+      params(options.limit),
+    );
+    const flagged = options.changes === 'flagged' ? " AND attribution IN ('unattributed', 'conflict')" : '';
+    const changes = await this.store.query<Record<string, unknown>>(
+      `SELECT sequence, space, scan, path, hash, previous, attribution, ticket_id AS ticketId, node_id AS nodeId, lane, run, suspects, at
+         FROM p_workspace_changes WHERE project_id = ?${flagged}${options.ticketId === undefined ? '' : " AND (ticket_id = ? OR suspects LIKE '%' || ? || '%')"}
+         ORDER BY sequence DESC, id DESC LIMIT ?`,
+      options.ticketId === undefined ? [projectId, options.limit] : [projectId, options.ticketId, options.ticketId, options.limit],
+    );
+    const overlaps = await this.store.query<Record<string, unknown>>(
+      'SELECT sequence, path, spaces, holders, at FROM p_overlap_warnings WHERE project_id = ? ORDER BY sequence DESC LIMIT ?',
+      [projectId, options.limit],
+    );
+    const worktrees = await this.store.query<Record<string, unknown>>(
+      `SELECT key, ticket_id AS ticketId, scope, node_id AS nodeId, lane, path, branch, base, created_at AS createdAt, removed_at AS removedAt,
+              removed_reason AS removedReason, branch_deleted AS branchDeleted
+         FROM p_worktrees WHERE project_id = ?${byTicket} ORDER BY created_at, key`,
+      params(),
+    );
+    const parse = (rows: Record<string, unknown>[], columns: readonly string[]) =>
+      rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, columns.includes(key) && typeof value === 'string' ? (JSON.parse(value) as unknown) : value])));
+    return {
+      checkouts: checkouts.map((row) => ({ ...row, paused: row.paused === 1, retained: row.retained === 1 })),
+      blocks: parse(blocks, ['paths', 'conflicts']).map((row) => ({ ...row, deadlock: row.deadlock === 1 })),
+      changes: parse(changes, ['suspects']),
+      overlaps: parse(overlaps, ['spaces', 'holders']),
+      worktrees: worktrees.map((row) => ({ ...row, branchDeleted: row.branchDeleted === null ? null : row.branchDeleted === 1 })),
+    };
+  }
+
   async ticket(ticketId: string): Promise<TicketDetail | undefined> {
     const row = await this.store.queryOne<RawTicket>('SELECT * FROM p_tickets WHERE ticket_id = ?', [ticketId]);
     if (row === undefined) return undefined;
     const ticket = toTicket(row);
     const lanes = await this.store.query<Record<string, unknown>>(
       `SELECT node_id AS nodeId, lane, lane_group AS laneGroup, run, status, executor, run_id AS runId, attempt,
-              pause_requested AS pauseRequested, superseded_by AS supersededBy, updated_at AS updatedAt
+              pause_requested AS pauseRequested, superseded_by AS supersededBy, waiting_for AS waitingFor, updated_at AS updatedAt
          FROM p_node_lanes WHERE ticket_id = ? ORDER BY node_id, lane`,
       [ticketId],
     );
@@ -127,7 +182,8 @@ export class EngineQueries {
     );
     const runs = await this.store.query<Record<string, unknown>>(`SELECT ${RUN_COLUMNS} FROM p_runs WHERE ticket_id = ? ORDER BY started_at, run_id`, [ticketId]);
     const waitingFor = await this.waitReasons(ticketId, ticket);
-    return { ticket, lanes, executions, runs, ...(waitingFor === undefined ? {} : { waitingFor }) };
+    const parsedLanes = lanes.map((row) => ({ ...row, waitingFor: typeof row.waitingFor === 'string' ? (JSON.parse(row.waitingFor) as unknown) : null }));
+    return { ticket, lanes: parsedLanes, executions, runs, ...(waitingFor === undefined ? {} : { waitingFor }) };
   }
 
   async artifacts(ticketId: string, nodeId?: string): Promise<ArtifactRow[]> {

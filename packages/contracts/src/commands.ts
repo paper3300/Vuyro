@@ -1,11 +1,29 @@
 import { type Static, type TSchema, Type } from '@sinclair/typebox';
 import { CommandErrorSchema } from './errors.ts';
-import { EXECUTION_FIELDS, LaneSchema, OBSERVATION_FIELDS, RUN_SETTLE_FIELDS } from './events.ts';
+import { CHECKOUT_RELEASE_REASONS, EXECUTION_FIELDS, LaneSchema, OBSERVATION_FIELDS, RUN_SETTLE_FIELDS, TicketPriority } from './events.ts';
 import { ArtifactRefSchema, ItemRefSchema, PORT_PATTERN, SLOT_PATTERN } from './handoff.ts';
 import { IdSchema, NodeIdSchema, RequestIdSchema } from './ids.ts';
 import { PermissionRuleSchema } from './permission.ts';
 import { AGENT_PROVIDERS } from './providers.ts';
-import { DEFINITION_ID_PATTERN, DEFINITION_KINDS, HashSchema, NodeTypeDefinitionSchema, TEMPLATE_ID_PATTERN, TemplateDefinitionSchema } from './workflow.ts';
+import {
+  DEFINITION_ID_PATTERN,
+  DEFINITION_KINDS,
+  HashSchema,
+  NodeTypeDefinitionSchema,
+  TEMPLATE_ID_PATTERN,
+  TemplateDefinitionSchema,
+  WorkspaceSettingsSchema,
+} from './workflow.ts';
+import {
+  ConflictSchema,
+  DetectedChangeSchema,
+  HolderSchema,
+  MergeResultSchema,
+  ProjectWorkspaceFields,
+  SCAN_REASONS,
+  SpaceSchema,
+  WorktreeSchema,
+} from './workspace.ts';
 
 /**
  * Command envelope. UI buttons, the `vuyro` CLI, the agent panel and MCP all send this
@@ -65,7 +83,7 @@ export interface CommandDefinition {
   readonly version: number;
   readonly scope: CommandScope;
   /** 'permission' commands are always refused for AI principals (fixed rule). */
-  readonly category: 'project' | 'ticket' | 'artifact' | 'run' | 'node' | 'definition' | 'permission';
+  readonly category: 'project' | 'ticket' | 'artifact' | 'run' | 'node' | 'definition' | 'workspace' | 'permission';
   readonly access: CommandAccess;
   readonly summary: string;
   readonly payload: TSchema;
@@ -153,6 +171,8 @@ export const COMMAND_CATALOG = {
         template: Type.Optional(
           Type.Object({ id: Type.String({ pattern: TEMPLATE_ID_PATTERN }), version: Type.Optional(Type.Integer({ minimum: 1 })) }, strict),
         ),
+        /** Higher first when tickets compete for a claim (`priorityWins`). Default 0. */
+        priority: Type.Optional(TicketPriority),
       },
       strict,
     ),
@@ -169,9 +189,150 @@ export const COMMAND_CATALOG = {
         ticketId: IdSchema,
         title: Type.Optional(Type.String({ minLength: 1, maxLength: 300 })),
         description: Type.Optional(Type.String({ maxLength: 65536 })),
+        priority: Type.Optional(TicketPriority),
       },
       { ...strict, minProperties: 2 },
     ),
+    result: Empty,
+  },
+  'project.configure': {
+    version: 1,
+    scope: 'project',
+    category: 'project',
+    access: { nodeAgent: 'deny' },
+    summary: "Set the project's workspace folder, change-detection paths and its layer of the workspace settings. New tickets pin them.",
+    payload: Type.Object({ projectId: IdSchema, ...ProjectWorkspaceFields }, { ...strict, minProperties: 2 }),
+    result: Empty,
+  },
+  'app.configure': {
+    version: 1,
+    scope: 'app',
+    category: 'project',
+    access: { nodeAgent: 'deny' },
+    summary: 'Replace the app layer of the workspace settings (defaults for every project).',
+    payload: Type.Object({ settings: WorkspaceSettingsSchema }, strict),
+    result: Empty,
+  },
+  'checkout.acquire': {
+    version: 1,
+    scope: 'node',
+    category: 'workspace',
+    access: { nodeAgent: 'own-node' },
+    summary: "Check workspace files out for the caller's execution right before editing them (internal ledger only; no external lock).",
+    payload: Type.Object(
+      {
+        ticketId: IdSchema,
+        nodeId: NodeIdSchema,
+        lane: Type.Optional(LaneSchema),
+        /** Absolute, or relative to the execution's workspace folder. */
+        paths: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { minItems: 1, maxItems: 256 }),
+        mode: Type.Optional(Type.Union([Type.Literal('exclusive'), Type.Literal('shared')])),
+        /** hook: the automatic PreToolUse hook. agent: the agent asked itself (`vuyro checkout`). */
+        source: Type.Optional(Type.Union([Type.Literal('hook'), Type.Literal('agent')])),
+      },
+      strict,
+    ),
+    result: Type.Object(
+      {
+        granted: Type.Boolean(),
+        /** granted, overlap (granted under `warn`), outside (not in the workspace: nothing to record), wait, fail, ask. */
+        decision: Type.Union(['granted', 'overlap', 'outside', 'wait', 'fail', 'ask'].map((decision) => Type.Literal(decision))),
+        reason: Type.Optional(Type.String({ maxLength: 4096 })),
+        conflicts: Type.Optional(Type.Array(ConflictSchema, { maxItems: 256 })),
+        /** The workspace-relative paths now held. */
+        paths: Type.Optional(Type.Array(Type.String({ maxLength: 1024 }), { maxItems: 256 })),
+      },
+      strict,
+    ),
+  },
+  'checkout.release': {
+    version: 1,
+    scope: 'node',
+    category: 'workspace',
+    access: { nodeAgent: 'own-node' },
+    summary: "Release checkouts of the caller's execution (all of them, or the given paths). Claims stay until the node ends.",
+    payload: Type.Object(
+      {
+        ticketId: IdSchema,
+        nodeId: NodeIdSchema,
+        lane: Type.Optional(LaneSchema),
+        paths: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { minItems: 1, maxItems: 256 })),
+      },
+      strict,
+    ),
+    result: Type.Object({ released: Type.Integer({ minimum: 0 }) }, strict),
+  },
+  'checkout.forceRelease': {
+    version: 1,
+    scope: 'project',
+    category: 'workspace',
+    access: { nodeAgent: 'deny' },
+    summary: "Release ledger entries by id, whoever holds them (a person clearing a stuck claim or a 'manual' release).",
+    payload: Type.Object({ projectId: IdSchema, ids: Type.Array(IdSchema, { minItems: 1, maxItems: 1024 }) }, strict),
+    result: Type.Object({ released: Type.Integer({ minimum: 0 }) }, strict),
+  },
+  'workspace.record': {
+    version: 1,
+    scope: 'project',
+    category: 'workspace',
+    access: { nodeAgent: 'deny', systemOnly: true },
+    summary: "The engine's workspace bookkeeping: releases, pause hashes, detected changes, worktrees.",
+    payload: Type.Union([
+      Type.Object(
+        { projectId: IdSchema, op: Type.Literal('release'), ids: Type.Array(IdSchema, { minItems: 1, maxItems: 4096 }), reason: Type.Union(CHECKOUT_RELEASE_REASONS.map((reason) => Type.Literal(reason))) },
+        strict,
+      ),
+      Type.Object({ projectId: IdSchema, op: Type.Literal('retain'), ids: Type.Array(IdSchema, { minItems: 1, maxItems: 4096 }) }, strict),
+      Type.Object({ projectId: IdSchema, op: Type.Literal('pause'), holder: HolderSchema, hashes: Type.Record(IdSchema, Type.Union([HashSchema, Type.Null()])) }, strict),
+      Type.Object(
+        {
+          projectId: IdSchema,
+          op: Type.Literal('resume'),
+          holder: HolderSchema,
+          changed: Type.Array(
+            Type.Object(
+              { entryId: IdSchema, path: Type.String({ maxLength: 1024 }), pauseHash: Type.Union([HashSchema, Type.Null()]), hash: Type.Union([HashSchema, Type.Null()]) },
+              strict,
+            ),
+            { maxItems: 1024 },
+          ),
+        },
+        strict,
+      ),
+      Type.Object(
+        {
+          projectId: IdSchema,
+          op: Type.Literal('changes'),
+          space: SpaceSchema,
+          scan: Type.Union(SCAN_REASONS.map((reason) => Type.Literal(reason))),
+          changes: Type.Array(DetectedChangeSchema, { minItems: 1, maxItems: 4096 }),
+          /** Also warn about files another worktree changed too (`overlapWarning`). */
+          warnOverlaps: Type.Optional(Type.Boolean()),
+        },
+        strict,
+      ),
+      Type.Object(
+        {
+          projectId: IdSchema,
+          op: Type.Literal('baseline'),
+          space: SpaceSchema,
+          files: Type.Record(Type.String({ minLength: 1, maxLength: 1024 }), Type.Union([HashSchema, Type.Null()])),
+        },
+        strict,
+      ),
+      Type.Object({ projectId: IdSchema, op: Type.Literal('worktreeCreated'), worktree: WorktreeSchema }, strict),
+      Type.Object(
+        {
+          projectId: IdSchema,
+          op: Type.Literal('worktreeRemoved'),
+          ticketId: IdSchema,
+          key: Type.String({ minLength: 1, maxLength: 230 }),
+          reason: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone')]),
+          branchDeleted: Type.Boolean(),
+        },
+        strict,
+      ),
+    ]),
     result: Empty,
   },
   'artifact.add': {
@@ -301,7 +462,15 @@ export const COMMAND_CATALOG = {
     access: { nodeAgent: 'deny', systemOnly: true },
     summary: "Start a queued execution. For agent nodes this also starts the run and returns its token (once).",
     payload: Type.Object({ ...EXECUTION_FIELDS, attempt: Type.Integer({ minimum: 1 }) }, strict),
-    result: Type.Object({ runId: Type.Optional(IdSchema), runToken: Type.Optional(Type.String()) }, strict),
+    result: Type.Object(
+      {
+        runId: Type.Optional(IdSchema),
+        runToken: Type.Optional(Type.String()),
+        /** The node's claims conflict (M4): it did not start. wait/ask: it pauses for the paths; fail: it failed. */
+        blocked: Type.Optional(Type.Union([Type.Literal('wait'), Type.Literal('ask'), Type.Literal('fail')])),
+      },
+      strict,
+    ),
   },
   'node.finish': {
     version: 1,
@@ -328,6 +497,7 @@ export const COMMAND_CATALOG = {
             },
             strict,
           ),
+          MergeResultSchema,
         ]),
       },
       strict,

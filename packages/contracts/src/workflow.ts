@@ -1,7 +1,16 @@
 import { type Static, Type } from '@sinclair/typebox';
 import { PORT_PATTERN } from './handoff.ts';
 import { NodeIdSchema } from './ids.ts';
-import { ArtifactSlotSpecSchema, ExtensionsSchema, JsonSchemaObjectSchema, NODE_TYPE_PATTERN, NodeTypeSpecSchema } from './node-type.ts';
+import {
+  ArtifactSlotSpecSchema,
+  CLAIM_CONFLICT_POLICIES,
+  ExtensionsSchema,
+  JsonSchemaObjectSchema,
+  NODE_TYPE_PATTERN,
+  NodeTypeSpecSchema,
+  PAUSE_MODES,
+} from './node-type.ts';
+import { AGENT_PROVIDERS } from './providers.ts';
 
 /**
  * Workflow templates, definition files and node states ([[구현 계획]] M2).
@@ -44,17 +53,34 @@ export const ACTIVATION_CAUSES = ['start', 'input', 'rework', 'review', 'retry']
 export type ActivationCause = (typeof ACTIVATION_CAUSES)[number];
 
 // ---------------------------------------------------------------------------
-// Settings layered app → project → template → node (interpreted from M4 on)
+// Settings layered app → project → template → node ([[명령·이벤트 계약]] §14)
+
+export const MERGE_CONFLICT_POLICIES = ['ask', 'agent', 'rerun', 'fail'] as const;
 
 export const WorkspaceSettingsSchema = Type.Object(
   {
+    /** shared: every node works in the project folder. worktree: git worktrees (git repositories only). */
     workspaceMode: Type.Optional(Type.Union([Type.Literal('shared'), Type.Literal('worktree')])),
+    /** ticket: one worktree per ticket. nodeRun: fan-out lanes get a worktree each, merged by the join. */
     worktreeScope: Type.Optional(Type.Union([Type.Literal('ticket'), Type.Literal('nodeRun')])),
+    /** Check files out right before an agent edits them (PreToolUse hook). Default: on in shared mode, off in worktree mode. */
     autoCheckoutHook: Type.Optional(Type.Boolean()),
-    onMergeConflict: Type.Optional(
-      Type.Union([Type.Literal('ask'), Type.Literal('agent'), Type.Literal('rerun'), Type.Literal('fail')]),
+    onMergeConflict: Type.Optional(Type.Union(MERGE_CONFLICT_POLICIES.map((policy) => Type.Literal(policy)))),
+    /** Agent that resolves merge conflicts under `onMergeConflict: agent`. Default Claude with its default model. */
+    mergeAgent: Type.Optional(
+      Type.Object(
+        {
+          provider: Type.Union(AGENT_PROVIDERS.map((provider) => Type.Literal(provider))),
+          model: Type.Optional(Type.String({ maxLength: 128 })),
+        },
+        { additionalProperties: false },
+      ),
     ),
+    /** Warn when two worktrees change the same file (a likely merge conflict), before the merge. */
     overlapWarning: Type.Optional(Type.Boolean()),
+    /** Claim and checkout conflicts (§3.7). A claim of the node type may override them. */
+    onConflict: Type.Optional(Type.Union(CLAIM_CONFLICT_POLICIES.map((policy) => Type.Literal(policy)))),
+    pauseMode: Type.Optional(Type.Union(PAUSE_MODES.map((mode) => Type.Literal(mode)))),
   },
   { additionalProperties: false },
 );

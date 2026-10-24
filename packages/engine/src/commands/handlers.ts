@@ -10,6 +10,7 @@ import type { RandomSource } from '../runtime/ids.ts';
 import type { IdGenerator } from '../runtime/ids.ts';
 import type { NewEvent, StreamAppend } from '../store/event-store.ts';
 import type { DefinitionResolver } from '../workflow/definitions.ts';
+import type { WorkspaceServices } from '../workspace/services.ts';
 import { currentExecution, execution } from '../workflow/state.ts';
 import {
   type AggregateDefinition,
@@ -25,6 +26,15 @@ import type { CommandTarget } from './authorize.ts';
 import type { CallerContext } from './caller.ts';
 import { issueRunToken } from './run-token.ts';
 import {
+  appConfigure,
+  checkoutForceRelease,
+  projectConfigure,
+  ticketWorkspace,
+  workspaceRecord,
+} from './workspace-handlers.ts';
+import {
+  checkoutAcquireHandler,
+  checkoutReleaseHandler,
   createTicketEvents,
   definitionAbandon,
   definitionActivate,
@@ -53,6 +63,8 @@ export interface HandlerContext {
   readonly random: RandomSource;
   /** Definition files (templates, node types). Absent in engines without a definition store. */
   readonly definitions?: DefinitionResolver;
+  /** Workspace layout, clock and file hashes for the checkout ledger (M4). */
+  readonly workspaces?: WorkspaceServices;
   load<S>(definition: AggregateDefinition<S>, aggregateId: string): Promise<Loaded<S>>;
 }
 
@@ -163,7 +175,7 @@ export const HANDLERS: HandlerMap = {
       const project = await ctx.load(projectAggregate, payload.projectId);
       if (!project.state.exists) return fail('not_found', `project ${payload.projectId} does not exist`);
       const ticketId = ctx.ids.next();
-      const events = await createTicketEvents(ctx, ticketId, payload);
+      const events = await createTicketEvents(ctx, ticketId, payload, await ticketWorkspace(ctx, project.state));
       if (!Array.isArray(events)) return events;
       return {
         ok: true,
@@ -296,6 +308,12 @@ export const HANDLERS: HandlerMap = {
     },
   }),
 
+  'project.configure': handler(projectConfigure),
+  'app.configure': handler(appConfigure),
+  'checkout.acquire': handler(checkoutAcquireHandler),
+  'checkout.release': handler(checkoutReleaseHandler),
+  'checkout.forceRelease': handler(checkoutForceRelease),
+  'workspace.record': handler(workspaceRecord),
   'nodeType.save': handler(nodeTypeSave),
   'template.save': handler(templateSave),
   'definition.activate': handler(definitionActivate),

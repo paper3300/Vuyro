@@ -26,6 +26,7 @@ import {
   TicketsQuerySchema,
   type TSchema,
   UnsubscribeParamsSchema,
+  WorkspaceQuerySchema,
 } from '@vuyro/contracts';
 import type { CommandBus } from '../commands/command-bus.ts';
 import type { TransportIdentity } from '../commands/caller.ts';
@@ -285,6 +286,10 @@ export class RpcConnection {
       case RPC_METHODS.artifacts: {
         const query = this.params(ArtifactsQuerySchema, params);
         return { artifacts: await queries.artifacts(query.ticketId, query.nodeId) };
+      }
+      case RPC_METHODS.workspace: {
+        const query = this.params(WorkspaceQuerySchema, params);
+        return queries.workspace(query.projectId, { ...(query.ticketId === undefined ? {} : { ticketId: query.ticketId }), changes: query.changes ?? 'flagged', limit: query.limit ?? 200 });
       }
       case RPC_METHODS.ticketStats: {
         const stats = await queries.ticketStats(this.params(TicketQuerySchema, params).ticketId);

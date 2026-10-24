@@ -3,6 +3,7 @@ import { ArtifactRefSchema, HandoffItemSchema, NodeRunOutputSchema, PORT_PATTERN
 import { AggregateIdSchema, IdSchema, NodeIdSchema, RequestIdSchema } from './ids.ts';
 import { PermissionRuleSchema } from './permission.ts';
 import { AuthorizationSchema, PrincipalSchema } from './principal.ts';
+import { CLAIM_CONFLICT_POLICIES } from './node-type.ts';
 import { AGENT_PROVIDERS } from './providers.ts';
 import { CostSchema, TokenUsageSchema } from './usage.ts';
 import {
@@ -12,7 +13,21 @@ import {
   DefinitionEnvelopeSchema,
   HashSchema,
   PinnedTemplateSchema,
+  WorkspaceSettingsSchema,
 } from './workflow.ts';
+import {
+  CheckoutEntrySchema,
+  ClaimWaitSchema,
+  ConflictSchema,
+  DetectedChangeSchema,
+  HolderSchema,
+  MergeReviewSchema,
+  ProjectWorkspaceFields,
+  SCAN_REASONS,
+  SpaceSchema,
+  TicketWorkspaceSchema,
+  WorktreeSchema,
+} from './workspace.ts';
 
 /**
  * Event envelope. Every state change is one of these, appended to the log and never changed.
@@ -46,6 +61,8 @@ export const EventEnvelopeSchema = Type.Object(
 );
 
 const RunId = IdSchema;
+/** Ticket priority (claims, `priorityWins`). */
+export const TicketPriority = Type.Integer({ minimum: -1000, maximum: 1000 });
 const TicketId = IdSchema;
 /** When the adapter read the line (epoch ms). The envelope timestamp is when it was stored. */
 const ObservedAt = Type.Optional(Type.Integer({ minimum: 0 }));
@@ -118,6 +135,15 @@ export const RUN_SETTLE_FIELDS = {
 
 const strict = { additionalProperties: false } as const;
 
+const CheckoutSource = Type.Union([Type.Literal('start'), Type.Literal('hook'), Type.Literal('agent')]);
+/**
+ * nodeDone / ticketDone / manual: the entry's own release. ended: its execution ended another way (superseded,
+ * discarded, failed). expired: its ttl passed. preempted: a higher-priority ticket took it. recovered: cleaned
+ * up when the engine started.
+ */
+export const CHECKOUT_RELEASE_REASONS = ['nodeDone', 'ticketDone', 'manual', 'ended', 'expired', 'preempted', 'recovered'] as const;
+export type CheckoutReleaseReason = (typeof CHECKOUT_RELEASE_REASONS)[number];
+
 /**
  * A lane is one parallel copy of a node. Whole-input nodes have the single lane 'main'; fan-out
  * (`mode: 'each'`) nodes get lanes '1', '2', … in creation order, never reused across groups.
@@ -180,6 +206,18 @@ export const EVENT_CATALOG = {
     version: 1,
     schema: Type.Object({ projectId: IdSchema, name: Type.String({ minLength: 1, maxLength: 200 }) }, strict),
   },
+  /** The project's workspace folder and settings layer changed (fields present = changed; `null` clears). */
+  'project.configured': {
+    aggregateType: 'project',
+    version: 1,
+    schema: Type.Object({ projectId: IdSchema, ...ProjectWorkspaceFields }, strict),
+  },
+  /** The app layer of the settings (replaced as a whole). */
+  'app.configured': {
+    aggregateType: 'settings',
+    version: 1,
+    schema: Type.Object({ settings: WorkspaceSettingsSchema }, strict),
+  },
   'ticket.created': {
     aggregateType: 'ticket',
     version: 1,
@@ -191,6 +229,10 @@ export const EVENT_CATALOG = {
         description: Type.Optional(Type.String({ maxLength: 65536 })),
         /** The workflow this ticket runs, pinned with the hashes of every definition it uses. */
         template: Type.Optional(PinnedTemplateSchema),
+        /** Higher first when tickets compete for a claim (`priorityWins`). Default 0. */
+        priority: Type.Optional(TicketPriority),
+        /** The project's workspace and the app + project settings, pinned for the ticket's lifetime (M4). */
+        workspace: Type.Optional(TicketWorkspaceSchema),
       },
       strict,
     ),
@@ -209,6 +251,7 @@ export const EVENT_CATALOG = {
         ticketId: TicketId,
         title: Type.Optional(Type.String({ minLength: 1, maxLength: 300 })),
         description: Type.Optional(Type.String({ maxLength: 65536 })),
+        priority: Type.Optional(TicketPriority),
       },
       strict,
     ),
@@ -260,19 +303,25 @@ export const EVENT_CATALOG = {
         basis: BasisSchema,
         /** On the activation that opens a new group: the execution whose delivery opened it. */
         openedBy: Type.Optional(Type.Object({ nodeId: NodeIdSchema, run: RunNumber }, strict)),
+        /**
+         * Worktree mode: start the lane's worktree over from the ticket branch (a merge conflict sent the lane
+         * back to run again on top of what was merged, `onMergeConflict: rerun`).
+         */
+        workspace: Type.Optional(Type.Object({ reset: Type.Literal(true) }, strict)),
       },
       strict,
     ),
   },
   'node.started': {
     aggregateType: 'ticket',
-    version: 1,
+    // v2: the 'merge' executor (a join merging worktree branches, M4). v1 data is valid v2 data.
+    version: 2,
     schema: Type.Object(
       {
         ...EXECUTION_FIELDS,
         /** 1, 2, … per execution (a restart after an engine crash is a new attempt). */
         attempt: Type.Integer({ minimum: 1 }),
-        executor: Type.Union([Type.Literal('agent'), Type.Literal('script')]),
+        executor: Type.Union([Type.Literal('agent'), Type.Literal('script'), Type.Literal('merge')]),
         runId: Type.Optional(RunId),
       },
       strict,
@@ -292,7 +341,13 @@ export const EVENT_CATALOG = {
     aggregateType: 'ticket',
     version: 1,
     schema: Type.Object(
-      { ...EXECUTION_FIELDS, output: NodeRunOutputSchema, reason: Type.Optional(Type.Literal('empty')) },
+      {
+        ...EXECUTION_FIELDS,
+        output: NodeRunOutputSchema,
+        reason: Type.Optional(Type.Literal('empty')),
+        /** A join's merge stopped on conflicts (M4). Approving continues the merge; rejecting hands it to an agent. */
+        merge: Type.Optional(MergeReviewSchema),
+      },
       strict,
     ),
   },
@@ -387,7 +442,15 @@ export const EVENT_CATALOG = {
   'node.pauseRequested': {
     aggregateType: 'ticket',
     version: 1,
-    schema: Type.Object(EXECUTION_FIELDS, strict),
+    schema: Type.Object(
+      {
+        ...EXECUTION_FIELDS,
+        /** The engine stops the run because of a claim conflict (M4): it waits for the paths, or fails (`fail`). */
+        claim: Type.Optional(ClaimWaitSchema),
+        fail: Type.Optional(Type.Literal(true)),
+      },
+      strict,
+    ),
   },
   'node.paused': {
     aggregateType: 'ticket',
@@ -397,6 +460,8 @@ export const EVENT_CATALOG = {
         ...EXECUTION_FIELDS,
         resumeTo: Type.Union([Type.Literal('queued'), Type.Literal('review'), Type.Literal('rejected')]),
         resumeFromRunId: Type.Optional(RunId),
+        /** Set when it waits for paths another execution holds (M4). The engine resumes it once they are free. */
+        claim: Type.Optional(ClaimWaitSchema),
       },
       strict,
     ),
@@ -409,6 +474,8 @@ export const EVENT_CATALOG = {
         ...EXECUTION_FIELDS,
         /** Where the lane is now: back where it was paused, or still running when the pause had not happened yet. */
         status: Type.Union([Type.Literal('queued'), Type.Literal('review'), Type.Literal('rejected'), Type.Literal('running')]),
+        /** A person resumed a lane that waited for a claim: it goes ahead despite the overlap (recorded as a warning). */
+        override: Type.Optional(Type.Literal(true)),
       },
       strict,
     ),
@@ -501,6 +568,155 @@ export const EVENT_CATALOG = {
     version: 1,
     schema: Type.Object({ runId: RunId, ...RUN_SETTLE_FIELDS }, strict),
   },
+  // -------------------------------------------------------------------------
+  // Workspace ledger (aggregate 'workspace', one per project; [[명령·이벤트 계약]] §14)
+
+  /** Entries taken: a node's claims when it started, or checkouts right before an edit. */
+  'checkout.acquired': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      {
+        projectId: IdSchema,
+        entries: Type.Array(CheckoutEntrySchema, { minItems: 1, maxItems: 1024 }),
+        source: CheckoutSource,
+        /** Overlaps that were let through: the `warn` policy, or a person resuming a waiting lane. */
+        overlaps: Type.Optional(Type.Array(ConflictSchema, { maxItems: 256 })),
+      },
+      strict,
+    ),
+  },
+  /** A request for paths another execution holds was refused: the decision and who holds them. */
+  'checkout.blocked': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      {
+        projectId: IdSchema,
+        requester: HolderSchema,
+        space: SpaceSchema,
+        paths: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { minItems: 1, maxItems: 1024 }),
+        source: CheckoutSource,
+        conflicts: Type.Array(ConflictSchema, { minItems: 1, maxItems: 256 }),
+        policy: Type.Union(CLAIM_CONFLICT_POLICIES.map((policy) => Type.Literal(policy))),
+        /** wait: the lane pauses until the paths are free. fail: the lane fails. ask: a person decides. */
+        outcome: Type.Union([Type.Literal('wait'), Type.Literal('fail'), Type.Literal('ask')]),
+        deadlock: Type.Optional(Type.Literal(true)),
+      },
+      strict,
+    ),
+  },
+  'checkout.released': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      {
+        projectId: IdSchema,
+        ids: Type.Array(IdSchema, { minItems: 1, maxItems: 4096 }),
+        reason: Type.Union(CHECKOUT_RELEASE_REASONS.map((reason) => Type.Literal(reason))),
+      },
+      strict,
+    ),
+  },
+  /** `release: ticketDone` entries outlive their node: the ticket keeps them until it completes. */
+  'checkout.retained': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object({ projectId: IdSchema, ids: Type.Array(IdSchema, { minItems: 1, maxItems: 4096 }) }, strict),
+  },
+  /** The holder paused: file hashes now, to tell later what others changed while it waited (pauseHash). */
+  'checkout.paused': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      {
+        projectId: IdSchema,
+        holder: HolderSchema,
+        hashes: Type.Record(IdSchema, Type.Union([HashSchema, Type.Null()])),
+      },
+      strict,
+    ),
+  },
+  /** The holder runs again: the pause hashes are cleared; `changed` lists what changed while it waited. */
+  'checkout.resumed': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      {
+        projectId: IdSchema,
+        holder: HolderSchema,
+        changed: Type.Array(
+          Type.Object(
+            { entryId: IdSchema, path: Type.String({ maxLength: 1024 }), pauseHash: Type.Union([HashSchema, Type.Null()]), hash: Type.Union([HashSchema, Type.Null()]) },
+            strict,
+          ),
+          { maxItems: 1024 },
+        ),
+      },
+      strict,
+    ),
+  },
+  /** Files found changed in a space (watcher, read-only git status, the holder's own checkouts) and how the ledger explains them. */
+  'workspace.changesDetected': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      {
+        projectId: IdSchema,
+        space: SpaceSchema,
+        scan: Type.Union(SCAN_REASONS.map((reason) => Type.Literal(reason))),
+        changes: Type.Array(DetectedChangeSchema, { minItems: 1, maxItems: 4096 }),
+      },
+      strict,
+    ),
+  },
+  /** The first look at a space: files that were already changed then are its starting point, not changes. */
+  'workspace.baselined': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      {
+        projectId: IdSchema,
+        space: SpaceSchema,
+        files: Type.Record(Type.String({ minLength: 1, maxLength: 1024 }), Type.Union([HashSchema, Type.Null()])),
+      },
+      strict,
+    ),
+  },
+  /** Two worktrees changed the same file: a merge conflict is likely (`overlapWarning`). Recorded once per pair. */
+  'workspace.overlapWarned': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      {
+        projectId: IdSchema,
+        path: Type.String({ minLength: 1, maxLength: 1024 }),
+        spaces: Type.Array(SpaceSchema, { minItems: 2, maxItems: 2 }),
+        holders: Type.Array(HolderSchema, { maxItems: 2 }),
+      },
+      strict,
+    ),
+  },
+  'worktree.created': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object({ projectId: IdSchema, worktree: WorktreeSchema }, strict),
+  },
+  'worktree.removed': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      {
+        projectId: IdSchema,
+        ticketId: IdSchema,
+        key: Type.String({ minLength: 1, maxLength: 230 }),
+        /** merged: its branch is in the ticket branch. ticketDone: the ticket completed. */
+        reason: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone')]),
+        branchDeleted: Type.Boolean(),
+      },
+      strict,
+    ),
+  },
   'permission.rulesChanged': {
     aggregateType: 'permissions',
     version: 1,
@@ -566,7 +782,10 @@ export type Upcaster = (data: unknown) => unknown;
 export type UpcasterRegistry = { readonly [T in EventType]?: Readonly<Record<number, Upcaster>> };
 
 /** Upcasters for events whose `version` was bumped after release. Pre-release bumps retire versions instead. */
-export const EVENT_UPCASTERS: UpcasterRegistry = {};
+export const EVENT_UPCASTERS: UpcasterRegistry = {
+  // v2 only widened `executor` with 'merge': v1 data is valid as is.
+  'node.started': { 1: (data) => data },
+};
 
 export class UnsupportedSchemaVersionError extends Error {
   readonly type: string;

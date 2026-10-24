@@ -17,17 +17,43 @@ export interface Projector {
 
 const projects: Projector = {
   name: 'projects',
-  version: 1,
-  tables: ['p_projects'],
+  version: 2,
+  tables: ['p_projects', 'p_app_settings'],
   ddl: [
     `CREATE TABLE p_projects (
       project_id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       created_at INTEGER NOT NULL,
-      revision INTEGER NOT NULL
+      revision INTEGER NOT NULL,
+      root TEXT,
+      base_ref TEXT,
+      watch TEXT,
+      settings TEXT
+    ) STRICT`,
+    `CREATE TABLE p_app_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      settings TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
     ) STRICT`,
   ],
   apply(event) {
+    if (event.type === 'app.configured') {
+      return [
+        {
+          sql: 'INSERT INTO p_app_settings (id, settings, updated_at) VALUES (1, ?, ?) ON CONFLICT (id) DO UPDATE SET settings = excluded.settings, updated_at = excluded.updated_at',
+          params: [JSON.stringify(event.data.settings), event.timestamp],
+        },
+      ];
+    }
+    if (event.type === 'project.configured') {
+      const { data } = event;
+      // Absent = unchanged, null = cleared.
+      const column = (name: string, value: unknown, json = false): SqliteStatement[] =>
+        value === undefined
+          ? []
+          : [{ sql: `UPDATE p_projects SET ${name} = ?, revision = ? WHERE project_id = ?`, params: [value === null ? null : json ? JSON.stringify(value) : (value as string), event.revision, data.projectId] }];
+      return [...column('root', data.root), ...column('base_ref', data.baseRef), ...column('watch', data.watch, true), ...column('settings', data.settings, true)];
+    }
     if (event.type !== 'project.created') return [];
     return [
       {
@@ -212,7 +238,7 @@ type LaneKey = { readonly ticketId: string; readonly nodeId: string; readonly la
  */
 const nodes: Projector = {
   name: 'nodes',
-  version: 3,
+  version: 4,
   tables: ['p_node_lanes', 'p_node_runs'],
   ddl: [
     `CREATE TABLE p_node_lanes (
@@ -227,6 +253,7 @@ const nodes: Projector = {
       attempt INTEGER NOT NULL DEFAULT 0,
       pause_requested INTEGER NOT NULL DEFAULT 0,
       superseded_by TEXT,
+      waiting_for TEXT,
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (ticket_id, node_id, lane)
     ) STRICT`,
@@ -272,7 +299,8 @@ const nodes: Projector = {
             sql: `INSERT INTO p_node_lanes (ticket_id, node_id, lane, lane_group, run, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
                   ON CONFLICT (ticket_id, node_id, lane) DO UPDATE SET
                     lane_group = COALESCE(excluded.lane_group, lane_group), run = excluded.run, status = excluded.status,
-                    executor = NULL, run_id = NULL, attempt = 0, pause_requested = 0, superseded_by = NULL, updated_at = excluded.updated_at`,
+                    executor = NULL, run_id = NULL, attempt = 0, pause_requested = 0, superseded_by = NULL, waiting_for = NULL,
+                    updated_at = excluded.updated_at`,
             params: [data.ticketId, data.nodeId, data.lane, data.group ?? null, data.run, data.status, event.timestamp],
           },
           {
@@ -316,9 +344,13 @@ const nodes: Projector = {
       case 'node.pauseRequested':
         return [lane('pause_requested = 1', [], event.data)];
       case 'node.paused':
-        return [lane("status = 'paused', pause_requested = 0", [], event.data), run("status = 'paused'", [], event.data)];
+        // `waiting_for`: the claim it waits for (who holds which paths), so boards can say why it paused.
+        return [
+          lane("status = 'paused', pause_requested = 0, waiting_for = ?", [event.data.claim === undefined ? null : JSON.stringify(event.data.claim)], event.data),
+          run("status = 'paused'", [], event.data),
+        ];
       case 'node.resumed':
-        return [lane('status = ?, pause_requested = 0', [event.data.status], event.data), run('status = ?', [event.data.status], event.data)];
+        return [lane('status = ?, pause_requested = 0, waiting_for = NULL', [event.data.status], event.data), run('status = ?', [event.data.status], event.data)];
       default:
         return [];
     }
@@ -552,7 +584,236 @@ const audit: Projector = {
   },
 };
 
-export const BUILTIN_PROJECTORS: readonly Projector[] = [projects, tickets, nodes, runs, permissions, audit, definitions];
+/**
+ * The workspace ledger (M4): entries held now, refused requests, changes found afterwards (unattributed ones are what
+ * screens flag), overlap warnings and the engine's worktrees.
+ */
+const workspace: Projector = {
+  name: 'workspace',
+  version: 1,
+  tables: ['p_checkouts', 'p_checkout_blocks', 'p_workspace_changes', 'p_overlap_warnings', 'p_worktrees'],
+  ddl: [
+    `CREATE TABLE p_checkouts (
+      entry_id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      space TEXT NOT NULL,
+      path TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      ticket_id TEXT NOT NULL,
+      node_id TEXT NOT NULL,
+      lane TEXT NOT NULL,
+      run INTEGER NOT NULL,
+      release TEXT NOT NULL,
+      on_conflict TEXT NOT NULL,
+      pause_mode TEXT NOT NULL,
+      priority INTEGER NOT NULL,
+      expires_at INTEGER,
+      base_hash TEXT,
+      pause_hash TEXT,
+      paused INTEGER NOT NULL DEFAULT 0,
+      retained INTEGER NOT NULL DEFAULT 0,
+      acquired_at INTEGER NOT NULL
+    ) STRICT`,
+    'CREATE INDEX p_checkouts_by_project ON p_checkouts (project_id, space, path)',
+    'CREATE INDEX p_checkouts_by_ticket ON p_checkouts (ticket_id, node_id, lane)',
+    `CREATE TABLE p_checkout_blocks (
+      sequence INTEGER PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      ticket_id TEXT NOT NULL,
+      node_id TEXT NOT NULL,
+      lane TEXT NOT NULL,
+      run INTEGER NOT NULL,
+      space TEXT NOT NULL,
+      paths TEXT NOT NULL,
+      source TEXT NOT NULL,
+      policy TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      deadlock INTEGER NOT NULL,
+      conflicts TEXT NOT NULL,
+      at INTEGER NOT NULL
+    ) STRICT`,
+    'CREATE INDEX p_checkout_blocks_by_project ON p_checkout_blocks (project_id, sequence)',
+    `CREATE TABLE p_workspace_changes (
+      id INTEGER PRIMARY KEY,
+      sequence INTEGER NOT NULL,
+      project_id TEXT NOT NULL,
+      space TEXT NOT NULL,
+      scan TEXT NOT NULL,
+      path TEXT NOT NULL,
+      hash TEXT,
+      previous TEXT,
+      attribution TEXT NOT NULL,
+      ticket_id TEXT,
+      node_id TEXT,
+      lane TEXT,
+      run INTEGER,
+      suspects TEXT,
+      at INTEGER NOT NULL
+    ) STRICT`,
+    'CREATE INDEX p_workspace_changes_by_project ON p_workspace_changes (project_id, attribution, sequence)',
+    'CREATE INDEX p_workspace_changes_by_ticket ON p_workspace_changes (ticket_id, sequence)',
+    `CREATE TABLE p_overlap_warnings (
+      sequence INTEGER PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      path TEXT NOT NULL,
+      spaces TEXT NOT NULL,
+      holders TEXT NOT NULL,
+      at INTEGER NOT NULL
+    ) STRICT`,
+    `CREATE TABLE p_worktrees (
+      project_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      ticket_id TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      node_id TEXT,
+      lane TEXT,
+      path TEXT NOT NULL,
+      branch TEXT NOT NULL,
+      base TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      removed_at INTEGER,
+      removed_reason TEXT,
+      branch_deleted INTEGER,
+      PRIMARY KEY (project_id, key)
+    ) STRICT`,
+  ],
+  apply(event) {
+    switch (event.type) {
+      case 'checkout.acquired':
+        return event.data.entries.map((entry) => ({
+          sql: `INSERT INTO p_checkouts
+                  (entry_id, project_id, space, path, kind, mode, ticket_id, node_id, lane, run, release, on_conflict, pause_mode,
+                   priority, expires_at, base_hash, acquired_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
+            entry.id,
+            event.data.projectId,
+            entry.space,
+            entry.path,
+            entry.kind,
+            entry.mode,
+            entry.holder.ticketId,
+            entry.holder.nodeId,
+            entry.holder.lane,
+            entry.holder.run,
+            entry.release,
+            entry.onConflict,
+            entry.pauseMode,
+            entry.priority,
+            entry.expiresAt ?? null,
+            entry.baseHash ?? null,
+            event.timestamp,
+          ],
+        }));
+      case 'checkout.released':
+        return event.data.ids.map((id) => ({ sql: 'DELETE FROM p_checkouts WHERE entry_id = ?', params: [id] }));
+      case 'checkout.retained':
+        return event.data.ids.map((id) => ({ sql: 'UPDATE p_checkouts SET retained = 1 WHERE entry_id = ?', params: [id] }));
+      case 'checkout.paused':
+        return Object.entries(event.data.hashes).map(([id, hash]) => ({ sql: 'UPDATE p_checkouts SET pause_hash = ?, paused = 1 WHERE entry_id = ?', params: [hash, id] }));
+      case 'checkout.resumed': {
+        const { holder } = event.data;
+        return [
+          {
+            sql: 'UPDATE p_checkouts SET pause_hash = NULL, paused = 0 WHERE ticket_id = ? AND node_id = ? AND lane = ? AND run = ?',
+            params: [holder.ticketId, holder.nodeId, holder.lane, holder.run],
+          },
+        ];
+      }
+      case 'checkout.blocked': {
+        const { data } = event;
+        return [
+          {
+            sql: `INSERT INTO p_checkout_blocks
+                    (sequence, project_id, ticket_id, node_id, lane, run, space, paths, source, policy, outcome, deadlock, conflicts, at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [
+              event.sequence,
+              data.projectId,
+              data.requester.ticketId,
+              data.requester.nodeId,
+              data.requester.lane,
+              data.requester.run,
+              data.space,
+              JSON.stringify(data.paths),
+              data.source,
+              data.policy,
+              data.outcome,
+              data.deadlock === true ? 1 : 0,
+              JSON.stringify(data.conflicts),
+              event.timestamp,
+            ],
+          },
+        ];
+      }
+      case 'workspace.changesDetected':
+        return event.data.changes.map((change) => ({
+          sql: `INSERT INTO p_workspace_changes
+                  (sequence, project_id, space, scan, path, hash, previous, attribution, ticket_id, node_id, lane, run, suspects, at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
+            event.sequence,
+            event.data.projectId,
+            event.data.space,
+            event.data.scan,
+            change.path,
+            change.hash,
+            change.previous ?? null,
+            change.attribution,
+            change.holder?.ticketId ?? null,
+            change.holder?.nodeId ?? null,
+            change.holder?.lane ?? null,
+            change.holder?.run ?? null,
+            change.suspects === undefined ? null : JSON.stringify(change.suspects),
+            event.timestamp,
+          ],
+        }));
+      case 'workspace.overlapWarned':
+        return [
+          {
+            sql: 'INSERT INTO p_overlap_warnings (sequence, project_id, path, spaces, holders, at) VALUES (?, ?, ?, ?, ?, ?)',
+            params: [event.sequence, event.data.projectId, event.data.path, JSON.stringify(event.data.spaces), JSON.stringify(event.data.holders), event.timestamp],
+          },
+        ];
+      case 'worktree.created': {
+        const { worktree } = event.data;
+        return [
+          {
+            sql: `INSERT INTO p_worktrees (project_id, key, ticket_id, scope, node_id, lane, path, branch, base, created_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  ON CONFLICT (project_id, key) DO UPDATE SET
+                    path = excluded.path, branch = excluded.branch, base = excluded.base, created_at = excluded.created_at,
+                    removed_at = NULL, removed_reason = NULL, branch_deleted = NULL`,
+            params: [
+              event.data.projectId,
+              worktree.key,
+              worktree.ticketId,
+              worktree.scope,
+              worktree.nodeId ?? null,
+              worktree.lane ?? null,
+              worktree.path,
+              worktree.branch,
+              worktree.base,
+              event.timestamp,
+            ],
+          },
+        ];
+      }
+      case 'worktree.removed':
+        return [
+          {
+            sql: 'UPDATE p_worktrees SET removed_at = ?, removed_reason = ?, branch_deleted = ? WHERE project_id = ? AND key = ?',
+            params: [event.timestamp, event.data.reason, event.data.branchDeleted ? 1 : 0, event.data.projectId, event.data.key],
+          },
+        ];
+      default:
+        return [];
+    }
+  },
+};
+
+export const BUILTIN_PROJECTORS: readonly Projector[] = [projects, tickets, nodes, runs, permissions, audit, definitions, workspace];
 
 /** Identifies the projection set; a mismatch with the stored value triggers a rebuild. */
 export function projectionVersion(projectors: readonly Projector[]): string {

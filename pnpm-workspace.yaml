@@ -7,3 +7,7 @@ packages:
 onlyBuiltDependencies:
   - koffi # selects its prebuilt binary
   - unrs-resolver # checks its prebuilt binary (used by eslint-plugin-import-x)
+
+# Ships prebuilt binaries per platform; its install script only builds from source as a fallback.
+ignoredBuiltDependencies:
+  - '@parcel/watcher'

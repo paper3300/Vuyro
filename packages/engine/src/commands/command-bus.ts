@@ -22,6 +22,7 @@ import { canonicalJson, sha256Hex } from './fingerprint.ts';
 import { type HandlerContext, handlerFor, type Loaded } from './handlers.ts';
 import type { HumanCredentialVerifier } from './human-credential.ts';
 import type { DefinitionResolver } from '../workflow/definitions.ts';
+import { type WorkspaceServices, workspaceServices } from '../workspace/services.ts';
 
 export interface CommandBusOptions {
   readonly store: EventStore;
@@ -40,6 +41,8 @@ export interface CommandBusOptions {
   readonly reportError?: (error: Error, context: string) => void;
   /** Definition files for workflow commands (templates, node types). */
   readonly definitions?: DefinitionResolver;
+  /** Workspace layout, clock and file hashes for the checkout ledger (M4). Default: worktrees under the temp folder, system clock. */
+  readonly workspaces?: WorkspaceServices;
 }
 
 interface CachedAggregate {
@@ -69,6 +72,7 @@ export class CommandBus {
   private readonly humanCredential: HumanCredentialVerifier | undefined;
   private readonly reportError: (error: Error, context: string) => void;
   private readonly definitions: DefinitionResolver | undefined;
+  private readonly workspaceServices: WorkspaceServices;
   private readonly cache = new Map<string, CachedAggregate>();
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -80,12 +84,18 @@ export class CommandBus {
     this.cacheSize = options.aggregateCacheSize ?? 1000;
     this.humanCredential = options.humanCredential;
     this.definitions = options.definitions;
+    this.workspaceServices = options.workspaces ?? workspaceServices();
     this.reportError =
       options.reportError ??
       ((error, context) => {
         process.stderr.write(`[vuyro] ${context}: ${error.message}
 `);
       });
+  }
+
+  /** Workspace layout, clock and hashes the handlers decide with; the engine uses the same ones. */
+  get workspaces(): WorkspaceServices {
+    return this.workspaceServices;
   }
 
   execute(request: unknown, transport: TransportIdentity): Promise<CommandResponse> {
@@ -195,6 +205,7 @@ export class CommandBus {
       ids: this.ids,
       random: this.random,
       ...(this.definitions === undefined ? {} : { definitions: this.definitions }),
+      workspaces: this.workspaceServices,
       load: (aggregate, aggregateId) => this.load(aggregate, aggregateId),
     };
     const outcome = await handler.decide(context, payload, target);

@@ -46,6 +46,20 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'vuyro_checkout',
+    description:
+      "Check workspace files out in Vuyro's ledger before you edit them (paths relative to your working folder). If another node holds them, the answer says who; your node then pauses until they are free.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        paths: { type: 'array', items: { type: 'string' }, minItems: 1 },
+        shared: { type: 'boolean', description: 'Read-only: other nodes may read the files too.' },
+      },
+      required: ['paths'],
+      additionalProperties: false,
+    },
+  },
 ] as const;
 
 export interface McpServerOptions {
@@ -121,15 +135,24 @@ async function call(params: Record<string, unknown>, options: McpServerOptions, 
       payload = { ticketId, nodeId, slot, ref };
       break;
     }
+    case 'vuyro_checkout':
+      type = 'checkout.acquire';
+      payload = { ticketId, nodeId, paths: args.paths, source: 'agent', ...(args.shared === true ? { mode: 'shared' } : {}) };
+      break;
     default:
       return text(`unknown tool '${String(params.name)}'`, true);
   }
   try {
     const client = await (options.connect ?? ((o) => EngineClient.connect(o)))({ client: 'cli', env: options.env });
+    let result: unknown;
     try {
-      await client.execute({ requestId: `mcp-${randomUUID()}`, type, payload, auth: { runToken: token } });
+      result = (await client.execute({ requestId: `mcp-${randomUUID()}`, type, payload, auth: { runToken: token } })).result;
     } finally {
       client.close();
+    }
+    if (type === 'checkout.acquire') {
+      const checkout = result as { granted: boolean; reason?: string; paths?: string[] };
+      return checkout.granted ? text(`Checked out: ${(checkout.paths ?? []).join(', ') || '(outside the workspace)'}`) : text(checkout.reason ?? 'refused', true);
     }
     return text(type === 'node.done' ? 'Result recorded.' : 'Artifact registered.');
   } catch (error) {

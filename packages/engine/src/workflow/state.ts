@@ -2,12 +2,15 @@ import {
   type ActivationCause,
   type ArtifactRef,
   type Basis,
+  type ClaimWait,
   type ExecutionStatus,
   type HandoffItem,
   isRetiredEvent,
+  type MergeReview,
   type NodeRunOutput,
   type NodeStatus,
   type PinnedTemplate,
+  type TicketWorkspace,
 } from '@vuyro/contracts';
 import type { DomainEvent } from '@vuyro/contracts';
 import type { NewEvent } from '../store/event-store.ts';
@@ -34,7 +37,7 @@ export interface Execution {
   readonly attempts: number;
   /** Automatic restarts so far (engine restart, cancelled without a pause). Bounded by MAX_AUTOMATIC_ATTEMPTS. */
   readonly requeues: number;
-  readonly executor?: 'agent' | 'script';
+  readonly executor?: 'agent' | 'script' | 'merge';
   /** Agent runs of this execution, oldest first. The last one is current. */
   readonly runIds: readonly string[];
   /** What the agent submitted with `node.done` (applied when its run settles). */
@@ -48,6 +51,19 @@ export interface Execution {
   readonly resumeFromRunId?: string;
   readonly pauseRequested: boolean;
   readonly resumeTo?: 'queued' | 'review' | 'rejected';
+  /** The engine asked the run to stop for a claim conflict (M4): it then waits for the paths, or fails (`fail`). */
+  readonly pauseClaim?: { readonly claim: ClaimWait; readonly fail?: true };
+  /** Paused because another execution holds paths this one needs (M4). Cleared when it resumes. */
+  readonly claimWait?: ClaimWait;
+  /**
+   * A person resumed it while it waited for a claim: for the rest of this execution its claims and checkouts go ahead
+   * despite overlaps (recorded as warnings). A person decided it may; waiting again would undo that.
+   */
+  readonly override?: true;
+  /** Worktree mode: start the lane's worktree over from the ticket branch (merge conflict, `rerun`). */
+  readonly reset?: true;
+  /** A join's merge waiting for a person (conflicts), M4. */
+  readonly merge?: MergeReview;
   /** Set when the output had items for edges but every one was stale, so nothing travelled (not a path end, D-021). */
   readonly onlyStale?: boolean;
   /** Ticket step at which the execution finished (for "latest run", and "after the last activation"). */
@@ -86,6 +102,10 @@ export interface TicketWorkflow {
   readonly description?: string;
   readonly status: 'open' | 'done';
   readonly template?: PinnedTemplate;
+  /** Claim priority (`priorityWins`). Default 0. */
+  readonly priority: number;
+  /** The workspace and app + project settings pinned at creation (M4). */
+  readonly workspace?: TicketWorkspace;
   readonly nodes: Readonly<Record<string, NodeProgress>>;
   /** Fan-out groups by id. */
   readonly groups: Readonly<Record<string, Group>>;
@@ -110,6 +130,7 @@ export const EMPTY_TICKET: TicketWorkflow = {
   projectId: '',
   title: '',
   status: 'open',
+  priority: 0,
   nodes: {},
   groups: {},
   step: 0,
@@ -205,6 +226,8 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEven
         title: data.title,
         description: data.description,
         template: data.template,
+        priority: data.priority ?? 0,
+        workspace: data.workspace,
       });
     }
     case 'ticket.updated': {
@@ -213,6 +236,7 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEven
         ...state,
         ...(data.title === undefined ? {} : { title: data.title }),
         ...(data.description === undefined ? {} : { description: data.description }),
+        ...(data.priority === undefined ? {} : { priority: data.priority }),
       };
     }
     case 'ticket.completed':
@@ -249,6 +273,7 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEven
         routes: {},
         artifacts: {},
         pauseRequested: false,
+        reset: data.workspace?.reset,
       });
       return setNode(next, data.nodeId, (node) => {
         const existing = Object.hasOwn(node.lanes, data.lane) ? node.lanes[data.lane] : undefined;
@@ -273,6 +298,8 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEven
           executor: data.executor,
           runIds: data.runId === undefined ? current.runIds : [...current.runIds, data.runId],
           resumeFromRunId: undefined,
+          reset: undefined,
+          merge: undefined,
         }),
       );
       if (data.runId !== undefined) next = { ...next, runIndex: { ...next.runIndex, [data.runId]: { nodeId: data.nodeId, run: data.run } } };
@@ -281,7 +308,9 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEven
     case 'node.outputSubmitted':
       return setExecution(state, event.data.nodeId, event.data.run, (current) => ({ ...current, submitted: event.data.output }));
     case 'node.reviewRequested':
-      return setExecution(state, event.data.nodeId, event.data.run, (current) => ({ ...current, status: 'review', output: event.data.output }));
+      return setExecution(state, event.data.nodeId, event.data.run, (current) =>
+        withoutUndefined<Execution>({ ...current, status: 'review', output: event.data.output, merge: event.data.merge }),
+      );
     case 'node.returned':
       return setExecution(state, event.data.nodeId, event.data.run, (current) => ({ ...current, status: 'discarded' }));
     case 'node.completed': {
@@ -319,28 +348,39 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEven
       return setNode(next, data.nodeId, (node) => ({ ...node, group: data.group }));
     }
     case 'node.superseded':
-      return setExecution(state, event.data.nodeId, event.data.run, (current) => ({ ...current, status: 'superseded', pauseRequested: false }));
+      return setExecution(state, event.data.nodeId, event.data.run, (current) =>
+        withoutUndefined<Execution>({ ...current, status: 'superseded', pauseRequested: false, pauseClaim: undefined, claimWait: undefined }),
+      );
     case 'node.requeued':
       return setExecution(state, event.data.nodeId, event.data.run, (current) =>
         withoutUndefined<Execution>({
           ...current,
           status: 'queued',
+          pauseClaim: undefined,
           requeues: current.requeues + 1,
           submitted: undefined,
           resumeFromRunId: event.data.resumeFromRunId,
         }),
       );
-    case 'node.pauseRequested':
-      return setExecution(state, event.data.nodeId, event.data.run, (current) => ({ ...current, pauseRequested: true }));
+    case 'node.pauseRequested': {
+      const { claim, fail } = event.data;
+      return setExecution(state, event.data.nodeId, event.data.run, (current) => ({
+        ...current,
+        pauseRequested: true,
+        ...(claim === undefined ? {} : { pauseClaim: fail === true ? { claim, fail } : { claim } }),
+      }));
+    }
     case 'node.paused':
       return setExecution(state, event.data.nodeId, event.data.run, (current) =>
         withoutUndefined<Execution>({
           ...current,
           status: 'paused',
           pauseRequested: false,
+          pauseClaim: undefined,
           submitted: undefined,
           resumeTo: event.data.resumeTo,
           resumeFromRunId: event.data.resumeFromRunId ?? current.resumeFromRunId,
+          claimWait: event.data.claim,
         }),
       );
     case 'node.resumed':
@@ -349,7 +389,10 @@ export function evolveTicket(state: TicketWorkflow, event: NewEvent | DomainEven
           ...current,
           status: current.status === 'paused' ? (current.resumeTo ?? 'queued') : current.status,
           pauseRequested: false,
+          pauseClaim: undefined,
           resumeTo: undefined,
+          claimWait: undefined,
+          override: event.data.override ?? current.override,
         }),
       );
     default:

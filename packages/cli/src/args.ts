@@ -12,7 +12,7 @@ export interface ParsedArgs {
   readonly flags: ReadonlyMap<string, string | true>;
 }
 
-const BOOLEAN_FLAGS = new Set(['json', 'follow', 'help']);
+const BOOLEAN_FLAGS = new Set(['json', 'follow', 'help', 'all', 'shared', 'clear-root', 'clear-base-ref']);
 
 export function parseArgs(argv: readonly string[]): ParsedArgs {
   const positionals: string[] = [];

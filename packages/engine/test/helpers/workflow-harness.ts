@@ -15,6 +15,9 @@ import { WorkflowEngine, type WorkflowEngineOptions } from '../../src/workflow/e
 import { endReached, ticketWaitReasons } from '../../src/workflow/machine.ts';
 import { type ScriptedBehavior, ScriptedAgentAdapter } from '../../src/workflow/scripted-agent.ts';
 import { currentExecution, evolveTicket, EMPTY_TICKET, laneStatus, nodeProgress, type TicketWorkflow } from '../../src/workflow/state.ts';
+import type { GitClient } from '../../src/workspace/git.ts';
+import { type WorkspaceServices, workspaceServices } from '../../src/workspace/services.ts';
+import type { FileWatcher } from '../../src/workspace/watcher.ts';
 import { HUMAN, nextRequestId, SYSTEM, tempDir } from './engine-harness.ts';
 
 export interface WorkflowHarnessOptions {
@@ -30,10 +33,15 @@ export interface WorkflowHarnessOptions {
   readonly adapters?: (parts: { clock: VirtualClock; processes: FakeProcessRunner; bus: CommandBus }) => WorkflowEngineOptions['adapters'];
   readonly agentTimeoutMs?: number;
   readonly agentEnv?: Readonly<Record<string, string>>;
+  /** Git for worktree tests (default: git on PATH). */
+  readonly git?: GitClient;
+  readonly watcher?: FileWatcher;
 }
 
 export interface WorkflowHarness {
   readonly dir: string;
+  /** Workspace layout (worktrees under `<dir>/wt`), the virtual clock and real file hashes; shared by bus and engine. */
+  readonly workspaces: WorkspaceServices;
   readonly clock: VirtualClock;
   readonly activity: ActivityTracker;
   readonly processes: FakeProcessRunner;
@@ -72,6 +80,7 @@ export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}):
   const activity = new ActivityTracker();
   const processes = new FakeProcessRunner(clock);
   const fs = options.fs ?? nodeFileSystem;
+  const workspaces = workspaceServices({ worktreeRoot: join(temp.dir, 'wt'), clock });
   const errors: { error: Error; context: string }[] = [];
   const reportError = (error: Error, context: string) => {
     errors.push({ error, context });
@@ -81,7 +90,7 @@ export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}):
   const build = async (start: { engine: boolean }) => {
     const store = await EventStore.open({ path: join(temp.dir, 'engine.db'), clock, ids });
     const registry = new DefinitionRegistry({ root: join(temp.dir, 'definitions'), fs, store });
-    const bus = new CommandBus({ store, ids, random, definitions: registry, reportError });
+    const bus = new CommandBus({ store, ids, random, definitions: registry, reportError, workspaces });
     const writer = new DefinitionWriter({ registry, fs, bus, store, activity, reportError });
     writer.start();
     const adapter = new ScriptedAgentAdapter({ provider: 'claude', clock, bus, activity, behavior: (session) => behavior(session) });
@@ -100,6 +109,9 @@ export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}):
           ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
           ...(options.agentTimeoutMs === undefined ? {} : { agentTimeoutMs: options.agentTimeoutMs }),
           ...(options.agentEnv === undefined ? {} : { agentEnv: options.agentEnv }),
+          ...(options.git === undefined ? {} : { git: options.git }),
+          ...(options.watcher === undefined ? {} : { watcher: options.watcher }),
+          workspaces,
         })
       : undefined;
     return { store, registry, bus, writer, adapter, engine };
@@ -115,6 +127,7 @@ export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}):
 
   const harness: WorkflowHarness = {
     dir: temp.dir,
+    workspaces,
     clock,
     activity,
     processes,

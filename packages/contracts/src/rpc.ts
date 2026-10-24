@@ -23,6 +23,7 @@ export const RPC_METHODS = {
   ticket: 'query.ticket',
   artifacts: 'query.artifacts',
   ticketStats: 'query.ticketStats',
+  workspace: 'query.workspace',
 } as const;
 
 export type RpcMethod = (typeof RPC_METHODS)[keyof typeof RPC_METHODS];
@@ -89,6 +90,17 @@ export const TicketsQuerySchema = Type.Object({ projectId: Type.Optional(IdSchem
 export const TicketQuerySchema = Type.Object({ ticketId: IdSchema }, strict);
 export const ArtifactsQuerySchema = Type.Object({ ticketId: IdSchema, nodeId: Type.Optional(NodeIdSchema) }, strict);
 export const ProjectsQuerySchema = Type.Object({}, strict);
+/** The project's checkout ledger: entries held now, recent refusals and changes, overlap warnings, worktrees. */
+export const WorkspaceQuerySchema = Type.Object(
+  {
+    projectId: IdSchema,
+    ticketId: Type.Optional(IdSchema),
+    /** Changes to list: unattributed and conflicting only (default), or every one. */
+    changes: Type.Optional(Type.Union([Type.Literal('flagged'), Type.Literal('all')])),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+  },
+  strict,
+);
 
 export interface SubscribeResult {
   readonly subscription: string;

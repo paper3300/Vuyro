@@ -1,5 +1,6 @@
-import type { DefinitionKind, DomainEvent, RunOutcome } from '@vuyro/contracts';
+import type { DefinitionKind, DomainEvent, RunOutcome, WatchSettings, WorkspaceSettings } from '@vuyro/contracts';
 import { EMPTY_TICKET, evolveTicket, type TicketWorkflow } from '../workflow/state.ts';
+import { EMPTY_LEDGER, evolveLedger, type LedgerState } from '../workspace/ledger.ts';
 
 /**
  * Aggregate state used to decide commands, folded from the aggregate's own events.
@@ -14,14 +15,54 @@ export interface AggregateDefinition<S> {
 export interface ProjectState {
   readonly exists: boolean;
   readonly name: string;
+  /** Workspace folder and settings layer (`project.configure`, M4). */
+  readonly root?: string;
+  readonly baseRef?: string;
+  readonly watch?: WatchSettings;
+  readonly settings?: WorkspaceSettings;
 }
 
 export const projectAggregate: AggregateDefinition<ProjectState> = {
   type: 'project',
   initial: { exists: false, name: '' },
   evolve(state, event) {
-    return event.type === 'project.created' ? { exists: true, name: event.data.name } : state;
+    if (event.type === 'project.created') return { exists: true, name: event.data.name };
+    if (event.type !== 'project.configured') return state;
+    // Absent = unchanged, null = cleared.
+    const { data } = event;
+    const root = data.root === undefined ? state.root : (data.root ?? undefined);
+    const baseRef = data.baseRef === undefined ? state.baseRef : (data.baseRef ?? undefined);
+    const watch = data.watch ?? state.watch;
+    const settings = data.settings ?? state.settings;
+    return {
+      exists: state.exists,
+      name: state.name,
+      ...(root === undefined ? {} : { root }),
+      ...(baseRef === undefined ? {} : { baseRef }),
+      ...(watch === undefined ? {} : { watch }),
+      ...(settings === undefined ? {} : { settings }),
+    };
   },
+};
+
+/** The app layer of the workspace settings (singleton aggregate `settings:app`). */
+export interface AppSettingsState {
+  readonly settings?: WorkspaceSettings;
+}
+
+export const appSettingsAggregate: AggregateDefinition<AppSettingsState> = {
+  type: 'settings',
+  initial: {},
+  evolve(state, event) {
+    return event.type === 'app.configured' ? { settings: event.data.settings } : state;
+  },
+};
+
+/** A project's workspace ledger (`workspace:<projectId>`). */
+export const workspaceAggregate: AggregateDefinition<LedgerState> = {
+  type: 'workspace',
+  initial: EMPTY_LEDGER,
+  evolve: evolveLedger,
 };
 
 /** The ticket and its workflow progress (see workflow/state.ts). */

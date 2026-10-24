@@ -11,6 +11,8 @@ export interface EnginePaths {
   readonly lock: string;
   readonly definitions: string;
   readonly log: string;
+  /** Git worktrees the engine makes in worktree mode. Short on purpose: Windows paths have a length limit. */
+  readonly worktrees: string;
 }
 
 /** `%LOCALAPPDATA%\Vuyro` (local to this PC, not roamed). */
@@ -28,6 +30,7 @@ export function enginePaths(dataDir: string): EnginePaths {
     lock: join(root, 'engine', 'engine.lock'),
     definitions: join(root, 'definitions'),
     log: join(root, 'logs', 'engine.log'),
+    worktrees: join(root, 'wt'),
   };
 }
 

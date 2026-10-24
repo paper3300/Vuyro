@@ -15,6 +15,11 @@ import { ActivityTracker } from '../runtime/activity.ts';
 import type { Clock } from '../runtime/clock.ts';
 import type { ProcessRunner } from '../runtime/process.ts';
 import type { EventStore } from '../store/event-store.ts';
+import { type MergeAgentRequest, type Prepared, WorkspaceCoordinator } from '../workspace/coordinator.ts';
+import { GitClient } from '../workspace/git.ts';
+import type { WorkspaceServices } from '../workspace/services.ts';
+import { mergingJoins } from '../workspace/settings.ts';
+import type { FileWatcher } from '../workspace/watcher.ts';
 import type { CompiledNode, CompiledWorkflow } from './compile.ts';
 import { executionContext } from './context.ts';
 import type { DefinitionResolver } from './definitions.ts';
@@ -48,6 +53,15 @@ export interface WorkflowEngineOptions {
    * `vuyro` calls reach this engine. The run variables (token, ticket, node, lane, run id) always win.
    */
   readonly agentEnv?: Readonly<Record<string, string>>;
+  /**
+   * Workspace layout, clock and hashes (M4). Pass the bus's (`bus.workspaces`, the default) so both agree on where
+   * executions work.
+   */
+  readonly workspaces?: WorkspaceServices;
+  /** Git for worktrees, merges and read-only status. Default: git on PATH, no shell. */
+  readonly git?: GitClient;
+  /** Watches spaces while executions run (candidates for change detection). Default none: scans at start and finish. */
+  readonly watcher?: FileWatcher;
   readonly reportError?: (error: Error, context: string) => void;
 }
 
@@ -63,10 +77,15 @@ export interface WorkspaceTarget {
 
 interface LiveExecution {
   readonly ticketId: string;
+  /**
+   * Ticket revision the launch was decided from. Part of the start request id: a lane that paused for a claim and
+   * was resumed starts again with the same run and attempt, and must not get the stored "blocked" answer back.
+   */
+  readonly revision: number;
   readonly nodeId: string;
   readonly lane: string;
   readonly run: number;
-  readonly kind: 'agent' | 'script';
+  readonly kind: 'agent' | 'script' | 'merge';
   cancel?: () => void;
   cancelled: boolean;
 }
@@ -102,6 +121,8 @@ function keyOf(ticketId: string, nodeId: string, lane: string, run: number): str
  */
 export class WorkflowEngine {
   readonly activity: ActivityTracker;
+  /** The engine's file and git work for workspaces (M4). */
+  readonly workspaces: WorkspaceCoordinator;
   private readonly options: WorkflowEngineOptions;
   private readonly maxConcurrent: number;
   private readonly scriptEnv: Readonly<Record<string, string>>;
@@ -117,6 +138,19 @@ export class WorkflowEngine {
     this.activity = options.activity ?? new ActivityTracker();
     this.maxConcurrent = options.maxConcurrent ?? 4;
     this.scriptEnv = options.scriptEnv ?? defaultScriptEnv();
+    this.workspaces = new WorkspaceCoordinator({
+      bus: options.bus,
+      store: options.store,
+      definitions: options.definitions,
+      services: options.workspaces ?? options.bus.workspaces,
+      git: options.git ?? new GitClient(),
+      activity: this.activity,
+      ...(options.watcher === undefined ? {} : { watcher: options.watcher }),
+      resolveConflicts: (request) => this.resolveConflicts(request),
+      reportError: (error, context) => {
+        this.report(error, context);
+      },
+    });
   }
 
   /** Settles runs orphaned by a previous engine, then picks up every ticket with work left. */
@@ -124,9 +158,12 @@ export class WorkflowEngine {
     this.stopped = false;
     this.unsubscribe ??= this.options.store.subscribe((events) => {
       this.onEvents(events);
+      this.workspaces.onEvents(events);
     });
     await this.activity.track(async () => {
       await settleOrphanedRuns(this.options.bus, this.options.store);
+      // Entries of executions that ended while the engine was down go; spaces are checked for unwatched changes.
+      await this.workspaces.recover();
       await this.scheduleWaiting(true);
     });
   }
@@ -134,6 +171,7 @@ export class WorkflowEngine {
   /** Stops scheduling. Running executors are cancelled when `cancelRunning` is set. */
   stop(options: { cancelRunning?: boolean } = {}): void {
     this.stopped = true;
+    this.workspaces.stop();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     if (options.cancelRunning === true) for (const live of this.live.values()) this.cancel(live);
@@ -211,14 +249,16 @@ export class WorkflowEngine {
       this.report(error, `loading the workflow of ticket ${ticketId}`);
       return;
     }
+    const merging = mergingJoins(state, workflow);
     for (const node of workflow.nodes.values()) {
-      if (node.completion !== 'agent' && node.completion !== 'script') continue;
+      if (node.completion !== 'agent' && node.completion !== 'script' && !merging.has(node.id)) continue;
       for (const lane of nodeProgress(state, node.id).laneOrder) {
         const exec = currentExecution(state, node.id, lane);
         if (exec === undefined) continue;
         const key = keyOf(ticketId, node.id, lane, exec.run);
         if (exec.status === 'running' && !this.live.has(key)) {
-          await this.reconcile(ticketId, node, exec);
+          if (exec.executor === 'merge') this.launch(ticketId, state, workflow, node, exec, true);
+          else await this.reconcile(ticketId, node, exec);
         } else if ((exec.status === 'queued' || exec.status === 'rejected') && !this.live.has(key) && this.live.size < this.maxConcurrent) {
           this.launch(ticketId, state, workflow, node, exec);
         }
@@ -245,19 +285,25 @@ export class WorkflowEngine {
     }, ticketId, node.id, exec.lane, exec.run, exec.attempts);
   }
 
-  private launch(ticketId: string, state: TicketWorkflow, workflow: CompiledWorkflow, node: CompiledNode, exec: Execution): void {
+  private launch(ticketId: string, state: TicketWorkflow, workflow: CompiledWorkflow, node: CompiledNode, exec: Execution, resumeMerge = false): void {
     const live: LiveExecution = {
       ticketId,
+      revision: this.tickets.get(ticketId)?.revision ?? 0,
       nodeId: node.id,
       lane: exec.lane,
       run: exec.run,
-      kind: node.completion === 'agent' ? 'agent' : 'script',
+      kind: node.completion === 'agent' ? 'agent' : node.completion === 'script' ? 'script' : 'merge',
       cancelled: false,
     };
     const key = keyOf(ticketId, node.id, exec.lane, exec.run);
     this.live.set(key, live);
     const done = this.activity.begin();
-    const work = node.completion === 'agent' ? this.runAgent(state, workflow, node, exec, live, done) : this.runScript(state, workflow, node, exec, live, done);
+    const work =
+      live.kind === 'agent'
+        ? this.runAgent(state, workflow, node, exec, live, done)
+        : live.kind === 'script'
+          ? this.runScript(state, workflow, node, exec, live, done)
+          : this.runMerge(state, workflow, node, exec, live, resumeMerge, done);
     void work
       .catch((error: unknown) => {
         this.report(error, `running ${node.id} lane ${exec.lane} of ticket ${ticketId}`);
@@ -285,10 +331,11 @@ export class WorkflowEngine {
     const ticketId = live.ticketId;
     const attempt = exec.attempts + 1;
     const fields = { ticketId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt };
-    const started = await this.command('start', 'node.start', fields, ticketId, node.id, exec.lane, exec.run, attempt);
+    const started = await this.command('start', 'node.start', fields, ticketId, node.id, exec.lane, exec.run, attempt, live.revision);
     if (!started.ok) return;
-    const { runId, runToken } = started.result as { runId?: string; runToken?: string };
-    if (runId === undefined) return;
+    const { runId, runToken, blocked } = started.result as { runId?: string; runToken?: string; blocked?: string };
+    // Its claims conflict: the lane paused (or failed) instead of starting.
+    if (blocked !== undefined || runId === undefined) return;
     const finish = async (): Promise<void> => {
       await this.command('finish', 'node.finish', { ...fields, result: { kind: 'agent', runId } }, runId);
     };
@@ -308,11 +355,23 @@ export class WorkflowEngine {
       await finish();
       return;
     }
+    const target = { ticketId, state, workflow, node, exec, provider };
+    let prepared: Prepared;
+    try {
+      prepared = await this.workspaces.prepare(target);
+    } catch (error) {
+      await settle({ outcome: 'failed', terminalReason: 'workspace_failed', error: `could not prepare the workspace: ${(error as Error).message}` });
+      await finish();
+      return;
+    }
     const context = executionContext(state, workflow, ticketId, node, { ...exec, attempts: attempt });
-    const prompt = agentPrompt(node, context, state.title, exec.lane, exec.run);
+    const prompt = [agentPrompt(node, context, state.title, exec.lane, exec.run), ...prepared.notes].join('\n\n');
     const resume = await this.resumeTarget(runId);
     const model = typeof context.params === 'object' && context.params !== null ? (context.params as Record<string, unknown>).model : undefined;
-    const cwd = this.options.workspace?.({ ticketId, projectId: state.projectId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt });
+    const cwd = prepared.cwd ?? this.options.workspace?.({ ticketId, projectId: state.projectId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt });
+    for (const [index, message] of prepared.warnings.entries()) {
+      await this.command('observe', 'run.observe', { runId, observations: [{ kind: 'warning', message, source: 'vuyro.workspace' }] }, runId, 'workspace', index);
+    }
     let handle: AgentRunHandle;
     try {
       handle = adapter.start({
@@ -335,8 +394,10 @@ export class WorkflowEngine {
         ...(cwd === undefined ? {} : { cwd }),
         ...(this.options.agentTimeoutMs === undefined ? {} : { timeoutMs: this.options.agentTimeoutMs }),
         ...(resume === undefined ? {} : { resume }),
+        ...(prepared.checkoutHook ? { checkoutHook: true } : {}),
       });
     } catch (error) {
+      await this.afterRun(target);
       await settle({ outcome: 'failed', terminalReason: 'start_failed', error: (error as Error).message });
       await finish();
       return;
@@ -354,9 +415,91 @@ export class WorkflowEngine {
     }
     const settlement = await handle.settled;
     await this.activity.track(async () => {
+      await this.afterRun(target);
       await settle(settlement);
       await finish();
     });
+  }
+
+  /** After an executor's process ended: the engine's commit in its worktree and the finish scan. Never throws. */
+  private async afterRun(target: Parameters<WorkspaceCoordinator['finish']>[0]): Promise<void> {
+    try {
+      await this.workspaces.finish(target);
+    } catch (error) {
+      this.report(error, `checking the workspace after ${target.node.id} lane ${target.exec.lane}`);
+    }
+  }
+
+  /**
+   * The merge step of a join in worktree mode: merges the lanes' branches into the ticket branch and reports it with
+   * `node.finish` (kind merge). `resume`: the engine restarted while it ran; it runs again (merged branches are skipped).
+   */
+  private async runMerge(
+    state: TicketWorkflow,
+    workflow: CompiledWorkflow,
+    node: CompiledNode,
+    exec: Execution,
+    live: LiveExecution,
+    resume: boolean,
+    endSpan: () => void,
+  ): Promise<void> {
+    const ticketId = live.ticketId;
+    const attempt = resume ? exec.attempts : exec.attempts + 1;
+    const fields = { ticketId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt };
+    if (!resume) {
+      const started = await this.command('start', 'node.start', fields, ticketId, node.id, exec.lane, exec.run, attempt);
+      if (!started.ok) return;
+    }
+    // The merge tracks its own git work; an agent resolving conflicts may wait on the clock in between.
+    endSpan();
+    const result = await this.workspaces.merge({ ticketId, state, workflow, node, exec });
+    await this.activity.track(() => this.command('finish', 'node.finish', { ...fields, result }, ticketId, node.id, exec.lane, exec.run, attempt, 'merge'));
+  }
+
+  /** An agent run that resolves merge conflicts (`onMergeConflict: agent`). Resolves true when it ended normally. */
+  private async resolveConflicts(request: MergeAgentRequest): Promise<boolean> {
+    const adapter = this.options.adapters[request.provider];
+    if (adapter === undefined) return false;
+    const started = await this.activity.track(() =>
+      this.command('merge-agent', 'run.start', { ticketId: request.ticketId, nodeId: request.nodeId, provider: request.provider }, request.ticketId, request.nodeId, request.run, request.cwd, this.options.clock.now()),
+    );
+    if (!started.ok) return false;
+    const { runId, runToken } = started.result as { runId: string; runToken?: string };
+    if (runToken === undefined) return false;
+    let handle: AgentRunHandle;
+    try {
+      handle = adapter.start({
+        runId,
+        provider: request.provider,
+        ticketId: request.ticketId,
+        nodeId: request.nodeId,
+        lane: request.lane,
+        run: request.run,
+        prompt: request.prompt,
+        cwd: request.cwd,
+        env: {
+          ...this.options.agentEnv,
+          [AGENT_ENV.runToken]: runToken,
+          [AGENT_ENV.ticket]: request.ticketId,
+          [AGENT_ENV.node]: request.nodeId,
+          [AGENT_ENV.lane]: request.lane,
+          [AGENT_ENV.runId]: runId,
+        },
+        ...(request.model === undefined ? {} : { model: request.model }),
+        ...(this.options.agentTimeoutMs === undefined ? {} : { timeoutMs: this.options.agentTimeoutMs }),
+      });
+    } catch (error) {
+      await this.activity.track(() => this.command('settle', 'run.settle', { runId, outcome: 'failed', terminalReason: 'start_failed', error: (error as Error).message }, runId));
+      return false;
+    }
+    let index = 0;
+    for await (const observation of handle.observations) {
+      index += 1;
+      await this.activity.track(() => this.command('observe', 'run.observe', { runId, observations: [observation] }, runId, index));
+    }
+    const settlement = await handle.settled;
+    await this.activity.track(() => this.command('settle', 'run.settle', { runId, ...settlement }, runId));
+    return settlement.outcome === 'succeeded';
   }
 
   private async resumeTarget(runId: string): Promise<{ runId: string; providerSessionId: string } | undefined> {
@@ -382,10 +525,18 @@ export class WorkflowEngine {
     const finish = async (result: Record<string, unknown>): Promise<void> => {
       await this.command('finish', 'node.finish', { ...fields, result: { kind: 'script', ...result } }, ticketId, node.id, exec.lane, exec.run, attempt);
     };
-    const started = await this.command('start', 'node.start', fields, ticketId, node.id, exec.lane, exec.run, attempt);
-    if (!started.ok) return;
+    const started = await this.command('start', 'node.start', fields, ticketId, node.id, exec.lane, exec.run, attempt, live.revision);
+    if (!started.ok || (started.result as { blocked?: string }).blocked !== undefined) return;
     const script = node.type.script;
     if (script === undefined) return;
+    const target = { ticketId, state, workflow, node, exec };
+    let prepared: Prepared;
+    try {
+      prepared = await this.workspaces.prepare(target);
+    } catch (error) {
+      await finish({ exitCode: null, error: `could not prepare the workspace: ${(error as Error).message}` });
+      return;
+    }
     const context = executionContext(state, workflow, ticketId, node, { ...exec, attempts: attempt });
     const program = stringifyValue(resolveTemplateValue(script.program, context));
     const args = script.args.flatMap((arg) => {
@@ -396,9 +547,10 @@ export class WorkflowEngine {
     for (const [name, value] of script.env) env[name] = stringifyValue(resolveTemplateValue(value, context));
     const cwd =
       script.cwd === undefined
-        ? this.options.workspace?.({ ticketId, projectId: state.projectId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt })
+        ? (prepared.cwd ?? this.options.workspace?.({ ticketId, projectId: state.projectId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt }))
         : stringifyValue(resolveTemplateValue(script.cwd, context));
     if (program === '') {
+      await this.afterRun(target);
       await finish({ exitCode: null, error: 'the program resolved to an empty string' });
       return;
     }
@@ -415,16 +567,17 @@ export class WorkflowEngine {
     endSpan();
     const [stdout, stderr, exit] = await Promise.all([collect(child.stdout, STDOUT_LIMIT), collect(child.stderr, STDERR_LIMIT), child.exited]);
     this.options.clock.clearTimeout(timer);
-    await this.activity.track(() =>
-      finish({
+    await this.activity.track(async () => {
+      await this.afterRun(target);
+      await finish({
         exitCode: exit.code,
         signal: exit.signal,
         ...(timedOut ? { timedOut: true } : {}),
         ...(exit.error === undefined ? {} : { error: `could not start '${program}': ${exit.error.message}` }),
         stdout,
         stderr,
-      }),
-    );
+      });
+    });
   }
 
   private cancel(live: LiveExecution): void {

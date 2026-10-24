@@ -23,3 +23,4 @@ export * from './rpc.ts';
 export * from './schema.ts';
 export * from './usage.ts';
 export * from './workflow.ts';
+export * from './workspace.ts';

@@ -9,6 +9,7 @@ import {
   DraftItemSchema,
   nodeTypeKey,
   SchemaValidator,
+  type TicketWorkspace,
 } from '@vuyro/contracts';
 import type { NewEvent, StreamAppend } from '../store/event-store.ts';
 import { type CompiledNode, type CompiledNodeType, type CompiledWorkflow, compileNodeType, compileWorkflow, DefinitionError } from '../workflow/compile.ts';
@@ -20,15 +21,20 @@ import {
   executionLive,
   failureOutput,
   finishWithOutput,
+  joinItems,
   rerun,
+  rework,
   withLateArtifacts,
   WorkflowDraft,
 } from '../workflow/machine.ts';
+import { locate } from '../workspace/layout.ts';
+import { mergingJoins, nodeSettings } from '../workspace/settings.ts';
 import { ACTIVE_STATUSES, currentExecution, EMPTY_TICKET, type Execution, execution, laneOf, nodeProgress } from '../workflow/state.ts';
 import { type DefinitionState, definitionAggregate, runAggregate, type TicketState, ticketAggregate } from './aggregates.ts';
 import type { CommandTarget } from './authorize.ts';
 import type { CommandHandler, Decision, HandlerContext, Loaded } from './handlers.ts';
 import { issueRunToken } from './run-token.ts';
+import { checkoutAcquire, checkoutRelease, claimItems, decideClaims, holderOf, preemptionAppends, servicesOf } from './workspace-handlers.ts';
 
 /**
  * Handlers of the workflow commands (M2): definitions, node results, approvals, and the engine's
@@ -276,12 +282,15 @@ export async function createTicketEvents(
   ctx: HandlerContext,
   ticketId: string,
   payload: CommandPayload<'ticket.create'>,
+  workspace?: TicketWorkspace,
 ): Promise<NewEvent[] | Failure> {
   const base = {
     ticketId,
     projectId: payload.projectId,
     title: payload.title,
     ...(payload.description === undefined ? {} : { description: payload.description }),
+    ...(payload.priority === undefined ? {} : { priority: payload.priority }),
+    ...(workspace === undefined ? {} : { workspace }),
   };
   if (payload.template === undefined) return [{ type: 'ticket.created', data: base }];
   if (ctx.definitions === undefined) return fail('invariant_violated', 'this engine has no definition store');
@@ -316,6 +325,9 @@ export function laneScope(payload: { ticketId: string; nodeId: string; lane?: st
   const runId = currentExecution(target.state, payload.nodeId, payload.lane)?.runIds.at(-1);
   return { ...scope, runId: runId ?? 'none' };
 }
+
+export const checkoutAcquireHandler = checkoutAcquire(openWorkflow);
+export const checkoutReleaseHandler = checkoutRelease(openWorkflow);
 
 export const nodeDone: CommandHandler<'node.done', TicketState> = {
   target: ticketTarget,
@@ -377,6 +389,11 @@ export const nodeApprove: CommandHandler<'node.approve', TicketState> = {
     const exec = pickLane(ticket.state, node.id, payload.lane, reviewable, 'in review');
     if (isFailure(exec)) return exec;
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);
+    if (exec.merge !== undefined) {
+      // A merge that stopped on conflicts: the person resolved them (or let the agent's resolution stand); the merge step goes on.
+      rerun(draft, exec, 'retry');
+      return decided(ticket, draft);
+    }
     if (node.completion !== 'human') {
       // Review gate: release the held output.
       if (exec.output === undefined) return fail('invariant_violated', `lane '${exec.lane}' of node '${node.id}' holds no output`);
@@ -404,6 +421,12 @@ export const nodeReject: CommandHandler<'node.reject', TicketState> = {
     const exec = pickLane(ticket.state, node.id, payload.lane, reviewable, 'in review');
     if (isFailure(exec)) return exec;
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);
+    if (exec.merge !== undefined) {
+      // A merge that stopped on conflicts: an agent resolves them, with the person's comment as instructions.
+      if (payload.items !== undefined) return fail('validation_failed', 'items apply to approval nodes only', { issues: [{ path: '/items', message: 'not allowed here' }] });
+      rerun(draft, exec, 'review', { run: exec.run, ...(payload.comment === undefined ? {} : { comment: payload.comment }) });
+      return decided(ticket, draft);
+    }
     if (node.completion !== 'human') {
       // Review gate: discard the held output and run the lane again with the reviewer's comment.
       if (payload.items !== undefined) return fail('validation_failed', 'items apply to approval nodes only', { issues: [{ path: '/items', message: 'not allowed here' }] });
@@ -485,7 +508,13 @@ export const nodeResume: CommandHandler<'node.resume', TicketState> = {
     if (isFailure(exec)) return exec;
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);
     const status = exec.status === 'paused' ? (exec.resumeTo ?? 'queued') : 'running';
-    draft.emit({ type: 'node.resumed', data: { ticketId: ticket.aggregateId, nodeId: node.id, lane: exec.lane, run: exec.run, status } });
+    // A lane waiting for a claim: the engine resumes it when the paths are free (its start checks them again);
+    // a person resuming it lets it go ahead despite the overlap (§3.7: a person can always decide).
+    const override = exec.status === 'paused' && exec.claimWait !== undefined && ctx.caller.principal.kind !== 'system';
+    draft.emit({
+      type: 'node.resumed',
+      data: { ticketId: ticket.aggregateId, nodeId: node.id, lane: exec.lane, run: exec.run, status, ...(override ? { override: true as const } : {}) },
+    });
     return decided(ticket, draft);
   },
 };
@@ -514,12 +543,41 @@ export const nodeStart: CommandHandler<'node.start', TicketState> = {
     if (currentExecution(ticket.state, node.id, exec.lane)?.run !== exec.run) return fail('invariant_violated', `run ${exec.run} was superseded`);
     if (exec.status !== 'queued' && exec.status !== 'rejected') return fail('invariant_violated', `run ${exec.run} of node '${node.id}' is ${exec.status}, not ready to start`);
     if (payload.attempt !== exec.attempts + 1) return fail('invariant_violated', `attempt ${payload.attempt} does not follow attempt ${exec.attempts}`);
-    if (node.completion !== 'agent' && node.completion !== 'script') return fail('invariant_violated', `node '${node.id}' has no executor (${node.completion})`);
+    const merging = node.completion === 'join' && mergingJoins(ticket.state, workflow).has(node.id);
+    if (node.completion !== 'agent' && node.completion !== 'script' && !merging) return fail('invariant_violated', `node '${node.id}' has no executor (${node.completion})`);
     const fields = { ticketId: ticket.aggregateId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt: payload.attempt };
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);
+    if (merging) {
+      draft.emit({ type: 'node.started', data: { ...fields, executor: 'merge' } });
+      return decided(ticket, draft);
+    }
+    // Claims the node type declares are taken together before it starts (§3.7). A conflict decides by policy.
+    const claims = claimItems(node.type.spec.claims ?? []);
+    if (isFailure(claims)) return claims;
+    const extra: StreamAppend[] = [];
+    if (claims.length > 0) {
+      const location = locate(servicesOf(ctx).layout, ticket.state, ticket.aggregateId, workflow, node.id, exec.lane);
+      const decision = await decideClaims(ctx, { ticket, workflow, holder: holderOf(ticket.aggregateId, exec), location, items: claims, source: 'start', override: exec.override === true });
+      const ledgerAppend: StreamAppend = { aggregateType: 'workspace', aggregateId: decision.ledger.aggregateId, expectedRevision: decision.ledger.revision, events: decision.ledgerEvents };
+      if (decision.outcome === 'wait' || decision.outcome === 'ask' || decision.outcome === 'fail') {
+        if (decision.outcome === 'fail' || decision.claim === undefined) {
+          const error = `claims conflict (onConflict: fail): ${decision.conflicts.map((conflict) => `'${conflict.path}' is held by '${conflict.holder.nodeId}' of ticket ${conflict.holder.ticketId}`).join('; ')}`;
+          complete(draft, node.id, exec.run, failureOutput(node, exec, error, { conflicts: decision.conflicts.slice(0, 50) }), 'failed', { error });
+        } else {
+          draft.emit({ type: 'node.paused', data: { ticketId: ticket.aggregateId, nodeId: node.id, lane: exec.lane, run: exec.run, resumeTo: exec.status === 'rejected' ? 'rejected' : 'queued', claim: decision.claim } });
+        }
+        return {
+          ok: true,
+          appends: [ticketStream(ticket, draft.events), ledgerAppend],
+          result: { blocked: decision.outcome },
+        };
+      }
+      if (decision.ledgerEvents.length > 0) extra.push(ledgerAppend);
+      extra.push(...(await preemptionAppends(ctx, decision, ticket.aggregateId)));
+    }
     if (node.completion === 'script') {
       draft.emit({ type: 'node.started', data: { ...fields, executor: 'script' } });
-      return decided(ticket, draft);
+      return { ok: true, appends: [ticketStream(ticket, draft.events), ...extra], result: {} };
     }
     const provider = typeof node.params.provider === 'string' && (node.params.provider === 'claude' || node.params.provider === 'codex') ? node.params.provider : 'claude';
     let resumedFromRunId: string | undefined;
@@ -544,7 +602,7 @@ export const nodeStart: CommandHandler<'node.start', TicketState> = {
     };
     return {
       ok: true,
-      appends: [ticketStream(ticket, draft.events), { aggregateType: 'run', aggregateId: runId, expectedRevision: 0, events: [runStarted] }],
+      appends: [ticketStream(ticket, draft.events), { aggregateType: 'run', aggregateId: runId, expectedRevision: 0, events: [runStarted] }, ...extra],
       result: { runId, runToken: token },
       storedResult: { runId },
     };
@@ -579,8 +637,13 @@ export const nodeFinish: CommandHandler<'node.finish', TicketState> = {
       const resumeFrom = run.state.sessionId === undefined ? {} : { resumeFromRunId: result.runId };
       const canRequeue = exec.requeues < MAX_AUTOMATIC_ATTEMPTS;
       const interrupted = run.state.status === 'abnormal_exit' && run.state.terminalReason === 'engine_restarted';
-      if (run.state.status === 'cancelled' && exec.pauseRequested) {
-        draft.emit({ type: 'node.paused', data: { ...fields, resumeTo: 'queued', ...resumeFrom } });
+      if (run.state.status === 'cancelled' && exec.pauseRequested && exec.pauseClaim?.fail === true) {
+        // Stopped for a claim conflict under `onConflict: fail`.
+        const conflicts = exec.pauseClaim.claim.conflicts;
+        const error = `checkout conflict (onConflict: fail): ${conflicts.map((conflict) => `'${conflict.path}' is held by '${conflict.holder.nodeId}' of ticket ${conflict.holder.ticketId}`).join('; ')}`;
+        complete(draft, node.id, exec.run, failureOutput(node, exec, error, { conflicts: conflicts.slice(0, 50) }), 'failed', { error });
+      } else if (run.state.status === 'cancelled' && exec.pauseRequested) {
+        draft.emit({ type: 'node.paused', data: { ...fields, resumeTo: 'queued', ...resumeFrom, ...(exec.pauseClaim === undefined ? {} : { claim: exec.pauseClaim.claim }) } });
       } else if (exec.submitted !== undefined && run.state.status !== 'cancelled') {
         // The agent reported before it ended; its result counts even if the process then exited badly.
         finishWithOutput(draft, node, exec, withLateArtifacts(exec.submitted, exec));
@@ -596,6 +659,12 @@ export const nodeFinish: CommandHandler<'node.finish', TicketState> = {
         const error = run.state.error === undefined ? reason : `${reason}: ${run.state.error}`;
         complete(draft, node.id, exec.run, failureOutput(node, exec, error, { outcome: run.state.status }), 'failed', { error });
       }
+      return decided(ticket, draft);
+    }
+
+    if (result.kind === 'merge') {
+      if (exec.executor !== 'merge') return fail('invariant_violated', 'this execution is not a merge');
+      finishMerge(draft, node, exec, result);
       return decided(ticket, draft);
     }
 
@@ -617,6 +686,60 @@ export const nodeFinish: CommandHandler<'node.finish', TicketState> = {
     return decided(ticket, draft);
   },
 };
+
+/**
+ * Applies a join's merge step (worktree mode, §3.9 "합치기"): merged → the join passes its items on, each with the
+ * ticket branch and commit; conflicts → by `onMergeConflict`: fail (the join fails), rerun (the join fails and the
+ * conflicting lanes run again on top of what was merged; the join fires again when they finish), ask or an agent
+ * that could not resolve them (the merge waits for a person in Review); resolved by an agent → Review as well.
+ */
+function finishMerge(draft: WorkflowDraft, node: CompiledNode, exec: Execution, result: Extract<CommandPayload<'node.finish'>['result'], { kind: 'merge' }>): void {
+  const items = joinItems(draft, node.id, exec.run).map((item) =>
+    result.branch === undefined || result.head === undefined
+      ? item
+      : { ...item, artifacts: { ...(item.artifacts ?? {}), mergedBranch: { kind: 'git', uri: result.branch, version: result.head } } },
+  );
+  const done = { schemaVersion: 1 as const, port: 'done', items };
+  const conflicts = result.conflicts ?? [];
+  const describe = conflicts.map((conflict) => `${conflict.branch} (${conflict.files.slice(0, 10).join(', ')})`).join('; ');
+  if (result.outcome === 'merged') {
+    complete(draft, node.id, exec.run, done, 'done');
+    return;
+  }
+  if (result.outcome === 'error' || result.worktree === undefined || result.branch === undefined) {
+    const error = `merge failed: ${result.error ?? 'unknown error'}`;
+    complete(draft, node.id, exec.run, failureOutput(node, exec, error), 'failed', { error });
+    return;
+  }
+  const review = { worktree: result.worktree, branch: result.branch, conflicts: conflicts.map((conflict) => ({ branch: conflict.branch, files: conflict.files })) };
+  if (result.outcome === 'resolved') {
+    draft.emit({ type: 'node.reviewRequested', data: { ticketId: draft.ticketId, nodeId: node.id, lane: exec.lane, run: exec.run, output: done, merge: { ...review, resolvedBy: 'agent' } } });
+    return;
+  }
+  const policy = nodeSettings(draft.state, draft.workflow, node.id).onMergeConflict;
+  if (policy === 'fail') {
+    const error = `merge conflict (onMergeConflict: fail): ${describe}`;
+    complete(draft, node.id, exec.run, failureOutput(node, exec, error, { conflicts: conflicts.slice(0, 50) }), 'failed', { error });
+    return;
+  }
+  if (policy === 'rerun') {
+    const error = `merge conflict (onMergeConflict: rerun): ${describe}; those lanes run again on top of the merged branch`;
+    complete(draft, node.id, exec.run, failureOutput(node, exec, error, { conflicts: conflicts.slice(0, 50) }), 'failed', { error });
+    for (const conflict of conflicts) {
+      const lane = currentExecution(draft.state, conflict.nodeId, conflict.lane);
+      if (lane === undefined || ACTIVE_STATUSES.has(lane.status)) continue;
+      rework(
+        draft,
+        lane,
+        `Your branch ${conflict.branch} conflicted with the other work merged into ${result.branch} (files: ${conflict.files.slice(0, 20).join(', ')}). ` +
+          'Your worktree now starts from the merged branch; do the task again on top of it.',
+      );
+    }
+    return;
+  }
+  // ask, or an agent that could not resolve them: a person decides (approve = continue the merge, reject = let an agent try).
+  draft.emit({ type: 'node.reviewRequested', data: { ticketId: draft.ticketId, nodeId: node.id, lane: exec.lane, run: exec.run, output: done, merge: review } });
+}
 
 const TAIL = 4096;
 const tail = (text: string | undefined): string => (text === undefined ? '' : text.length > TAIL ? text.slice(-TAIL) : text);

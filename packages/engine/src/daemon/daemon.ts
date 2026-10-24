@@ -16,6 +16,9 @@ import { installBuiltins } from '../workflow/builtins.ts';
 import { DefinitionWriter } from '../workflow/definition-writer.ts';
 import { DefinitionRegistry } from '../workflow/definitions.ts';
 import { WorkflowEngine, type WorkflowEngineOptions } from '../workflow/engine.ts';
+import type { GitClient } from '../workspace/git.ts';
+import { workspaceServices } from '../workspace/services.ts';
+import { type FileWatcher, parcelWatcher } from '../workspace/watcher.ts';
 import { denyingApprover, type HumanApprover, windowsDialogApprover } from './approver.ts';
 import { HumanCredentials } from './credentials.ts';
 import { defaultDataDir, defaultPipePath, type EnginePaths, enginePaths } from './paths.ts';
@@ -47,6 +50,10 @@ export interface EngineDaemonOptions {
   /** Time limit of one agent run. Default 60 minutes ([[결정 대기]] D-026). */
   readonly agentTimeoutMs?: number;
   readonly workspace?: WorkflowEngineOptions['workspace'];
+  /** Git for worktree mode and read-only status. Default: git on PATH. */
+  readonly git?: GitClient;
+  /** Watches workspaces while executions run. Default @parcel/watcher; `null` = no watching (scans only). */
+  readonly watcher?: FileWatcher | null;
   /** Time limit of a CLI human credential. Default 8 hours ([[결정 대기]] D-023). */
   readonly cliCredentialTtlMs?: number;
   /** How long a pairing waits for the person. Default 2 minutes. */
@@ -169,7 +176,8 @@ export async function startEngineDaemon(options: EngineDaemonOptions = {}): Prom
   try {
     store = await EventStore.open({ path: paths.db, clock, ids });
     const registry = new DefinitionRegistry({ root: paths.definitions, fs, store });
-    const bus = new CommandBus({ store, ids, random, definitions: registry, humanCredential: credentials.cliVerifier(), reportError });
+    const workspaces = workspaceServices({ worktreeRoot: paths.worktrees, clock });
+    const bus = new CommandBus({ store, ids, random, definitions: registry, humanCredential: credentials.cliVerifier(), reportError, workspaces });
     writer = new DefinitionWriter({ registry, fs, bus, store, activity, reportError });
     writer.start();
     await writer.recover();
@@ -177,14 +185,18 @@ export async function startEngineDaemon(options: EngineDaemonOptions = {}): Prom
       if (!response.ok) reportError(new Error(`${response.error.code}: ${response.error.message}`), 'installing a built-in definition');
     }
     const processRunner = options.processRunner ?? nodeProcessRunner;
+    // The checkout hook runs `vuyro hook pretooluse` with the same CLI.
+    const vuyroHook = options.vuyroCli === undefined ? {} : { vuyroHook: { command: options.vuyroCli.command, args: options.vuyroCli.args } };
     const adapters = options.adapters ?? {
-      claude: CliAgentAdapter.claude({ runner: processRunner, clock }),
+      claude: CliAgentAdapter.claude({ runner: processRunner, clock, ...vuyroHook }),
       codex: CliAgentAdapter.codex({
         runner: processRunner,
         clock,
+        ...vuyroHook,
         ...(options.vuyroCli === undefined ? {} : { vuyroMcp: { command: options.vuyroCli.command, args: [...options.vuyroCli.args, 'mcp'] } }),
       }),
     };
+    const watcher = options.watcher === undefined ? parcelWatcher() : options.watcher;
     engine = new WorkflowEngine({
       bus,
       store,
@@ -199,6 +211,9 @@ export async function startEngineDaemon(options: EngineDaemonOptions = {}): Prom
       agentEnv: { [AGENT_ENV.pipe]: pipePath, [AGENT_ENV.dataDir]: paths.dataDir },
       ...(options.maxConcurrent === undefined ? {} : { maxConcurrent: options.maxConcurrent }),
       ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
+      workspaces,
+      ...(options.git === undefined ? {} : { git: options.git }),
+      ...(watcher === null ? {} : { watcher }),
     });
     await engine.start();
 

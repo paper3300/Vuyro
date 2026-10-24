@@ -10,6 +10,7 @@ import {
   type ValidationIssue,
 } from '@vuyro/contracts';
 import type { NewEvent } from '../store/event-store.ts';
+import { mergingJoins } from '../workspace/settings.ts';
 import type { CompiledNode, CompiledPort, CompiledWorkflow } from './compile.ts';
 import { ancestorsOf, edgeContext, inputItems, outputItem } from './context.ts';
 import {
@@ -272,9 +273,14 @@ export interface ActivationExtra {
   readonly group?: string;
   readonly groupParent?: string;
   readonly feedback?: { readonly run: number; readonly comment?: string };
+  /** Worktree mode: the lane starts over from the ticket branch (merge conflict, `rerun`). */
+  readonly reset?: true;
 }
 
-/** Starts a new execution of a lane. Join nodes finish right away. Returns the run number. */
+/**
+ * Starts a new execution of a lane. Join nodes finish right away, except joins that merge worktree branches
+ * (worktree mode, nodeRun scope): those queue for the engine's merge step. Returns the run number.
+ */
 export function activate(
   draft: WorkflowDraft,
   nodeId: string,
@@ -305,15 +311,30 @@ export function activate(
       ...(extra.feedback === undefined ? {} : { feedback: extra.feedback }),
       basis: extra.basis,
       ...(extra.openedBy === undefined ? {} : { openedBy: extra.openedBy }),
+      ...(extra.reset === undefined ? {} : { workspace: { reset: extra.reset } }),
     },
   });
-  if (node.completion === 'join') {
-    const exec = draft.exec(nodeId, run);
-    // Join output items are the inputs, in port and edge order, each pointing at the item it copies.
-    const items = inputItems(exec, node).map((item) => ({ ...item, lineage: item.lineage ?? [] }));
-    complete(draft, nodeId, run, { schemaVersion: 1, port: 'done', items }, 'done');
+  if (node.completion === 'join' && !mergingJoins(draft.state, draft.workflow).has(nodeId)) {
+    complete(draft, nodeId, run, { schemaVersion: 1, port: 'done', items: joinItems(draft, nodeId, run) }, 'done');
   }
   return run;
+}
+
+/** Join output items are the inputs, in port and edge order, each pointing at the item it copies. */
+export function joinItems(draft: WorkflowDraft, nodeId: string, run: number): HandoffItem[] {
+  return inputItems(draft.exec(nodeId, run), draft.node(nodeId)).map((item) => ({ ...item, lineage: item.lineage ?? [] }));
+}
+
+/** A merge conflict sends a lane back (`onMergeConflict: rerun`): it runs again on top of what was merged. */
+export function rework(draft: WorkflowDraft, exec: Execution, comment: string): void {
+  if (!executionLive(draft.state, exec)) return;
+  const group = laneOf(draft.state, exec.nodeId, exec.lane)?.group;
+  activate(draft, exec.nodeId, exec.lane, 'rework', exec.inputs, {
+    basis: exec.basis ?? FREE,
+    ...(group === undefined ? {} : { group }),
+    feedback: { run: exec.run, comment },
+    reset: true,
+  });
 }
 
 export function activateEntries(draft: WorkflowDraft): void {

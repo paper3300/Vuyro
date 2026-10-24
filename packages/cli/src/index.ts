@@ -17,6 +17,7 @@ import {
 import { fileURLToPath } from 'node:url';
 import { flag, has, onlyFlags, type ParsedArgs, parseArgs, requireFlag, UsageError } from './args.ts';
 import { serveMcp } from './mcp.ts';
+import { denyOutput, type HookCheckout, runPreToolUseHook } from './hook.ts';
 
 export interface CliIo {
   out(line: string): void;
@@ -51,13 +52,23 @@ Engine
 
 Work
   project create <name>        project list
-  ticket create --project <id> --title <text> [--description <text>] [--template <id>[@<version>]]
+  project configure <projectId> [--root <dir> | --clear-root] [--base-ref <ref> | --clear-base-ref]
+                    [--settings <json|@file>] [--watch <json|@file>]   Workspace folder and settings layer
+  app configure --settings <json|@file>                               App layer of the workspace settings
+  ticket create --project <id> --title <text> [--description <text>] [--template <id>[@<version>]] [--priority <n>]
   ticket list [--project <id>]     ticket show <ticketId>     ticket stats <ticketId>
   node done --port <port> [--data <json|@file>] [--summary <text>] [--artifacts <json|@file>] [--items <json|@file>]
   node approve|reject|retry|pause|resume [--comment <text>] [--items <json|@file>]
   artifact add <slot> --kind <kind> --uri <uri> [--version <v>] [--title <t>] [--mime <type>] [--hash <hash>]
   artifact list --ticket <id> [--node <id>]
   definition save <json|@file> Save a node type or template version (export envelope)
+
+Workspace (Vuyro's own checkout ledger; nothing is locked in git or Perforce)
+  checkout <path>... [--shared]   Check files out for this node before editing them
+  checkout release [<path>...]    Release this node's checkouts (all, or the given files)
+  checkout force-release --project <id> <entryId>...   Release ledger entries (a person)
+  workspace show --project <id> [--ticket <id>] [--all]   Held entries, refusals, flagged changes, worktrees
+  hook pretooluse [--provider claude|codex]   The automatic checkout hook (run by the agent CLI)
   mcp                          Serve the node agent's report tools over stdio MCP (started by the agent CLI)
   events [--after <sequence>] [--follow]
 
@@ -122,6 +133,14 @@ export async function runCli(argv: readonly string[], io: CliIo, options: CliOpt
         return await artifactCommand(ctx, sub);
       case 'definition':
         return await definitionCommand(ctx, sub);
+      case 'app':
+        return await appCommand(ctx, sub);
+      case 'checkout':
+        return await checkoutCommand(ctx, sub);
+      case 'workspace':
+        return await workspaceCommand(ctx, sub);
+      case 'hook':
+        return await hookCommand(ctx, sub);
       case 'mcp':
         onlyFlags(ctx.args, []);
         await serveMcp(options.stdin ?? (process.stdin.setEncoding('utf8') as AsyncIterable<string>), (line) => {
@@ -310,6 +329,28 @@ async function authCommand(ctx: Context, sub: string | undefined): Promise<numbe
 }
 
 async function projectCommand(ctx: Context, sub: string | undefined): Promise<number> {
+  if (sub === 'configure') {
+    onlyFlags(ctx.args, ['root', 'clear-root', 'base-ref', 'clear-base-ref', 'settings', 'watch']);
+    const projectId = ctx.args.positionals[2];
+    if (projectId === undefined || projectId === '') throw new UsageError('project configure: give the project id');
+    const root = flag(ctx.args, 'root');
+    const baseRef = flag(ctx.args, 'base-ref');
+    const settings = jsonArgument(ctx, 'settings');
+    const watch = jsonArgument(ctx, 'watch');
+    const payload = {
+      projectId,
+      ...(root === undefined ? {} : { root: resolve(ctx.cwd, root) }),
+      ...(has(ctx.args, 'clear-root') ? { root: null } : {}),
+      ...(baseRef === undefined ? {} : { baseRef }),
+      ...(has(ctx.args, 'clear-base-ref') ? { baseRef: null } : {}),
+      ...(settings === undefined ? {} : { settings }),
+      ...(watch === undefined ? {} : { watch }),
+    };
+    if (Object.keys(payload).length === 1) throw new UsageError('project configure: give at least one of --root, --base-ref, --settings, --watch');
+    await execute(ctx, 'project.configure', payload);
+    print(ctx, { ok: true }, () => ['Project configured. New tickets use it.']);
+    return EXIT.ok;
+  }
   onlyFlags(ctx.args, []);
   switch (sub) {
     case 'create': {
@@ -325,14 +366,14 @@ async function projectCommand(ctx: Context, sub: string | undefined): Promise<nu
       return EXIT.ok;
     }
     default:
-      throw new UsageError("project: expected 'create' or 'list'");
+      throw new UsageError("project: expected 'create', 'list' or 'configure'");
   }
 }
 
 async function ticketCommand(ctx: Context, sub: string | undefined): Promise<number> {
   switch (sub) {
     case 'create': {
-      onlyFlags(ctx.args, ['project', 'title', 'description', 'template']);
+      onlyFlags(ctx.args, ['project', 'title', 'description', 'template', 'priority']);
       const template = flag(ctx.args, 'template');
       let templateRef: { id: string; version?: number } | undefined;
       if (template !== undefined) {
@@ -340,11 +381,14 @@ async function ticketCommand(ctx: Context, sub: string | undefined): Promise<num
         templateRef = { id, ...(version === undefined ? {} : { version: Number(version) }) };
       }
       const description = flag(ctx.args, 'description');
+      const priority = flag(ctx.args, 'priority');
+      if (priority !== undefined && !/^-?\d+$/.test(priority)) throw new UsageError('--priority must be a whole number');
       const result = (await execute(ctx, 'ticket.create', {
         projectId: requireFlag(ctx.args, 'project'),
         title: requireFlag(ctx.args, 'title'),
         ...(description === undefined ? {} : { description }),
         ...(templateRef === undefined ? {} : { template: templateRef }),
+        ...(priority === undefined ? {} : { priority: Number(priority) }),
       })) as { ticketId: string };
       print(ctx, result, () => [result.ticketId]);
       return EXIT.ok;
@@ -499,6 +543,124 @@ async function definitionCommand(ctx: Context, sub: string | undefined): Promise
   if (type === undefined) throw new UsageError("definition save: 'kind' must be 'nodeType' or 'template'");
   const result = (await execute(ctx, type, { definition })) as { id: string; version: number; status: string };
   print(ctx, result, () => [`${result.id}@${result.version}: ${result.status}`]);
+  return EXIT.ok;
+}
+
+async function appCommand(ctx: Context, sub: string | undefined): Promise<number> {
+  onlyFlags(ctx.args, ['settings']);
+  if (sub !== 'configure') throw new UsageError("app: expected 'configure'");
+  const settings = jsonArgument(ctx, 'settings');
+  if (settings === undefined) throw new UsageError('app configure: --settings is required');
+  await execute(ctx, 'app.configure', { settings });
+  print(ctx, { ok: true }, () => ['App settings replaced.']);
+  return EXIT.ok;
+}
+
+interface CheckoutResult {
+  granted: boolean;
+  decision: string;
+  reason?: string;
+  paths?: string[];
+}
+
+async function checkoutCommand(ctx: Context, sub: string | undefined): Promise<number> {
+  switch (sub) {
+    case 'release': {
+      onlyFlags(ctx.args, ['ticket', 'node', 'lane']);
+      const paths = ctx.args.positionals.slice(2).map((path) => resolve(ctx.cwd, path));
+      const result = (await execute(ctx, 'checkout.release', { ...target(ctx), ...(paths.length === 0 ? {} : { paths }) })) as { released: number };
+      print(ctx, result, () => [`Released ${result.released} checkout(s).`]);
+      return EXIT.ok;
+    }
+    case 'force-release': {
+      onlyFlags(ctx.args, ['project']);
+      const ids = ctx.args.positionals.slice(2);
+      if (ids.length === 0) throw new UsageError('checkout force-release: give the entry ids');
+      const result = (await execute(ctx, 'checkout.forceRelease', { projectId: requireFlag(ctx.args, 'project'), ids })) as { released: number };
+      print(ctx, result, () => [`Released ${result.released} entr${result.released === 1 ? 'y' : 'ies'}.`]);
+      return EXIT.ok;
+    }
+    default: {
+      onlyFlags(ctx.args, ['ticket', 'node', 'lane', 'shared']);
+      const paths = ctx.args.positionals.slice(1).map((path) => resolve(ctx.cwd, path));
+      if (paths.length === 0) throw new UsageError('checkout: give the files to check out');
+      const result = (await execute(ctx, 'checkout.acquire', {
+        ...target(ctx),
+        paths,
+        source: 'agent',
+        ...(has(ctx.args, 'shared') ? { mode: 'shared' } : {}),
+      })) as CheckoutResult;
+      print(ctx, result, () => [result.granted ? `Checked out: ${(result.paths ?? []).join(', ') || '(outside the workspace)'}` : `Refused: ${result.reason ?? result.decision}`]);
+      return result.granted ? EXIT.ok : EXIT.refused;
+    }
+  }
+}
+
+async function workspaceCommand(ctx: Context, sub: string | undefined): Promise<number> {
+  onlyFlags(ctx.args, ['project', 'ticket', 'all']);
+  if (sub !== 'show') throw new UsageError("workspace: expected 'show'");
+  const ticketId = flag(ctx.args, 'ticket');
+  const view = await withClient(ctx, (client) =>
+    client.request<{ checkouts: Record<string, unknown>[]; blocks: Record<string, unknown>[]; changes: Record<string, unknown>[]; overlaps: Record<string, unknown>[]; worktrees: Record<string, unknown>[] }>(
+      RPC_METHODS.workspace,
+      { projectId: requireFlag(ctx.args, 'project'), ...(ticketId === undefined ? {} : { ticketId }), changes: has(ctx.args, 'all') ? 'all' : 'flagged' },
+    ),
+  );
+  const text = (value: unknown): string => (typeof value === 'string' ? value : typeof value === 'number' || typeof value === 'boolean' ? String(value) : JSON.stringify(value));
+  print(ctx, view, () => [
+    `Held (${view.checkouts.length}):`,
+    ...view.checkouts.map((entry) => `  ${text(entry.mode).padEnd(9)} ${text(entry.space)}:${text(entry.path)}  ${text(entry.nodeId)}/${text(entry.lane)} of ${text(entry.ticketId)}${entry.paused === true ? '  (paused)' : ''}`),
+    `Refused (${view.blocks.length}):`,
+    ...view.blocks.map((block) => `  ${text(block.outcome).padEnd(5)} ${text(block.nodeId)}/${text(block.lane)} of ${text(block.ticketId)}: ${text(block.paths)}`),
+    `Changes (${view.changes.length}):`,
+    ...view.changes.map((change) => `  ${text(change.attribution).padEnd(12)} ${text(change.space)}:${text(change.path)}`),
+    `Overlap warnings (${view.overlaps.length}):`,
+    ...view.overlaps.map((overlap) => `  ${text(overlap.path)}  ${text(overlap.spaces)}`),
+    `Worktrees (${view.worktrees.length}):`,
+    ...view.worktrees.map((worktree) => `  ${text(worktree.branch)}  ${text(worktree.path)}${worktree.removedAt === null ? '' : `  (removed: ${text(worktree.removedReason)})`}`),
+  ]);
+  return EXIT.ok;
+}
+
+async function readAll(input: AsyncIterable<string | Buffer>, limit: number): Promise<string> {
+  let text = '';
+  for await (const chunk of input) {
+    text += String(chunk);
+    if (text.length > limit) throw new Error('the hook input is too large');
+  }
+  return text;
+}
+
+/**
+ * `vuyro hook pretooluse`: always exits 0. Its stdout is either empty (the edit may go ahead) or a JSON deny; any
+ * failure (no run token, the engine unreachable, a refusal) is a deny, never an unchecked edit.
+ */
+async function hookCommand(ctx: Context, sub: string | undefined): Promise<number> {
+  try {
+    onlyFlags(ctx.args, ['provider']);
+    if (sub !== 'pretooluse') throw new UsageError("hook: expected 'pretooluse'");
+    const stdin = await readAll(ctx.options.stdin ?? process.stdin, 4 * 1024 * 1024).catch(() => '');
+    const token = ctx.env[AGENT_ENV.runToken];
+    const ticketId = ctx.env[AGENT_ENV.ticket];
+    const nodeId = ctx.env[AGENT_ENV.node];
+    const identified = token !== undefined && token !== '' && ticketId !== undefined && ticketId !== '' && nodeId !== undefined && nodeId !== '';
+    const checkout: HookCheckout | undefined = identified
+      ? async (paths) => {
+          try {
+            const result = (await execute(ctx, 'checkout.acquire', { ticketId, nodeId, paths: [...paths], source: 'hook' })) as CheckoutResult;
+            return { granted: result.granted, ...(result.reason === undefined ? {} : { reason: result.reason }) };
+          } catch (error) {
+            if (error instanceof EngineRequestError) throw new Error(`${error.data.code}: ${error.data.message}`, { cause: error });
+            throw error;
+          }
+        }
+      : undefined;
+    const output = await runPreToolUseHook(stdin, ctx.cwd, checkout);
+    if (output !== undefined) ctx.io.out(output);
+  } catch (error) {
+    // Even a broken invocation answers with a deny: a hook that errors out would let the edit through.
+    ctx.io.out(denyOutput(`the checkout hook failed (${error instanceof Error ? error.message : String(error)}), so the edit is blocked`));
+  }
   return EXIT.ok;
 }
 

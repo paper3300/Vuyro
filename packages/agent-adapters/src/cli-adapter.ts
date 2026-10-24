@@ -3,6 +3,7 @@ import { ClaudeStreamNormalizer, claudeArgs } from './claude.ts';
 import type { Clock, TimerHandle } from './clock.ts';
 import { CodexStreamNormalizer, codexArgs } from './codex.ts';
 import { AGENT_ENV } from './agent-env.ts';
+import { claudeHookArgs, codexHookArgs, type HookCli, hookCommandLine } from './hooks.ts';
 import { agentEnvironment, resolveExecutable } from './environment.ts';
 import type { AgentAdapter, AgentRunHandle, AgentStartRequest } from './index.ts';
 import { clip, LIMITS } from './limits.ts';
@@ -35,6 +36,8 @@ export interface CliAgentAdapterOptions {
    * command line; the server gets the run token by Codex forwarding the named environment variables.
    */
   readonly vuyroMcp?: { readonly command: string; readonly args: readonly string[] };
+  /** How to run the `vuyro` CLI for the automatic checkout hook (`vuyro hook pretooluse`). Absent = no hook can be installed. */
+  readonly vuyroHook?: HookCli;
 }
 
 /** `-c` overrides that register `vuyro mcp` with Codex and forward the run variables to it. */
@@ -123,9 +126,11 @@ export class CliAgentAdapter implements AgentAdapter {
     const { clock, runner } = this.options;
     const env = agentEnvironment(this.options.baseEnv ?? process.env, request.env);
     const command = (this.options.resolve ?? resolveExecutable)(this.options.command ?? this.spec.command, env);
+    const hook = request.checkoutHook === true && this.options.vuyroHook !== undefined ? hookCommandLine(this.options.vuyroHook, this.provider) : undefined;
     const extraArgs = [
       ...(this.options.extraArgs ?? this.spec.extraArgs),
       ...(this.provider === 'codex' && this.options.vuyroMcp !== undefined ? codexMcpArgs(this.options.vuyroMcp) : []),
+      ...(hook === undefined ? [] : this.provider === 'claude' ? claudeHookArgs(hook) : codexHookArgs(hook)),
     ];
     const args = [...(this.options.prefixArgs ?? []), ...this.spec.args(request, extraArgs)];
     const normalizer = this.spec.normalizer(request);
@@ -134,6 +139,10 @@ export class CliAgentAdapter implements AgentAdapter {
     child.endInput();
 
     const observations = new AsyncQueue<RunObservation>();
+    if (request.checkoutHook === true && hook === undefined) {
+      // Changes are still found afterwards; the run says why nothing blocked edits up front.
+      observations.push({ kind: 'warning', message: 'the automatic checkout hook was asked for, but the engine has no vuyro CLI to run it', source: 'vuyro.adapter', observedAt: clock.now() });
+    }
     const flags = { cancelled: false, timedOut: false, lingered: false };
     const timers: TimerHandle[] = [];
     const timeoutMs = request.timeoutMs ?? this.options.timeoutMs;

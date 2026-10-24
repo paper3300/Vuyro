@@ -35,7 +35,7 @@ describe('vuyro mcp', () => {
       { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'vuyro_node_done', arguments: { port: 'done', summary: 'ok' } } },
     ]);
     expect(out[0]).toMatchObject({ id: 1, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} } } });
-    expect((out[1]?.result as { tools: { name: string }[] }).tools.map((tool) => tool.name)).toEqual(['vuyro_artifact_add', 'vuyro_node_done']);
+    expect((out[1]?.result as { tools: { name: string }[] }).tools.map((tool) => tool.name)).toEqual(['vuyro_artifact_add', 'vuyro_node_done', 'vuyro_checkout']);
     expect(sent.map((call) => call.envelope)).toMatchObject([
       { type: 'artifact.add', payload: { ticketId: 'T', nodeId: 'dev', slot: 'report', ref: { kind: 'file', uri: 'r.md', version: '1' } }, auth: { runToken: TOKEN } },
       { type: 'node.done', payload: { ticketId: 'T', nodeId: 'dev', port: 'done', summary: 'ok' }, auth: { runToken: TOKEN } },
