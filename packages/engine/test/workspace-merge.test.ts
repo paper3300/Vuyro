@@ -119,6 +119,22 @@ describe('merge conflicts at the join', { timeout: 120_000 }, () => {
     expect(currentExecution(await h.ticket(ticketId), 'join', 'main')?.merge).not.toHaveProperty('resolvedBy');
   });
 
+  it('agent: a run that failed is not a resolution, whatever it left behind', async () => {
+    t = await startParallel({
+      settings: { workspaceMode: 'worktree', onMergeConflict: 'agent' },
+      dev: CONFLICTING,
+      resolver: (s) => {
+        writeFileSync(join(s.request.cwd ?? '', 'src', 'app.txt'), 'line 1\nhalf done\nline 3\n');
+        git(s.request.cwd ?? '', 'add', 'src/app.txt');
+        throw new Error('the agent crashed');
+      },
+    });
+    const { h, ticketId } = t;
+    await h.drive();
+    expect(await h.status(ticketId, 'join')).toBe('review');
+    expect(currentExecution(await h.ticket(ticketId), 'join', 'main')?.merge).not.toHaveProperty('resolvedBy');
+  });
+
   it('agent: staging a file that still has conflict markers is not a resolution', async () => {
     t = await startParallel({
       settings: { workspaceMode: 'worktree', onMergeConflict: 'agent' },

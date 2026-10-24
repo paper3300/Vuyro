@@ -98,6 +98,15 @@ describe('worktree mode', { timeout: 120_000 }, () => {
     expect(await h.status(ticketId, 'qa')).toBe('review');
   });
 
+  it('claims of lanes in their own worktrees do not conflict: the files are different files', async () => {
+    t = await startParallel({ settings: { workspaceMode: 'worktree' }, dev: CLEAN, devClaims: [{ path: 'src/**', mode: 'exclusive' }] });
+    const { h, ticketId, projectId } = t;
+    await h.activity.idle();
+    expect([await h.status(ticketId, 'dev', '1'), await h.status(ticketId, 'dev', '2')]).toEqual(['running', 'running']);
+    const spaces = await h.store.query<{ space: string }>('SELECT space FROM p_checkouts WHERE project_id = ? ORDER BY space', [projectId]);
+    expect(spaces.map((row) => row.space)).toEqual([`wt:${laneWorktree(h.workspaces.layout.worktreeRoot, ticketId, 'dev', '1').key}`, `wt:${laneWorktree(h.workspaces.layout.worktreeRoot, ticketId, 'dev', '2').key}`]);
+  });
+
   it('ticket scope: every node of the ticket works in the ticket worktree and the join does not merge', async () => {
     t = await startParallel({ settings: { workspaceMode: 'worktree', worktreeScope: 'ticket' }, dev: CLEAN });
     const { h, ticketId, seen } = t;

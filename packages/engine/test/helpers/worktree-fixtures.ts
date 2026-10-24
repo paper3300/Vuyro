@@ -1,9 +1,9 @@
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { WorkspaceSettings } from '@vuyro/contracts';
+import type { ClaimSpec, WorkspaceSettings } from '@vuyro/contracts';
 import type { ScriptedBehavior, ScriptedSession } from '../../src/workflow/scripted-agent.ts';
 import { openWorkflowHarness, type WorkflowHarness } from './workflow-harness.ts';
-import { edge, expectOk, git, gitRepo, MINUTE, projectAt, save, template, ticketIn } from './workspace-fixtures.ts';
+import { edge, editorType, expectOk, git, gitRepo, MINUTE, projectAt, save, template, ticketIn } from './workspace-fixtures.ts';
 
 /**
  * Worktree tests: a ticket that plans two tasks, works on them in parallel (fan-out lanes), joins them, has QA approve
@@ -18,6 +18,8 @@ export interface Setup {
   readonly dev: DevStep;
   /** The merge agent (onMergeConflict: agent). */
   readonly resolver?: (s: ScriptedSession) => void | Promise<void>;
+  /** Claims of the dev node (it then runs as a node type of its own). */
+  readonly devClaims?: ClaimSpec[];
 }
 
 export interface ParallelTicket {
@@ -71,13 +73,15 @@ export async function startParallel(setup: Setup): Promise<ParallelTicket> {
   const seen: ScriptedSession['request'][] = [];
   const h = await openWorkflowHarness({ behavior: behavior(setup, seen) });
   const repo = gitRepo(join(h.dir, 'repo'));
+  if (setup.devClaims !== undefined) await save(h, editorType('test.dev', setup.devClaims));
+  const dev = setup.devClaims === undefined ? { type: 'vuyro.agent', params: { instructions: 'dev' } } : { type: 'test.dev' };
   await save(
     h,
     template(
       'myteam/parallel',
       [
         { id: 'plan', type: 'vuyro.agent', version: 1, params: { instructions: 'plan' } },
-        { id: 'dev', type: 'vuyro.agent', version: 1, params: { instructions: 'dev' }, ports: { in: { mode: 'each' } } },
+        { id: 'dev', version: 1, ...dev, ports: { in: { mode: 'each' } } },
         { id: 'join', type: 'vuyro.join', version: 1 },
         { id: 'qa', type: 'vuyro.approval', version: 1 },
         { id: 'end', type: 'vuyro.end', version: 1 },

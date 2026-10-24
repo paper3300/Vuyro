@@ -18,6 +18,7 @@ import {
   type TemplateSpec,
   templateExpressions,
 } from '@vuyro/contracts';
+import { normalizeRelative } from '../workspace/paths.ts';
 import { parseDuration } from './duration.ts';
 
 /**
@@ -181,6 +182,10 @@ export function compileNodeType(spec: NodeTypeSpec, validator: SchemaValidator):
   }
   spec.params.forEach((param, index) => {
     issues.schema(`/params/${index}/schema`, validator, param.schema);
+  });
+  // Claims name paths inside the workspace (M4): relative, no `..`.
+  spec.claims?.forEach((claim, index) => {
+    if (normalizeRelative(claim.path) === undefined) issues.add(`/claims/${index}/path`, 'a claim path must stay inside the workspace (relative, no ..)');
   });
 
   let prompt: ParsedTemplate | undefined;

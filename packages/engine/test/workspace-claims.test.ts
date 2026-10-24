@@ -276,9 +276,10 @@ describe('claims and their conflict policies', () => {
         [
           { id: 'a', type: 'test.keeper', version: 1 },
           { id: 'c', type: 'test.editor', version: 1 },
+          { id: 'gate', type: 'vuyro.human-task', version: 1 },
           { id: 'end', type: 'vuyro.end', version: 1 },
         ],
-        [edge('a', 'done', 'c'), edge('c', 'done', 'end')],
+        [edge('a', 'done', 'c'), edge('c', 'done', 'gate'), edge('gate', 'done', 'end')],
       ),
     );
     await save(h, template('myteam/one', [{ id: 'x', type: 'test.editor', version: 1 }, { id: 'end', type: 'vuyro.end', version: 1 }], [edge('x', 'done', 'end')]));
@@ -291,9 +292,15 @@ describe('claims and their conflict policies', () => {
     expect(await h.status(keeper, 'c')).toBe('running');
     const retained = (await ledgerEvents(h, projectId)).find((event) => event.type === 'checkout.retained');
     expect(retained).toBeDefined();
+    // c finishes (its own claim goes); the ticket waits for a person and still keeps a's claim.
+    await h.clock.advance(11 * MINUTE);
+    await h.activity.idle();
+    expect(await h.status(keeper, 'gate')).toBe('review');
+    expect(await heldPaths(h, projectId)).toEqual(['a:src/**']);
     const other = await ticketIn(h, projectId, 'myteam/one');
     await h.activity.idle();
     expect(await h.status(other, 'x')).toBe('paused');
+    await h.ok('node.done', { ticketId: keeper, nodeId: 'gate', port: 'done' });
     await h.drive();
     expect((await h.ticket(keeper)).status).toBe('done');
     expect((await h.ticket(other)).status).toBe('done');
@@ -437,6 +444,86 @@ describe('claims and their conflict policies', () => {
     expect(await heldPaths(h, projectId)).toEqual(['a:src/**']);
     await h.ok('node.resume', { ticketId, nodeId: 'b' }, system);
     expect((await start('b')).result).toEqual({});
+    // The engine starts again and cleans up what it missed.
+    await h.restart();
+    await h.activity.idle();
+    const released = (await ledgerEvents(h, projectId)).filter((event) => event.type === 'checkout.released').map((event) => (event.data as { reason: string }).reason);
+    // a's entry (a ended while nobody watched) is recovered; b's run had no executor after the restart and failed.
+    expect(released).toEqual(['recovered', 'nodeDone']);
+  });
+
+  it('an expired entry blocks nothing, even before the engine records that it expired', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    root = join(h.dir, 'ws');
+    mkdirSync(root, { recursive: true });
+    const build = (id: string, claims: ClaimSpec[]) => ({
+      vuyro: 'export' as const,
+      formatVersion: 1 as const,
+      kind: 'nodeType' as const,
+      id,
+      version: 1,
+      name: id,
+      content: {
+        type: id,
+        version: 1,
+        label: id,
+        completion: 'script' as const,
+        inputs: [{ name: 'in', label: 'In' }],
+        outputs: [
+          { name: 'done', label: 'Done' },
+          { name: 'error', label: 'Error' },
+        ],
+        params: [],
+        script: { program: 'build' },
+        claims,
+      },
+    });
+    await save(h, build('test.hold', [{ path: 'src/**', mode: 'exclusive', release: 'manual', ttl: '1h' }]));
+    await save(h, build('test.use', [{ path: 'src/**', mode: 'exclusive' }]));
+    await save(
+      h,
+      template(
+        'myteam/expire',
+        [
+          { id: 'a', type: 'test.hold', version: 1 },
+          { id: 'b', type: 'test.use', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [edge('a', 'done', 'end'), edge('b', 'done', 'end')],
+      ),
+    );
+    const projectId = await projectAt(h, root);
+    const ticketId = await ticketIn(h, projectId, 'myteam/expire');
+    const system = { kind: 'internal', component: 'workflow' } as const;
+    const start = (nodeId: string) => h.ok('node.start', { ticketId, nodeId, lane: 'main', run: 1, attempt: 1 }, system);
+    await start('a');
+    await h.ok('node.finish', { ticketId, nodeId: 'a', lane: 'main', run: 1, attempt: 1, result: { kind: 'script', exitCode: 0 } }, system);
+    expect((await start('b')).result).toEqual({ blocked: 'wait' });
+    await h.clock.advance(60 * MINUTE);
+    await h.ok('node.resume', { ticketId, nodeId: 'b' }, system);
+    expect((await start('b')).result).toEqual({});
+  });
+
+  it('a claim path must stay inside the workspace (checked when the node type is saved)', async () => {
+    await open(working({}));
+    const response = await h.writer.save(editorType('test.escape', [{ path: '../outside/**', mode: 'exclusive' }]), HUMAN, 'save-escape-0001');
+    expect(response.ok ? 'ok' : response.error.code).toBe('validation_failed');
+  });
+
+  it("a node's own shared claim does not block its exclusive checkout of a file under it", async () => {
+    let answer: unknown;
+    await open(async (s) => {
+      const response = await s.vuyro('checkout.acquire', { ticketId: s.request.ticketId, nodeId: s.request.nodeId, paths: ['src/a.txt'] });
+      answer = response.ok ? (response.result as { decision: string }).decision : response.error.code;
+      expectOk(await s.vuyro('node.done', { ticketId: s.request.ticketId, nodeId: s.request.nodeId, port: 'done' }));
+      return undefined;
+    });
+    await save(h, editorType('test.reader', [{ path: 'src/**', mode: 'shared' }]));
+    await save(h, template('myteam/one', [{ id: 'a', type: 'test.reader', version: 1 }, { id: 'end', type: 'vuyro.end', version: 1 }], [edge('a', 'done', 'end')]));
+    const projectId = await projectAt(h, root);
+    await ticketIn(h, projectId, 'myteam/one');
+    await h.drive();
+    expect(answer).toBe('granted');
   });
 
   it('a ticket pins the app and project settings it was created with', async () => {
