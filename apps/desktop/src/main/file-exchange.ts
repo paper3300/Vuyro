@@ -45,7 +45,7 @@ export async function openJsonFile(dialogs: FileDialogs, files: FileAccess): Pro
     if (!info.isFile) return failure('file_unreadable', '파일이 아닙니다.');
     if (info.size > MAX_FILE_BYTES) return failure('file_too_large', `파일이 너무 큽니다(${String(Math.ceil(info.size / 1024))} KB, 최대 ${String(MAX_FILE_BYTES / 1024)} KB).`);
     const text = (await files.readText(path)).replace(/^\uFEFF/, '');
-    if (text.length > MAX_EXPORT_TEXT) return failure('file_too_large', '파일이 너무 큽니다.');
+    // A UTF-8 file has no more characters than bytes, so the text is within the engine's limit too.
     return { ok: true, value: { name: basename(path), text } };
   } catch (error) {
     return failure('file_unreadable', `파일을 읽을 수 없습니다: ${(error as Error).message}`);

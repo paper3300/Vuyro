@@ -529,7 +529,9 @@ export async function previewImport(source: ExchangeSource, text: string, choice
   });
 
   const problems = [...read.problems, ...(read.blocking ?? [])];
-  const blocked = problems.length > 0 || items.some((item) => item.problems.length > 0 && (item.target !== undefined || item.state === 'conflict'));
+  // Any problem stops the import, also on an item that would not be saved (a refused new id, an undecided conflict):
+  // saving the rest would not be what the person chose.
+  const blocked = problems.length > 0 || items.some((item) => item.problems.length > 0);
   return {
     readable: true,
     problems,

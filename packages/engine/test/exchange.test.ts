@@ -311,4 +311,35 @@ describe('import preview', () => {
     expect(result.items.find((item) => item.kind === 'template')?.problems.join('\n')).toMatch(/nope/);
     expect(result.canSave).toBe(false);
   });
+
+  it('checks a node type before anything is saved', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    const twice = { ...buildType(), content: { ...buildType().content, outputs: [{ name: 'done', label: 'A' }, { name: 'done', label: 'B' }] } };
+    const result = await preview(json(twice));
+    expect(result.items[0]?.problems.join('\n')).toMatch(/duplicate name 'done'/);
+    expect(result.canSave).toBe(false);
+  });
+
+  it('refuses a bundle that holds a definition twice or whose template is not the one it names', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    const twice: ExportBundle = { vuyro: 'export', formatVersion: 1, kind: 'bundle', id: 'myteam/build', version: 1, name: 'Build flow', content: buildTemplate(), embedded: [buildType(), buildType()] };
+    const doubled = await preview(json(twice));
+    expect(doubled.problems).toEqual(['nodeType:myteam.build@1가 파일에 두 번 들어 있습니다.']);
+    expect(doubled.canSave).toBe(false);
+    const other = await preview(json({ ...twice, id: 'myteam/other', embedded: [buildType()] }));
+    expect(other.problems).toEqual(['묶음의 id·버전과 안에 든 템플릿의 id·버전이 다릅니다.']);
+    expect(other.canSave).toBe(false);
+  });
+
+  it('two items of the file cannot take the same new id', async () => {
+    h = await openWorkflowHarness({ noEngine: true });
+    const second = { ...buildType(), id: 'myteam.pack', name: 'Pack', content: { ...buildType().content, type: 'myteam.pack' } };
+    const bundle: ExportBundle = { vuyro: 'export', formatVersion: 1, kind: 'bundle', id: 'myteam/build', version: 1, name: 'Build flow', content: buildTemplate(), embedded: [buildType(), second] };
+    const result = await preview(json(bundle), {
+      'nodeType:myteam.build@1': { action: 'newId', id: 'myteam.same' },
+      'nodeType:myteam.pack@1': { action: 'newId', id: 'myteam.same' },
+    });
+    expect(result.items.find((item) => item.id === 'myteam.pack')?.problems).toEqual(['myteam.same을(를) 이 파일의 다른 항목도 쓰려고 합니다.']);
+    expect(result.canSave).toBe(false);
+  });
 });

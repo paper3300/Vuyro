@@ -326,6 +326,61 @@ describe('JSON import', () => {
     await userEvent.click(await screen.findByRole('checkbox', { name: /확인했습니다/ }));
     expect(screen.getByRole('button', { name: '가져오기 (1개 저장)' })).toBeDisabled();
   });
+
+  it('confirming does not save what the engine says cannot be saved, nor a preview that is being redone', async () => {
+    let answer: (preview: ImportPreview) => void = () => undefined;
+    const ready = { ...PREVIEW, items: [PREVIEW.items[1]], saves: [{ type: 'template.save' as const, definition: {} }], canSave: true } as ImportPreview;
+    let calls = 0;
+    installBridge({
+      'query.importPreview': () => {
+        calls += 1;
+        if (calls === 1) return { ...ready, canSave: false };
+        if (calls === 2) return ready;
+        return new Promise<ImportPreview>((resolve) => {
+          answer = resolve;
+        });
+      },
+    });
+    renderWithClient(<ImportDialog onClose={() => undefined} />);
+    await userEvent.click(screen.getByLabelText('JSON 붙여넣기'));
+    await userEvent.paste('{}');
+    await userEvent.click(screen.getByRole('button', { name: '미리보기' }));
+    await userEvent.click(await screen.findByRole('checkbox', { name: /확인했습니다/ }));
+    expect(screen.getByRole('button', { name: '가져오기 (1개 저장)' })).toBeDisabled();
+    // A choice brings a saveable preview; then another choice while its preview is still on the way.
+    await userEvent.click(screen.getByRole('radio', { name: '새 id로' }));
+    await userEvent.click(await screen.findByRole('checkbox', { name: /확인했습니다/ }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '가져오기 (1개 저장)' })).toBeEnabled();
+    });
+    await userEvent.click(screen.getByRole('radio', { name: '건너뛰기' }));
+    await userEvent.click(screen.getByRole('checkbox', { name: /확인했습니다/ }));
+    expect(screen.getByRole('checkbox', { name: /확인했습니다/ })).toBeChecked();
+    expect(screen.getByRole('button', { name: '가져오기 (1개 저장)' })).toBeDisabled();
+    await act(async () => {
+      answer(ready);
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '가져오기 (1개 저장)' })).toBeEnabled();
+    });
+  });
+
+  it('a different choice asks the person to look again before saving', async () => {
+    installBridge({ 'query.importPreview': () => ({ ...PREVIEW, items: [PREVIEW.items[1]], saves: [{ type: 'template.save', definition: {} }], canSave: true }) });
+    renderWithClient(<ImportDialog onClose={() => undefined} />);
+    await userEvent.click(screen.getByLabelText('JSON 붙여넣기'));
+    await userEvent.paste('{}');
+    await userEvent.click(screen.getByRole('button', { name: '미리보기' }));
+    const confirm = await screen.findByRole('checkbox', { name: /확인했습니다/ });
+    await userEvent.click(confirm);
+    expect(screen.getByRole('button', { name: '가져오기 (1개 저장)' })).toBeEnabled();
+    await userEvent.click(screen.getByRole('radio', { name: '건너뛰기' }));
+    await waitFor(() => {
+      expect(screen.getByRole('checkbox', { name: /확인했습니다/ })).not.toBeChecked();
+    });
+    expect(screen.getByRole('button', { name: '가져오기 (1개 저장)' })).toBeDisabled();
+  });
 });
 
 describe('JSON export', () => {
