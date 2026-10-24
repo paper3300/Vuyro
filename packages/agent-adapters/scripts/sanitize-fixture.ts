@@ -38,6 +38,8 @@ const slug = (path: string) => path.replace(/[:\\/]/g, '-');
 const replacements: Array<[RegExp, string]> = [
   [new RegExp(escape(backslashed), 'gi'), FIXTURE_ROOT],
   [new RegExp(escape(slashed), 'gi'), FIXTURE_ROOT.replaceAll('\\', '/')],
+  // JSON text inside a value (a hook's JSON answer in Claude's hook_response) doubles the backslashes.
+  [new RegExp(escape(backslashed.replaceAll('\\', '\\\\')), 'gi'), FIXTURE_ROOT.replaceAll('\\', '\\\\')],
   [new RegExp(escape(slug(backslashed)), 'gi'), slug(FIXTURE_ROOT)],
   // Longest first, so the full name is replaced before any of its prefixes.
   ...userNamePrefixes(user).map((prefix): [RegExp, string] => [new RegExp(escape(prefix), 'gi'), 'sample']),

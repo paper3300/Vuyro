@@ -12,6 +12,7 @@ type Line = Record<string, unknown> & { type: string };
 const fixtures = new URL('../fixtures/', import.meta.url);
 const CLAUDE = 'claude/2.1.309/';
 const CODEX = 'codex/0.163.0/';
+const CLAUDE_2_1_310 = 'claude/2.1.310/';
 
 function text(path: string): string {
   return readFileSync(new URL(path, fixtures), 'utf8');
@@ -69,7 +70,7 @@ function hookLog(path: string): Array<Record<string, unknown>> {
 }
 
 describe('fixture files', () => {
-  const files = [CLAUDE, CODEX].flatMap((dir) => readdirSync(new URL(dir, fixtures)).map((name) => dir + name));
+  const files = [CLAUDE, CLAUDE_2_1_310, CODEX].flatMap((dir) => readdirSync(new URL(dir, fixtures)).map((name) => dir + name));
 
   // Read at run time; the real user name never appears in this file.
   const user = userInfo().username.toLowerCase();
@@ -268,5 +269,45 @@ describe('Codex CLI 0.163.0 exec --json', () => {
     const lines = jsonl(`${CODEX}error-unknown-model.jsonl`);
     expect(lines.at(-1)?.type).toBe('turn.failed');
     expect(only(lines, 'turn.completed')).toEqual([]);
+  });
+});
+
+/**
+ * M7a: the real `vuyro hook pretooluse` in each real CLI, next to a hook that logs what its process sees (the
+ * VUYRO_* names, the run token's shape, its parent processes). The run variables pointed at no engine, so the
+ * Vuyro hook had to deny ([[초기 검증 결과]] M7a).
+ */
+describe('real vuyro checkout hook (M7a)', () => {
+  const RUN_VARIABLES = ['VUYRO_DATA_DIR', 'VUYRO_LANE', 'VUYRO_NODE', 'VUYRO_PIPE', 'VUYRO_RUN_ID', 'VUYRO_RUN_TOKEN', 'VUYRO_TICKET'];
+
+  it('Claude 2.1.310 runs hooks through Git Bash with every run variable, and the deny blocks the Write', () => {
+    for (const entry of hookLog(`${CLAUDE_2_1_310}hook-deny-vuyro.hook-log.jsonl`)) {
+      expect(entry).toMatchObject({ tool: 'Write', vuyro: RUN_VARIABLES, runTokenShape: true });
+      expect((entry.parents as string[]).slice(0, 3)).toEqual(['bash.exe', 'bash.exe', 'claude.exe']);
+    }
+    const lines = jsonl(`${CLAUDE_2_1_310}hook-deny-vuyro.jsonl`);
+    const results = contentBlocks(lines, 'user').filter((block) => block.type === 'tool_result');
+    expect(results.length).toBeGreaterThan(0);
+    for (const result of results) {
+      expect(result.is_error).toBe(true);
+      expect(String(result.content)).toContain('Vuyro: the checkout could not be made');
+    }
+    expect((first(lines, 'result').permission_denials as unknown[]).length).toBe(results.length);
+    expect(claudeSettle(lines)).toBe('succeeded');
+  });
+
+  it('Codex 0.163.0 runs commandWindows through PowerShell with every run variable, and the deny blocks the patch', () => {
+    const log = hookLog(`${CODEX}hook-deny-vuyro.hook-log.jsonl`);
+    expect(log).toMatchObject([{ tool: 'apply_patch', vuyro: RUN_VARIABLES, runTokenShape: true }]);
+    expect((log[0]?.parents as string[]).slice(0, 2)).toEqual(['powershell.exe', 'codex.exe']);
+    const lines = jsonl(`${CODEX}hook-deny-vuyro.jsonl`);
+    expect(items(lines, 'file_change')).toEqual([]);
+    expect(text(`${CODEX}hook-deny-vuyro.stderr.txt`)).toContain('Command blocked by PreToolUse hook: Vuyro: the checkout could not be made');
+    expect(codexSettle(lines)).toBe('succeeded');
+  });
+
+  it('Codex lets the edit through when the hook line does not run (a quoted path first, in PowerShell)', () => {
+    expect(text(`${CODEX}hook-quoted-not-run.hook-log.jsonl`)).toBe('');
+    expect(items(jsonl(`${CODEX}hook-quoted-not-run.jsonl`), 'file_change')).toMatchObject([{ status: 'completed' }]);
   });
 });

@@ -1,0 +1,1 @@
+{"label":"codex","at":"2026-10-24T10:10:50.048Z","tool":"apply_patch","vuyro":["VUYRO_DATA_DIR","VUYRO_LANE","VUYRO_NODE","VUYRO_PIPE","VUYRO_RUN_ID","VUYRO_RUN_TOKEN","VUYRO_TICKET"],"runTokenShape":true,"ticket":"01900000-0000-7000-8000-00000000aaaa","node":"dev","parents":["powershell.exe","codex.exe","node.exe","bash.exe"],"bash":null,"shlvl":"1"}

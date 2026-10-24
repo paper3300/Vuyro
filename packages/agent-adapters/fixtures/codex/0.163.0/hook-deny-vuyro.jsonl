@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a16d64-1e80-70d1-b1b8-721e2dfc3e12"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"I couldn’t create `note.txt`: the file editing tool was blocked by a pre-edit hook because the Vuyro engine token was unavailable. I stopped without using a shell."}}
+{"type":"turn.completed","usage":{"input_tokens":94087,"cached_input_tokens":79616,"cache_write_input_tokens":0,"output_tokens":189,"reasoning_output_tokens":0}}

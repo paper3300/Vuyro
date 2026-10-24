@@ -97,3 +97,15 @@ process.stdout.write(JSON.stringify({
 2. 위 명령으로 녹화한다. herdr 같은 터미널 통합의 환경 변수는 빼고 실행한다(사용자 훅이 반응하지 않게).
 3. `node packages/agent-adapters/scripts/sanitize-fixture.ts --root <임시 폴더> <원본> <픽스처>`
 4. 새 CLI 버전이면 새 `<cli-version>` 폴더에 넣고, 이전 버전 폴더는 지우지 않는다.
+
+### M7a 실제 `vuyro` 훅 (2026-10-24)
+
+`vuyro hook pretooluse`(실제 CLI) 앞에 기록용 훅을 하나 더 두고, 실행 변수는 엔진이 없는 곳을 가리키게 해서 돌렸다. Vuyro 훅은 엔진에 닿지 못하면 언제나 deny다. 기록용 훅 로그(`*.hook-log.jsonl`)는 stdin이 아니라 그 프로세스가 본 것(`VUYRO_*` 이름, 실행 토큰 모양, 부모 프로세스 이름)을 한 줄씩 적는다.
+
+| 파일 | 내용 |
+|---|---|
+| `claude/2.1.310/hook-deny-vuyro.jsonl` | Claude Code 2.1.310, `claude-haiku-5-5`, `--include-hook-events`. 훅은 Git Bash로 돌고 Write 두 번이 모두 막힌다 |
+| `codex/0.163.0/hook-deny-vuyro.jsonl` | `gpt-6-luna`, `low`. `commandWindows`를 `& '<node>' …` 형식으로 줬다. 훅은 PowerShell로 돌고 패치가 막힌다(흔적은 stderr에만) |
+| `codex/0.163.0/hook-quoted-not-run.jsonl` | 같은 조건에서 `commandWindows`가 `"C:/Program Files/nodejs/node.exe" …`처럼 따옴표 경로로 시작했다. PowerShell 문법 오류로 훅이 돌지 않았고(로그 0줄) 파일이 만들어졌다 |
+
+치환은 같은 스크립트로 했다. Claude의 `hook_response.output`은 JSON 안의 JSON이라 백슬래시가 두 겹이다. 스크립트가 그 모양도 바꾸도록 고쳤다.

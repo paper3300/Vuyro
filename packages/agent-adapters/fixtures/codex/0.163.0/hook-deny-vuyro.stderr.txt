@@ -1,0 +1,4 @@
+2026-10-24T10:10:50.069722Z ERROR codex_core::tools::router: error=Command blocked by PreToolUse hook: Vuyro: the checkout could not be made (no engine token at C:\Users\sample\AppData\Local\Temp\vuyro-fixture-nodata\engine\engine.token (is the engine running?)), so the edit is blocked. Command: *** Begin Patch
+*** Add File: note.txt
++hello
+*** End Patch

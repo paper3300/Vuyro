@@ -1,0 +1,8 @@
+{"type":"thread.started","thread_id":"01a16d61-61fb-7d02-9091-a05cb8456eee"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\note.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"C:\\Users\\sample\\AppData\\Local\\Temp\\vuyro-fixture\\note.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Created `note.txt` containing `hello`."}}
+{"type":"turn.completed","usage":{"input_tokens":35650,"cached_input_tokens":23552,"cache_write_input_tokens":0,"output_tokens":51,"reasoning_output_tokens":0}}
