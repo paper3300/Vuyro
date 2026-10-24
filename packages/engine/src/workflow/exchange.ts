@@ -227,7 +227,8 @@ function issueLines(issues: readonly { path: string; message: string }[]): strin
 function readDocument(text: string, validator: SchemaValidator): { problems: string[]; entries?: Entry[]; document?: ImportPreview['document']; credentials?: string[]; blocking?: string[] } {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text) as unknown;
+    // A byte order mark is what Windows tools (Notepad, PowerShell 5) often put first; it is not part of the JSON.
+    parsed = JSON.parse(text.startsWith('\uFEFF') ? text.slice(1) : text) as unknown;
   } catch (error) {
     return { problems: [`JSON으로 읽을 수 없습니다: ${(error as Error).message}`] };
   }

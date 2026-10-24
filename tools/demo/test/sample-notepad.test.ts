@@ -35,6 +35,21 @@ describe('sample notepad repository', () => {
     expect(git('status', '--porcelain')).toBe('');
   }, 30_000);
 
+  it('the build reports a syntax error compiler-style and fails', () => {
+    const root = join(scratch(), 'notepad');
+    createSampleRepository(root, repo);
+    writeFileSync(join(root, 'src', 'broken.js'), 'export const ok = 1;\nexport const broken = ;\n');
+    let stderr = '';
+    try {
+      execFileSync(process.execPath, ['scripts/build.mjs'], { cwd: root, encoding: 'utf8', stdio: 'pipe' });
+    } catch (error) {
+      stderr = (error as { stderr: string }).stderr;
+    }
+    // `error` as a word: what a shared build's blame reads (`SyntaxError` alone is not an error line to it).
+    expect(stderr).toMatch(/^src\/broken\.js:2: error: SyntaxError/m);
+    expect(existsSync(join(root, 'dist'))).toBe(false);
+  }, 30_000);
+
   it('refuses a folder that is not empty', () => {
     const root = scratch();
     writeFileSync(join(root, 'keep.txt'), 'mine');

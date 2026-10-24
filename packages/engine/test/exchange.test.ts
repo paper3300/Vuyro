@@ -198,6 +198,8 @@ describe('import preview', () => {
     h = await openWorkflowHarness({ noEngine: true });
     expect(await preview('{not json')).toMatchObject({ readable: false, canSave: false, saves: [] });
     expect((await preview('{not json')).problems[0]).toMatch(/^JSON으로 읽을 수 없습니다/);
+    // M7b: a file saved by a Windows tool starts with a byte order mark; the same JSON still reads.
+    expect(await preview(`\uFEFF${json(buildType())}`)).toMatchObject({ readable: true, problems: [] });
     expect((await preview(json({ kind: 'template' }))).problems).toEqual(['Vuyro 내보내기 파일이 아닙니다("vuyro": "export"가 없습니다).']);
     expect((await preview(json([1, 2]))).readable).toBe(false);
     expect((await preview(json({ ...buildType(), formatVersion: 2 }))).problems[0]).toMatch(/formatVersion 2/);
