@@ -6,8 +6,8 @@
 //
 // The app starts it like the real engine (`--data-dir`, `--pipe`, `--ui-credential-stdin`, `--vuyro-cli`).
 // Not part of the build; never shipped.
-import { appendFileSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { type EngineDaemon, type EngineDaemonOptions, ScriptedAgentAdapter, type ScriptedBehavior, defaultDataDir, enginePaths, startEngineDaemon, systemClock } from '@vuyro/engine';
 
 type Adapter = NonNullable<NonNullable<EngineDaemonOptions['adapters']>['claude']>;
@@ -28,11 +28,52 @@ async function readFirstLine(): Promise<string> {
   return text.trim();
 }
 
+/** The ticket title, from the prompt's "## Ticket" section. */
+function ticketTitle(prompt: string): string {
+  const lines = prompt.split('\n');
+  return lines[lines.indexOf('## Ticket') + 1]?.trim() ?? '';
+}
+
+/**
+ * A Dev run that really edits its working folder (the project folder, or its worktree), checking the file out first
+ * like the hook would. Returns the changed path, or undefined when the ledger made it wait (the engine pauses the
+ * lane and starts it again once the file is free).
+ *
+ * - A fan-out lane (Plan's items) edits the shared `src/app.js`: odd lanes add a line at the top, even lanes at the
+ *   end, so two lanes conflict in the ledger (shared mode) but merge cleanly (worktree mode). It holds the file a few
+ *   seconds so the overlap shows.
+ * - A single lane (`main`, e.g. a build flow) writes its own `src/note-<ticket>.js`. A ticket whose title has
+ *   `[broken]` writes a syntax error on its first run, so a shared build can fail and blame it.
+ */
+async function devWork(session: Parameters<ScriptedBehavior>[0]): Promise<string | undefined> {
+  const { ticketId, nodeId, lane, run, cwd, prompt } = session.request;
+  if (cwd === undefined) return `src/${lane}.ts`;
+  const fanOut = lane !== 'main';
+  const relative = fanOut ? 'src/app.js' : `src/note-${ticketId.slice(-6)}.js`;
+  const file = join(cwd, relative);
+  const checkout = await session.vuyro('checkout.acquire', { ticketId, nodeId, paths: [file], source: 'agent' });
+  if (!checkout.ok || !(checkout.result as { granted: boolean }).granted) return undefined;
+  const title = ticketTitle(prompt);
+  if (fanOut) {
+    const text = existsSync(file) ? readFileSync(file, 'utf8') : '';
+    const line = `// lane ${lane} (${title}) run ${String(run)}`;
+    writeFileSync(file, Number(lane) % 2 === 1 ? `${line}\n${text}` : `${text}${line}\n`);
+    await session.sleep(4000);
+  } else {
+    mkdirSync(dirname(file), { recursive: true });
+    const broken = title.includes('[broken]') && run === 1;
+    writeFileSync(file, broken ? `// ${title}\nexport const note = ;\n` : `// ${title}\nexport const note = ${JSON.stringify(title)};\n`);
+  }
+  return session.cancelled ? undefined : relative;
+}
+
 /** What a well-behaved agent would report for each node of the default template; `done` for anything else. */
 const demoAgent: ScriptedBehavior = async (session) => {
   const { ticketId, nodeId, lane } = session.request;
   const report = (type: string, payload: Record<string, unknown>) => session.vuyro(type, { ticketId, nodeId, ...payload });
   session.observe({ kind: 'message', role: 'assistant', text: `${nodeId} 작업을 시작합니다. <script>alert(1)</script> 같은 출력도 글자로만 보여야 합니다.` });
+  // What a real CLI would get: whether the engine asked for the automatic checkout hook on this run.
+  session.observe({ kind: 'message', role: 'assistant', text: `자동 체크아웃 훅: ${session.request.checkoutHook === true ? '켬' : '끔'}` });
   session.observe({ kind: 'toolCallStarted', toolCallId: `${nodeId}-read`, name: 'Read', input: { file_path: 'README.md' } });
   await session.sleep(1500);
   session.observe({ kind: 'toolCallFinished', toolCallId: `${nodeId}-read`, output: 'ok' });
@@ -52,10 +93,13 @@ const demoAgent: ScriptedBehavior = async (session) => {
         ],
       });
       break;
-    case 'dev':
-      await report('artifact.add', { slot: 'change', ref: { kind: 'file', uri: `src/${lane}.ts`, version: 'v1' } });
-      await report('node.done', { port: 'done', summary: `레인 ${lane} 구현 완료`, data: { taskId: `task-${lane}` } });
+    case 'dev': {
+      const changed = await devWork(session);
+      if (changed === undefined) return { outcome: 'cancelled' };
+      await report('artifact.add', { slot: 'change', ref: { kind: 'file', uri: changed, version: `run-${String(session.request.run)}` } });
+      await report('node.done', { port: 'done', summary: `레인 ${lane}: ${changed} 수정`, data: { taskId: `task-${lane}`, changed } });
       break;
+    }
     case 'qa':
       await report('node.done', { port: 'approve', summary: '모든 작업이 기준을 만족합니다.', data: { verdict: 'pass' } });
       break;

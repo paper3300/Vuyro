@@ -20,18 +20,45 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Waits for an engine to end on its own (it was asked to stop), and ends it if it does not. */
+async function endProcess(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 50 && alive(pid); attempt++) await new Promise((resolve) => setTimeout(resolve, 100));
+  if (alive(pid)) process.kill(pid);
+}
+
 let counter = 0;
 function open(entryPath?: string) {
   const dataDir = mkdtempSync(join(tmpdir(), 'vuyro-desktop-'));
   const pipePath = `\\\\.\\pipe\\vuyro-test-desktop-${process.pid}-${Date.now()}-${++counter}`;
+  const base = engineConnector({ dataDir, pipePath, nodePath: process.execPath, ...(entryPath === undefined ? {} : { entryPath }) });
+  // Every engine this connection started: a test that ends while the connection is starting one again (it restarts a
+  // vanished engine) must not leave it running (seen once under a loaded full run).
+  const launched = new Set<number>();
   const connection = new EngineConnection({
-    connector: engineConnector({ dataDir, pipePath, nodePath: process.execPath, ...(entryPath === undefined ? {} : { entryPath }) }),
+    connector: {
+      ...base,
+      launch: async (credential) => {
+        const result = await base.launch(credential);
+        launched.add(result.pid);
+        return result;
+      },
+    },
     backoffMs: [200],
     statusEveryMs: 500,
   });
   cleanups.push(async () => {
     if (connection.current.access === 'write') await connection.shutdownEngine();
     connection.stop();
+    for (const pid of launched) await endProcess(pid);
     // The engine releases its files when its process ends.
     for (let attempt = 0; attempt < 50; attempt++) {
       try {
