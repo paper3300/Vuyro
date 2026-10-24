@@ -240,11 +240,19 @@ async function execute(ctx: Context, type: string, payload: Record<string, unkno
   return response.result;
 }
 
+/**
+ * The text of an `@file` argument, relative to the current folder. A byte order mark (PowerShell 5's `utf8`, some
+ * editors) is dropped, as the app's import does.
+ */
+function readArgumentFile(ctx: Context, path: string): string {
+  return readFileSync(resolve(ctx.cwd, path), 'utf8').replace(/^\uFEFF/, '');
+}
+
 /** A JSON value from the argument itself or `@file`. */
 function jsonArgument(ctx: Context, name: string): unknown {
   const raw = flag(ctx.args, name);
   if (raw === undefined) return undefined;
-  const text = raw.startsWith('@') ? readFileSync(resolve(ctx.cwd, raw.slice(1)), 'utf8') : raw;
+  const text = raw.startsWith('@') ? readArgumentFile(ctx, raw.slice(1)) : raw;
   try {
     return JSON.parse(text) as unknown;
   } catch (error) {
@@ -548,7 +556,7 @@ async function definitionCommand(ctx: Context, sub: string | undefined): Promise
   if (sub !== 'save') throw new UsageError("definition: expected 'save'");
   const source = ctx.args.positionals[2];
   if (source === undefined || source === '') throw new UsageError('definition save: give the envelope as JSON or @file');
-  const text = source.startsWith('@') ? readFileSync(resolve(ctx.cwd, source.slice(1)), 'utf8') : source;
+  const text = source.startsWith('@') ? readArgumentFile(ctx, source.slice(1)) : source;
   let definition: { kind?: unknown };
   try {
     definition = JSON.parse(text) as { kind?: unknown };
@@ -580,7 +588,7 @@ async function sharedCommand(ctx: Context, sub: string | undefined): Promise<num
       onlyFlags(ctx.args, ['project']);
       const projectId = requireFlag(ctx.args, 'project');
       if (name === undefined || name === '') throw new UsageError('shared define: give the spec as JSON or @file');
-      const text = name.startsWith('@') ? readFileSync(resolve(ctx.cwd, name.slice(1)), 'utf8') : name;
+      const text = name.startsWith('@') ? readArgumentFile(ctx, name.slice(1)) : name;
       let parsed: { kind?: unknown; content?: unknown };
       try {
         parsed = JSON.parse(text) as { kind?: unknown; content?: unknown };

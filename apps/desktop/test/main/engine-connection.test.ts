@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ConnectionState } from '../../src/shared/bridge.ts';
 import { EngineConnection, type EventBatch, toBridgeError } from '../../src/main/engine-connection.ts';
+import { quitForGood } from '../../src/main/tray-model.ts';
 import { FakeEngine, ManualScheduler, settle } from './fake-engine.ts';
 
 /**
@@ -228,6 +229,92 @@ describe('engine connection', () => {
     await readOnly.connection.start();
     expect(await readOnly.connection.shutdownEngine()).toMatchObject({ ok: false, error: { code: 'forbidden' } });
     expect(readOnly.engine.running).toBe(true);
+  });
+
+  it('quitting for good: the engine closing the pipe before it answers does not bring a new engine up', async () => {
+    // Race: the engine stops and drops the link before the shutdown answer arrives. The request fails, the person
+    // reads "엔진을 멈추지 못했습니다" for as long as they like, and meanwhile nothing reconnects or launches.
+    const { engine, connector, scheduler, connection } = setup((fake) => {
+      fake.shutdownClosesFirst = true;
+    });
+    await connection.start();
+    let dismiss: () => void = () => undefined;
+    const notices: string[] = [];
+    let exited = false;
+    const quitting = quitForGood({
+      running: () => connection.running(),
+      access: () => connection.current.access,
+      beginQuit: () => {
+        connection.beginQuit();
+      },
+      confirm: () => Promise.resolve(true),
+      notify: ({ message }) => {
+        notices.push(message);
+        return new Promise<void>((resolve) => {
+          dismiss = resolve;
+        });
+      },
+      shutdownEngine: () => connection.shutdownEngine(),
+      exitApp: () => {
+        exited = true;
+        connection.stop();
+      },
+    });
+    await settle();
+    expect(engine.shutdowns).toBe(1);
+    expect(notices).toEqual(['엔진을 멈추지 못했습니다.']);
+    const connects = connector.connects.length;
+    await scheduler.advance(60_000);
+    expect(engine.launches).toHaveLength(1);
+    expect(connector.connects).toHaveLength(connects);
+    expect(engine.running).toBe(false);
+    expect(connection.current).toMatchObject({ phase: 'offline', message: '종료하는 중입니다.' });
+    await connection.retry();
+    expect(engine.launches).toHaveLength(1);
+    dismiss();
+    expect(await quitting).toBe('quit-engine-kept');
+    expect(exited).toBe(true);
+  });
+
+  it('a link lost after the person chose to quit stays lost, before the shutdown is even sent', async () => {
+    const { engine, scheduler, connection } = setup();
+    await connection.start();
+    connection.beginQuit();
+    engine.crash();
+    await settle();
+    await scheduler.advance(60_000);
+    expect(engine.launches).toHaveLength(1);
+    expect(engine.running).toBe(false);
+  });
+
+  it('an engine launch still on its way when the person quits is stopped again, not left behind', async () => {
+    let open: () => void = () => undefined;
+    const { engine, connection } = setup((fake) => {
+      fake.launchGate = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+    });
+    const starting = connection.start();
+    await settle();
+    expect(engine.launches).toHaveLength(1);
+    connection.beginQuit();
+    open();
+    await starting;
+    // The fake engine stops on a real timer after it answers.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(engine.shutdowns).toBe(1);
+    expect(engine.running).toBe(false);
+    expect(engine.links.size).toBe(0);
+  });
+
+  it('a person who has not quit yet still gets a lost engine back (the quit state starts with the confirmation)', async () => {
+    const { engine, scheduler, connection } = setup();
+    await connection.start();
+    engine.crash();
+    await settle();
+    await scheduler.advance(100);
+    expect(engine.launches).toHaveLength(2);
+    expect(connection.current).toMatchObject({ phase: 'connected', access: 'write' });
   });
 
   it('turns engine refusals into bridge errors with their code', () => {

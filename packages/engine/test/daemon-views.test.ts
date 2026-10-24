@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { AgentAdapter, AgentStartRequest } from '@vuyro/agent-adapters';
 import { type BoardResult, type DefinitionListing, type ExportResult, type ImportPreview, RPC_METHODS, type RunEventsResult, type TemplateSummary } from '@vuyro/contracts';
-import type { TicketDetail } from '../src/daemon/queries.ts';
+import type { ProjectRow, TicketDetail } from '../src/daemon/queries.ts';
 import { systemClock } from '../src/runtime/clock.ts';
 import { type ScriptedBehavior, ScriptedAgentAdapter } from '../src/workflow/scripted-agent.ts';
 import { type DaemonHarness, oneAgentTemplate, openDaemonHarness } from './helpers/daemon-harness.ts';
@@ -89,6 +89,24 @@ describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
     expect(seen[1]).toBe(folder);
   });
 
+  it('lists where each project works, in which mode, and whether its folder is a git repository (the app offers worktree mode only then)', async () => {
+    h = await openDaemonHarness();
+    const ui = await h.ui();
+    const create = async (name: string) => ((await ui.execute({ requestId: rid(), type: 'project.create', payload: { name } })).result as { projectId: string }).projectId;
+    await create('no folder');
+    const rooted = await create('with folder');
+    const folder = join(h.dataDir, 'project-folder');
+    mkdirSync(folder);
+    await ui.execute({ requestId: rid(), type: 'project.configure', payload: { projectId: rooted, root: folder, settings: { workspaceMode: 'shared', onConflict: 'warn' } } });
+    const listed = async () => (await ui.request<{ projects: ProjectRow[] }>(RPC_METHODS.projects, {})).projects;
+    expect(await listed()).toEqual([
+      expect.objectContaining({ name: 'no folder', root: null, baseRef: null, settings: null, rootIsGitRepo: false }),
+      expect.objectContaining({ name: 'with folder', root: folder, settings: { workspaceMode: 'shared', onConflict: 'warn' }, rootIsGitRepo: false }),
+    ]);
+    mkdirSync(join(folder, '.git'));
+    expect((await listed())[1]?.rootIsGitRepo).toBe(true);
+  });
+
   it('lists active templates with nodes in stage order and loops marked', async () => {
     h = await openDaemonHarness();
     const ui = await h.ui();
@@ -120,7 +138,7 @@ describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
       ['Plain', 0],
     ]);
     expect(board.tickets[0]?.lanes).toMatchObject([{ nodeId: 'brainstorming', lane: 'main', status: 'review' }]);
-    expect(Object.keys(board.workflows)).toEqual(['vuyro/ai-sdlc@1']);
+    expect(Object.keys(board.workflows)).toEqual(['vuyro/ai-sdlc@2']);
 
     await ui.execute({ requestId: rid(), type: 'ticket.update', payload: { ticketId, priority: -2 } });
     await ui.execute({ requestId: rid(), type: 'node.done', payload: { ticketId, nodeId: 'brainstorming', port: 'done', summary: 'A notepad app' } });
@@ -312,12 +330,16 @@ describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
     agent.bind(h);
     const ui = await h.ui();
     const listed = await ui.request<{ definitions: DefinitionListing[] }>(RPC_METHODS.definitions, { kind: 'template' });
-    expect(listed.definitions).toEqual([expect.objectContaining({ kind: 'template', id: 'vuyro/ai-sdlc', version: 1, name: 'AI-Native SDLC', status: 'active', latest: true })]);
+    // v2 leaves the workspace mode to the project (D-073); v1 stays for the tickets that pinned it.
+    expect(listed.definitions).toEqual([
+      expect.objectContaining({ kind: 'template', id: 'vuyro/ai-sdlc', version: 1, status: 'active', latest: false }),
+      expect.objectContaining({ kind: 'template', id: 'vuyro/ai-sdlc', version: 2, name: 'AI-Native SDLC', status: 'active', latest: true }),
+    ]);
 
     const exported = await ui.request<ExportResult>(RPC_METHODS.exportDefinition, { kind: 'template', id: 'vuyro/ai-sdlc' });
-    expect(exported).toMatchObject({ fileName: 'vuyro.ai-sdlc@1.json', redacted: [], document: { kind: 'bundle', id: 'vuyro/ai-sdlc' } });
+    expect(exported).toMatchObject({ fileName: 'vuyro.ai-sdlc@2.json', redacted: [], document: { kind: 'bundle', id: 'vuyro/ai-sdlc' } });
     const text = JSON.stringify(exported.document, null, 2);
-    const key = 'template:vuyro/ai-sdlc@1';
+    const key = 'template:vuyro/ai-sdlc@2';
     const plan = await ui.request<ImportPreview>(RPC_METHODS.importPreview, { text, choices: { [key]: { action: 'newId', id: 'myteam/ai-sdlc', name: 'AI-Native SDLC (copy)' } } });
     expect(plan.canSave).toBe(true);
     const items = plan.saves.map((save) => ({ definition: save.definition, ...(save.expect === undefined ? {} : { expect: save.expect }) }));

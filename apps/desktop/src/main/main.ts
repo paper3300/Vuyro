@@ -8,6 +8,7 @@ import { EngineConnection } from './engine-connection.ts';
 import { engineConnector } from './engine-connector.ts';
 import { checkCopyText, type FileAccess, type FileDialogs, openJsonFile, saveJsonFile } from './file-exchange.ts';
 import { checkRendererRequest, checkSubscribe, isTrustedFrame } from './ipc-policy.ts';
+import { type FolderAccess, FolderGrants, pickProjectFolder, setProjectFolder } from './project-folder.ts';
 import { quitForGood, trayItems, trayTooltip } from './tray-model.ts';
 import { mainWindowOptions } from './window-options.ts';
 
@@ -44,6 +45,8 @@ const connection = new EngineConnection({
 });
 /** Renderer subscriptions by web contents, so a closed window stops its subscriptions. */
 const subscriptions = new Map<number, Map<string, () => void>>();
+/** Project folders the person picked, by one-time token (the page never sends a path). */
+const folderGrants = new FolderGrants();
 
 function showWindow(): void {
   if (window !== undefined && !window.isDestroyed()) {
@@ -85,6 +88,7 @@ function guardContents(contents: WebContents): void {
     event.preventDefault();
   });
   contents.once('destroyed', () => {
+    folderGrants.drop(contents.id);
     const owned = subscriptions.get(contents.id);
     subscriptions.delete(contents.id);
     for (const unsubscribe of owned?.values() ?? []) unsubscribe();
@@ -120,6 +124,9 @@ function requestQuit(): void {
   void quitForGood({
     running: () => connection.running(),
     access: () => connection.current.access,
+    beginQuit: () => {
+      connection.beginQuit();
+    },
     confirm: async ({ message, detail }) => (await ask({ type: 'warning', title: 'Vuyro', message, detail, buttons: ['종료', '취소'], defaultId: 1, cancelId: 1, noLink: true })).response === 0,
     notify: async ({ message, detail }) => {
       await ask({ type: 'info', title: 'Vuyro', message, detail, buttons: ['확인'] });
@@ -194,6 +201,30 @@ function registerIpc(): void {
     await clipboard.writeText(checked.text);
     return { ok: true, value: null };
   });
+  // The project folder: picked in a system dialog, checked here, saved by token as `project.configure` (D-072).
+  const folders: FolderAccess = {
+    kind: async (path) => {
+      try {
+        return (await stat(path)).isDirectory() ? 'directory' : 'file';
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ENOTDIR') return 'missing';
+        throw error;
+      }
+    },
+  };
+  ipcMain.handle(BRIDGE_CHANNELS.pickFolder, async (event) => {
+    if (!trusted(event)) return refusal;
+    const parent = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+    const pickFolder = async () => {
+      const options: Electron.OpenDialogOptions = { title: '프로젝트 폴더 고르기', properties: ['openDirectory'] };
+      const picked = parent === undefined ? await dialog.showOpenDialog(options) : await dialog.showOpenDialog(parent, options);
+      return picked.canceled ? undefined : picked.filePaths[0];
+    };
+    return pickProjectFolder({ pickFolder }, folders, folderGrants, event.sender.id);
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.setProjectFolder, async (event, message: unknown) =>
+    trusted(event) ? setProjectFolder(folderGrants, folders, event.sender.id, message, (method, params) => connection.request(method, params)) : refusal,
+  );
   ipcMain.on(BRIDGE_CHANNELS.subscribe, (event, message: unknown) => {
     if (!trusted(event)) return;
     const checked = checkSubscribe(message);

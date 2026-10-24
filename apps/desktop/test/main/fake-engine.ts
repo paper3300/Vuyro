@@ -19,6 +19,10 @@ export class FakeEngine {
   /** When set, `launch` starts nothing and another engine "already" runs without our credential. */
   launchRace = false;
   failLaunch: Error | undefined;
+  /** When set, `launch` waits for it (a launch still on its way). */
+  launchGate: Promise<void> | undefined;
+  /** `engine.shutdown` closes the pipe before its answer arrives (the engine stopping fast). */
+  shutdownClosesFirst = false;
   runningJobs = 0;
   shutdowns = 0;
   /** The next N `events.subscribe` requests fail (the connection stays up). */
@@ -59,8 +63,9 @@ export class FakeEngine {
         this.links.add(link);
         return Promise.resolve(link);
       },
-      launch: (credential) => {
+      launch: async (credential) => {
         this.launches.push(credential);
+        if (this.launchGate !== undefined) await this.launchGate;
         if (this.failLaunch !== undefined) return Promise.reject(this.failLaunch);
         if (this.launchRace) {
           this.running = true;
@@ -101,6 +106,10 @@ export class FakeLink implements EngineLink {
       case 'engine.shutdown':
         if (this.hello.identity !== 'ui') return Promise.reject(Object.assign(new Error('only the human'), { data: { code: 'forbidden', message: 'only the human', retryable: false } }));
         this.engine.shutdowns += 1;
+        if (this.engine.shutdownClosesFirst) {
+          this.engine.crash();
+          return Promise.reject(new Error('the connection was closed'));
+        }
         setTimeout(() => {
           this.engine.crash();
         }, 0);

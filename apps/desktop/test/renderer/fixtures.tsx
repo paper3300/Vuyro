@@ -136,6 +136,8 @@ export function installBridge(handlers: Partial<Record<RendererMethod, Handler>>
   const openJsonFile = vi.fn<VuyroBridge['openJsonFile']>(() => Promise.resolve({ ok: true, value: null }));
   const saveJsonFile = vi.fn<VuyroBridge['saveJsonFile']>(() => Promise.resolve({ ok: true, value: { name: 'saved.json' } }));
   const copyText = vi.fn<VuyroBridge['copyText']>(() => Promise.resolve({ ok: true, value: null }));
+  const pickProjectFolder = vi.fn<VuyroBridge['pickProjectFolder']>(() => Promise.resolve({ ok: true, value: null }));
+  const setProjectFolder = vi.fn<VuyroBridge['setProjectFolder']>(() => Promise.resolve({ ok: true, value: { ok: true, result: {} } }));
   const bridge: VuyroBridge = {
     request,
     subscribe,
@@ -146,9 +148,11 @@ export function installBridge(handlers: Partial<Record<RendererMethod, Handler>>
     openJsonFile,
     saveJsonFile,
     copyText,
+    pickProjectFolder,
+    setProjectFolder,
   };
   window.vuyro = bridge;
-  return { commands, request, pair, retry, subscribe, openJsonFile, saveJsonFile, copyText };
+  return { commands, request, pair, retry, subscribe, openJsonFile, saveJsonFile, copyText, pickProjectFolder, setProjectFolder };
 }
 
 export function setConnection(state: ConnectionState = { phase: 'connected', access: 'write' }): void {

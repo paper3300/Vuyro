@@ -254,7 +254,7 @@ describe.runIf(process.platform === 'win32')('engine daemon', () => {
       const again = await h.ui();
       expect(await again.request(RPC_METHODS.projects, {})).toMatchObject({ projects: [{ projectId: (result as { projectId: string }).projectId }] });
       const templates = await h.daemon.store.query<{ status: string }>("SELECT status FROM p_definitions WHERE kind = 'template'");
-      expect(templates.map((row) => row.status)).toEqual(['active']);
+      expect(templates.map((row) => row.status)).toEqual(['active', 'active']);
       await h.restart();
       expect((await (await h.ui()).request<{ projects: unknown[] }>(RPC_METHODS.projects, {})).projects).toHaveLength(1);
     }, 30_000);

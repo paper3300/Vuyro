@@ -6,7 +6,7 @@ import { Board } from './Board.tsx';
 import { ConnectionBanner } from './ConnectionBanner.tsx';
 import { GraphView } from './GraphView.tsx';
 import { Library } from './Library.tsx';
-import { NewProjectDialog, ProjectHome } from './ProjectHome.tsx';
+import { NewProjectDialog, ProjectHome, ProjectSettingsDialog } from './ProjectHome.tsx';
 import { TicketDrawer } from './TicketDetail.tsx';
 
 const NEW_PROJECT = '__new__';
@@ -26,6 +26,7 @@ export function App() {
   const view = useUi((state) => state.view);
   const setView = useUi((state) => state.setView);
   const [creatingProject, setCreatingProject] = useState(false);
+  const [configuringProject, setConfiguringProject] = useState(false);
   const list = projects.data ?? [];
   const project = list.find((each) => each.projectId === projectId);
 
@@ -59,6 +60,18 @@ export function App() {
               <option value={NEW_PROJECT}>+ 새 프로젝트…</option>
             </select>
           )}
+          {project !== undefined && (
+            <button
+              type="button"
+              onClick={() => {
+                setConfiguringProject(true);
+              }}
+              title={`프로젝트 폴더: ${project.root ?? '없음'} · 작업 공간 모드: ${project.settings?.workspaceMode ?? 'shared'}`}
+              className="h-[26px] rounded-md px-2 text-[12.5px] text-muted hover:bg-chip hover:text-ink"
+            >
+              프로젝트 설정
+            </button>
+          )}
           {project !== undefined && <span className="text-muted">/ {VIEWS.find((each) => each.key === view)?.crumb}</span>}
         </div>
         {project !== undefined && (
@@ -84,6 +97,14 @@ export function App() {
       </main>
       <TicketDrawer />
       <StatusLine />
+      {configuringProject && project !== undefined && (
+        <ProjectSettingsDialog
+          project={project}
+          onClose={() => {
+            setConfiguringProject(false);
+          }}
+        />
+      )}
       {creatingProject && (
         <NewProjectDialog
           onClose={() => {

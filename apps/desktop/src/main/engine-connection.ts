@@ -98,6 +98,8 @@ export class EngineConnection {
   private statusTimer: unknown;
   private attempt = 0;
   private stopped = false;
+  /** Quitting for good: never reconnect or start an engine again, whatever happens to the link meanwhile. */
+  private quitting = false;
   private startedByApp = false;
 
   constructor(options: EngineConnectionOptions) {
@@ -122,7 +124,18 @@ export class EngineConnection {
   /** Connects (or starts the engine). Resolves when this attempt is over, connected or not; it retries on its own. */
   start(): Promise<void> {
     this.stopped = false;
+    this.quitting = false;
     return this.establish();
+  }
+
+  /**
+   * The app is about to quit for good (the person confirmed): from now on a lost link stays lost and no engine is
+   * started, even while the shutdown request is on its way or a dialog waits for the person. Otherwise the engine
+   * closing the pipe as it stops would make this connection start a new one. The current link stays usable.
+   */
+  beginQuit(): void {
+    this.quitting = true;
+    this.clearRetry();
   }
 
   /** Tries again now instead of waiting for the next retry. */
@@ -200,6 +213,7 @@ export class EngineConnection {
 
   /** Stops the engine (only a UI session may). Running agents are cancelled and queue again at the next start. */
   async shutdownEngine(): Promise<BridgeResult<unknown>> {
+    this.beginQuit();
     const result = await this.request('engine.shutdown', {});
     if (result.ok) this.stop();
     return result;
@@ -221,11 +235,13 @@ export class EngineConnection {
   }
 
   private async connectOnce(): Promise<void> {
-    if (this.stopped || this.link !== undefined) return;
+    if (this.stopped || this.quitting || this.link !== undefined) return;
     this.update({ phase: this.state.phase === 'offline' ? 'offline' : 'connecting' });
     try {
-      const link = await this.open();
+      const { link, launched } = await this.open();
       if (this.isStopped()) {
+        // An engine this attempt started while the person was quitting: stop it again instead of leaving it behind.
+        if (this.isQuitting() && launched && link.hello.identity === 'ui') await link.request('engine.shutdown', {}).catch(() => undefined);
         link.close();
         return;
       }
@@ -243,23 +259,25 @@ export class EngineConnection {
    * 2. No engine answers → start one with our credential, then connect with it.
    * 3. An engine answers but does not know the credential → read-only until the person pairs.
    */
-  private async open(): Promise<EngineLink> {
+  private async open(): Promise<{ link: EngineLink; launched: boolean }> {
     this.credential ??= this.connector.newCredential();
     const credential = this.credential;
     try {
-      return await this.connector.connect(credential);
+      return { link: await this.connector.connect(credential), launched: false };
     } catch (error) {
       if (!(error instanceof EngineConnectError)) throw error;
-      if (error.reason === 'unauthenticated') return this.connector.connect(undefined);
+      if (error.reason === 'unauthenticated') return { link: await this.connector.connect(undefined), launched: false };
     }
+    // Read after the await: the person may have chosen to quit meanwhile.
+    if (this.isQuitting()) throw new Error('the app is quitting: no engine is started');
     this.update({ phase: 'launching' });
     const launched = await this.connector.launch(credential);
     this.startedByApp = launched.started;
     try {
-      return await this.connector.connect(credential);
+      return { link: await this.connector.connect(credential), launched: launched.started };
     } catch (error) {
       // Another engine won the race to the data directory: it never got our credential.
-      if (error instanceof EngineConnectError && error.reason === 'unauthenticated') return this.connector.connect(undefined);
+      if (error instanceof EngineConnectError && error.reason === 'unauthenticated') return { link: await this.connector.connect(undefined), launched: false };
       throw error;
     }
   }
@@ -272,6 +290,10 @@ export class EngineConnection {
       if (this.link !== link) return;
       this.dropLink(link);
       if (this.stopped) return;
+      if (this.quitting) {
+        this.update({ phase: 'offline', access: 'none', message: '종료하는 중입니다.' });
+        return;
+      }
       this.update({ phase: 'offline', access: 'none', message: '엔진 연결이 끊겼습니다. 다시 연결합니다.' });
       this.scheduleRetry();
     });
@@ -353,7 +375,7 @@ export class EngineConnection {
   }
 
   private scheduleRetry(): void {
-    if (this.stopped || this.retryTimer !== undefined) return;
+    if (this.stopped || this.quitting || this.retryTimer !== undefined) return;
     const wait = this.backoffMs[Math.min(this.attempt, this.backoffMs.length - 1)] ?? 1000;
     this.attempt += 1;
     this.retryTimer = this.scheduler.setTimeout(() => {
@@ -374,9 +396,13 @@ export class EngineConnection {
     this.statusTimer = undefined;
   }
 
-  /** Read after an await: `stop()` may have run meanwhile. */
+  /** Read after an await: `stop()` or `beginQuit()` may have run meanwhile. */
   private isStopped(): boolean {
-    return this.stopped;
+    return this.stopped || this.quitting;
+  }
+
+  private isQuitting(): boolean {
+    return this.quitting;
   }
 
   /** Merges `patch` into the state; an `undefined` value removes that field. */

@@ -56,6 +56,14 @@ describe('vuyro command envelopes', () => {
     expect(engine.sent[0]?.options).not.toHaveProperty('humanCredential');
   });
 
+  it('reads an @file that starts with a byte order mark (PowerShell 5, some editors save one)', async () => {
+    writeFileSync(join(dir, 'bom.json'), `\uFEFF${JSON.stringify({ taskId: 'T2' })}`, 'utf8');
+    const engine = fakeEngine();
+    const code = await runCli(['node', 'done', '--port', 'done', '--data', '@bom.json'], io(), { env: agentEnv, cwd: dir, connect: engine.connect });
+    expect(code).toBe(0);
+    expect(engine.sent[0]?.envelope.payload).toMatchObject({ data: { taskId: 'T2' } });
+  });
+
   it('artifact add maps the reference fields', async () => {
     const engine = fakeEngine();
     await runCli(['artifact', 'add', 'change', '--kind', 'git', '--uri', 'repo:main', '--version', 'abc123', '--mime', 'text/x-diff', '--hash', 'sha256:00'], io(), { env: agentEnv, connect: engine.connect });

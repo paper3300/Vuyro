@@ -299,4 +299,74 @@ describe('worktree mode', { timeout: 120_000 }, () => {
     expect(currentExecution(await h.ticket(ticketId), 'plan', 'main')?.output?.items[0]?.summary).toContain('needs a git repository');
     expect(seen).toEqual([]);
   });
+  it("the default template follows the project's workspace mode: parallel Dev lanes in worktrees, merged at the join (D-073)", async () => {
+    const seen: string[] = [];
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId, lane, cwd } = s.request;
+        seen.push(`${nodeId}/${lane}@${cwd ?? ''}`);
+        if (nodeId === 'spec') {
+          expectOk(await s.vuyro('artifact.add', { ticketId, nodeId, slot: 'specDoc', ref: { kind: 'file', uri: 'docs/spec.md', version: '1' } }));
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { title: 'Notepad', acceptanceCriteria: ['can save'] } }));
+        } else if (nodeId === 'plan') {
+          writeFileSync(join(cwd ?? '', 'PLAN.md'), '# plan\n');
+          const items = ['T1', 'T2'].map((taskId) => ({ data: { taskId, scope: taskId, files: [`src/${taskId}.txt`] } }));
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items }));
+        } else if (nodeId === 'dev') {
+          await s.sleep(MINUTE);
+          writeFileSync(join(cwd ?? '', 'src', `lane-${lane}.txt`), `work of lane ${lane}\n`);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: { taskId: `T${lane}` } }));
+        } else if (nodeId === 'qa') {
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'approve', data: { verdict: 'pass' } }));
+        } else {
+          throw new Error(`unexpected agent for ${nodeId}`);
+        }
+        return undefined;
+      },
+    });
+    const repo = gitRepo(join(h.dir, 'repo'));
+    // The project chose worktree mode; the template does not choose one (v2), so the project's choice holds.
+    const projectId = await projectAt(h, repo, { workspaceMode: 'worktree' });
+    const ticketId = await ticketIn(h, projectId, 'vuyro/ai-sdlc');
+    expect((await h.ticket(ticketId)).template).toMatchObject({ id: 'vuyro/ai-sdlc', version: 2 });
+    await h.drive();
+    await h.ok('node.done', { ticketId, nodeId: 'brainstorming', port: 'done', summary: 'A notepad' });
+    await h.drive();
+    await h.ok('node.approve', { ticketId, nodeId: 'specApproval' });
+    await h.drive();
+    expect(await h.status(ticketId, 'qa')).toBe('review');
+
+    const root = h.workspaces.layout.worktreeRoot;
+    const ticketTree = ticketWorktree(root, ticketId);
+    expect(seen).toEqual([
+      `spec/main@${ticketTree.path}`,
+      `plan/main@${ticketTree.path}`,
+      `dev/1@${laneWorktree(root, ticketId, 'dev', '1').path}`,
+      `dev/2@${laneWorktree(root, ticketId, 'dev', '2').path}`,
+      `qa/main@${ticketTree.path}`,
+    ]);
+    // The join merged both lanes into the ticket branch; QA saw the merged tree.
+    const head = git(ticketTree.path, 'rev-parse', 'HEAD');
+    expect(git(ticketTree.path, 'show', `${head}:src/lane-1.txt`)).toBe('work of lane 1');
+    expect(git(ticketTree.path, 'show', `${head}:src/lane-2.txt`)).toBe('work of lane 2');
+    expect(currentExecution(await h.ticket(ticketId), 'join', 'main')?.executor).toBe('merge');
+
+    await h.ok('node.approve', { ticketId, nodeId: 'qa' });
+    await h.drive();
+    expect((await h.ticket(ticketId)).status).toBe('done');
+    expect(existsSync(ticketTree.path)).toBe(false);
+    expect(git(repo, 'show', `${ticketTree.branch}:src/lane-2.txt`)).toBe('work of lane 2');
+    // The person's branch and folder were not touched.
+    expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main');
+    expect(git(repo, 'status', '--porcelain')).toBe('');
+
+    // A project that chose nothing: the same template runs in the project folder (shared, the default).
+    seen.length = 0;
+    const plain = await projectAt(h, repo);
+    const shared = await ticketIn(h, plain, 'vuyro/ai-sdlc');
+    await h.drive();
+    await h.ok('node.done', { ticketId: shared, nodeId: 'brainstorming', port: 'done', summary: 'Same again' });
+    await h.drive();
+    expect(seen).toEqual([`spec/main@${repo}`]);
+  });
 });

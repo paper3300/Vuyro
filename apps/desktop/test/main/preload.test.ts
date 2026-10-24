@@ -73,14 +73,16 @@ interface Api {
   openJsonFile(): Promise<unknown>;
   saveJsonFile(name: string, text: string): Promise<unknown>;
   copyText(text: string): Promise<unknown>;
+  pickProjectFolder(): Promise<unknown>;
+  setProjectFolder(projectId: string, token: string, settings?: unknown): Promise<unknown>;
 }
 
 describe('preload bridge', () => {
-  it('exposes window.vuyro with nine functions and nothing of Electron or Node', () => {
+  it('exposes window.vuyro with eleven functions and nothing of Electron or Node', () => {
     const { exposed, required } = loadPreload();
     expect([...exposed.keys()]).toEqual(['vuyro']);
     const api = exposed.get('vuyro') as Record<string, unknown>;
-    expect(Object.keys(api).sort()).toEqual(['connection', 'copyText', 'onConnection', 'openJsonFile', 'pair', 'request', 'retry', 'saveJsonFile', 'subscribe']);
+    expect(Object.keys(api).sort()).toEqual(['connection', 'copyText', 'onConnection', 'openJsonFile', 'pair', 'pickProjectFolder', 'request', 'retry', 'saveJsonFile', 'setProjectFolder', 'subscribe']);
     expect(Object.values(api).every((value) => typeof value === 'function')).toBe(true);
     expect(required).toEqual(['electron']);
   });
@@ -102,6 +104,8 @@ describe('preload bridge', () => {
     await api.openJsonFile();
     await api.saveJsonFile('a.json', '{}');
     await api.copyText('{}');
+    await api.pickProjectFolder();
+    await api.setProjectFolder('p1', 'vpf_0123', { workspaceMode: 'worktree' });
     expect(invoked).toEqual([
       { channel: 'vuyro:request', args: [{ method: 'query.board', params: { projectId: 'p' } }] },
       { channel: 'vuyro:connection', args: [] },
@@ -110,6 +114,9 @@ describe('preload bridge', () => {
       { channel: 'vuyro:open-file', args: [] },
       { channel: 'vuyro:save-file', args: [{ name: 'a.json', text: '{}' }] },
       { channel: 'vuyro:copy-text', args: [{ text: '{}' }] },
+      // The folder dialog takes no arguments; saving sends the grant token, never a path.
+      { channel: 'vuyro:pick-folder', args: [] },
+      { channel: 'vuyro:set-project-folder', args: [{ projectId: 'p1', token: 'vpf_0123', settings: { workspaceMode: 'worktree' } }] },
     ]);
   });
 

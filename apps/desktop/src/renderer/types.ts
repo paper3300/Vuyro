@@ -1,4 +1,4 @@
-import type { ReviewView, WorkflowView } from '@vuyro/contracts';
+import type { ReviewView, WorkflowView, WorkspaceSettings } from '@vuyro/contracts';
 
 /** Shapes of the engine's read side the screens use (`query.ticket`, `query.projects`, `query.artifacts`). */
 
@@ -6,6 +6,11 @@ export interface ProjectRow {
   readonly projectId: string;
   readonly name: string;
   readonly createdAt: number;
+  /** The project folder, or null: agents then work in an empty folder of their ticket. */
+  readonly root: string | null;
+  /** The project layer of the workspace settings, or null when never set. */
+  readonly settings: WorkspaceSettings | null;
+  readonly rootIsGitRepo: boolean;
 }
 
 export interface TicketRow {

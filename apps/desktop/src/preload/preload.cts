@@ -17,6 +17,8 @@ const CHANNELS = {
   openFile: 'vuyro:open-file',
   saveFile: 'vuyro:save-file',
   copyText: 'vuyro:copy-text',
+  pickFolder: 'vuyro:pick-folder',
+  setProjectFolder: 'vuyro:set-project-folder',
 } as const;
 
 type Listener = (payload: unknown) => void;
@@ -55,4 +57,6 @@ contextBridge.exposeInMainWorld('vuyro', {
   openJsonFile: (): Promise<unknown> => ipcRenderer.invoke(CHANNELS.openFile),
   saveJsonFile: (name: string, text: string): Promise<unknown> => ipcRenderer.invoke(CHANNELS.saveFile, { name, text }),
   copyText: (text: string): Promise<unknown> => ipcRenderer.invoke(CHANNELS.copyText, { text }),
+  pickProjectFolder: (): Promise<unknown> => ipcRenderer.invoke(CHANNELS.pickFolder),
+  setProjectFolder: (projectId: string, token: string, settings?: unknown): Promise<unknown> => ipcRenderer.invoke(CHANNELS.setProjectFolder, { projectId, token, settings }),
 });

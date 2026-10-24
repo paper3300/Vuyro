@@ -52,6 +52,11 @@ export function checkRendererRequest(message: unknown): CheckedRequest {
     const envelope = params as Record<string, unknown> | undefined;
     if (envelope === undefined) return { ok: false, error: refused('command envelope missing') };
     if ('auth' in envelope) return { ok: false, error: refused('the window does not send run tokens') };
+    // A folder comes only from the folder dialog (`setProjectFolder` with its grant), never as a path from the page.
+    const payload = envelope.payload as Record<string, unknown> | null | undefined;
+    if (envelope.type === 'project.configure' && typeof payload === 'object' && payload !== null && 'root' in payload) {
+      return { ok: false, error: refused('the window sets the project folder through the folder dialog only') };
+    }
   }
   return { ok: true, method, params };
 }

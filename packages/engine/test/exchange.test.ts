@@ -287,23 +287,23 @@ describe('import preview', () => {
     const exported = await exportDefinition(h.registry, { kind: 'template', id: 'vuyro/ai-sdlc' });
     const text = json(exported.document);
     const same = await preview(text);
-    expect(same.items.map((item) => [item.key, item.state, item.action])).toContainEqual(['template:vuyro/ai-sdlc@1', 'same', 'skip']);
+    expect(same.items.map((item) => [item.key, item.state, item.action])).toContainEqual(['template:vuyro/ai-sdlc@2', 'same', 'skip']);
     expect(same.items.every((item) => item.state === 'same' && item.action === 'skip')).toBe(true);
     expect(same).toMatchObject({ saves: [], canSave: false, problems: [] });
 
-    const copy = await preview(text, { 'template:vuyro/ai-sdlc@1': { action: 'newId', id: 'myteam/ai-sdlc', name: 'AI-Native SDLC (우리 팀)' } });
+    const copy = await preview(text, { 'template:vuyro/ai-sdlc@2': { action: 'newId', id: 'myteam/ai-sdlc', name: 'AI-Native SDLC (우리 팀)' } });
     expect(copy.canSave).toBe(true);
-    expect(copy.items.find((item) => item.kind === 'template')?.target).toEqual({ id: 'myteam/ai-sdlc', version: 1, name: 'AI-Native SDLC (우리 팀)' });
+    expect(copy.items.find((item) => item.kind === 'template')?.target).toEqual({ id: 'myteam/ai-sdlc', version: 2, name: 'AI-Native SDLC (우리 팀)' });
     expect(copy.saves).toHaveLength(1);
     const definition = copy.saves[0]?.definition as TemplateDefinition;
-    expect(definition).toMatchObject({ kind: 'template', id: 'myteam/ai-sdlc', version: 1, name: 'AI-Native SDLC (우리 팀)', content: { id: 'myteam/ai-sdlc', version: 1, name: 'AI-Native SDLC (우리 팀)' } });
+    expect(definition).toMatchObject({ kind: 'template', id: 'myteam/ai-sdlc', version: 2, name: 'AI-Native SDLC (우리 팀)', content: { id: 'myteam/ai-sdlc', version: 2, name: 'AI-Native SDLC (우리 팀)' } });
     expect(definition.checksum).toBeUndefined();
     await save(definition);
     const { result: project } = await h.ok('project.create', { name: 'sample' });
     const ticket = await h.ok('ticket.create', { projectId: (project as { projectId: string }).projectId, title: 'Copy', template: { id: 'myteam/ai-sdlc' } });
     expect(ticket.ok).toBe(true);
     // Imported again, the copy is already there too.
-    expect((await preview(text, { 'template:vuyro/ai-sdlc@1': { action: 'newId', id: 'myteam/ai-sdlc' } })).items.find((item) => item.kind === 'template')?.problems).toEqual([
+    expect((await preview(text, { 'template:vuyro/ai-sdlc@2': { action: 'newId', id: 'myteam/ai-sdlc' } })).items.find((item) => item.kind === 'template')?.problems).toEqual([
       'myteam/ai-sdlc은(는) 이미 있는 id입니다. 다른 id를 적거나 덮어쓰기(새 버전)를 고르세요.',
     ]);
   });

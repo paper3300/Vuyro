@@ -48,6 +48,16 @@ describe('IPC from the page', () => {
     }
   });
 
+  it('the page never sends a project folder path: only the folder dialog sets it (D-072)', () => {
+    const configure = (payload: Record<string, unknown>) => checkRendererRequest({ method: 'command.execute', params: { requestId: 'ui-1', type: 'project.configure', payload } });
+    for (const root of ['C:\\Windows', 'D:\\anything', '/etc', null, { token: 'vpf_x' }]) {
+      expect(configure({ projectId: 'p1', root }), JSON.stringify(root)).toMatchObject({ ok: false, error: { code: 'bridge_refused', message: 'the window sets the project folder through the folder dialog only' } });
+    }
+    // The rest of the project's settings is the page's to change, like the CLI's `--settings`.
+    expect(configure({ projectId: 'p1', settings: { workspaceMode: 'worktree' } })).toMatchObject({ ok: true });
+    expect(checkRendererRequest({ method: 'command.execute', params: { requestId: 'ui-1', type: 'project.create', payload: { name: 'sample' } } })).toMatchObject({ ok: true });
+  });
+
   it('refuses malformed requests and run tokens from the page', () => {
     expect(checkRendererRequest(null)).toMatchObject({ ok: false });
     expect(checkRendererRequest([])).toMatchObject({ ok: false });

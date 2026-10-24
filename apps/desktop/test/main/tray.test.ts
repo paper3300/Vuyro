@@ -33,6 +33,9 @@ function deps(options: { running: number | undefined; access: ConnectionState['a
       return Promise.resolve(options.running);
     },
     access: () => options.access,
+    beginQuit: () => {
+      calls.push('beginQuit');
+    },
     confirm: ({ message }) => {
       calls.push('confirm');
       questions.push(message);
@@ -58,12 +61,13 @@ describe('quitting for good', () => {
   it('nothing running: stops the engine and quits without asking', async () => {
     const { quit, calls } = deps({ running: 0, access: 'write' });
     expect(await quitForGood(quit)).toBe('quit-with-engine');
-    expect(calls).toEqual(['running', 'shutdown', 'exit']);
+    expect(calls).toEqual(['running', 'beginQuit', 'shutdown', 'exit']);
   });
 
   it('work running: asks first; "취소" leaves everything running', async () => {
     const { quit, calls, questions } = deps({ running: 2, access: 'write', answer: false });
     expect(await quitForGood(quit)).toBe('cancelled');
+    // Not quitting: the connection keeps reconnecting and restarting the engine as before.
     expect(calls).toEqual(['running', 'confirm']);
     expect(questions).toEqual(['실행 중인 작업 2개가 있습니다. 완전히 종료할까요?']);
   });
@@ -71,13 +75,13 @@ describe('quitting for good', () => {
   it('work running and confirmed: stops the engine, then quits', async () => {
     const { quit, calls } = deps({ running: 1, access: 'write', answer: true });
     expect(await quitForGood(quit)).toBe('quit-with-engine');
-    expect(calls).toEqual(['running', 'confirm', 'shutdown', 'exit']);
+    expect(calls).toEqual(['running', 'confirm', 'beginQuit', 'shutdown', 'exit']);
   });
 
   it('a read-only app cannot stop an engine started elsewhere: it says so and quits alone', async () => {
     const { quit, calls, notices } = deps({ running: 0, access: 'read-only' });
     expect(await quitForGood(quit)).toBe('quit-engine-kept');
-    expect(calls).toEqual(['running', 'notify', 'exit']);
+    expect(calls).toEqual(['running', 'beginQuit', 'notify', 'exit']);
     expect(notices).toEqual(['엔진은 계속 실행됩니다.']);
   });
 
@@ -89,17 +93,17 @@ describe('quitting for good', () => {
     // Confirmed: a writing app still stops the engine.
     const confirmed = deps({ running: undefined, access: 'write', answer: true });
     expect(await quitForGood(confirmed.quit)).toBe('quit-with-engine');
-    expect(confirmed.calls).toEqual(['running', 'confirm', 'shutdown', 'exit']);
+    expect(confirmed.calls).toEqual(['running', 'confirm', 'beginQuit', 'shutdown', 'exit']);
     // No engine at all: confirmed, only the app quits.
     const offline = deps({ running: undefined, access: 'none', answer: true });
     expect(await quitForGood(offline.quit)).toBe('quit-engine-kept');
-    expect(offline.calls).toEqual(['running', 'confirm', 'exit']);
+    expect(offline.calls).toEqual(['running', 'confirm', 'beginQuit', 'exit']);
   });
 
   it('when the engine refuses to stop, the person is told and the app still quits', async () => {
     const { quit, calls, notices } = deps({ running: 0, access: 'write', shutdown: { ok: false, error: { code: 'forbidden', message: 'only the human', retryable: false } } });
     expect(await quitForGood(quit)).toBe('quit-engine-kept');
-    expect(calls).toEqual(['running', 'shutdown', 'notify', 'exit']);
+    expect(calls).toEqual(['running', 'beginQuit', 'shutdown', 'notify', 'exit']);
     expect(notices).toEqual(['엔진을 멈추지 못했습니다.']);
   });
 });

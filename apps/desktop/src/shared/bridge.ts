@@ -28,6 +28,10 @@ export const BRIDGE_CHANNELS = {
   saveFile: 'vuyro:save-file',
   /** invoke: `{text}` onto the clipboard. → BridgeResult<null>. */
   copyText: 'vuyro:copy-text',
+  /** invoke: the person picks the project folder in a system dialog; main checks it. → BridgeResult<PickedFolder | null>. */
+  pickFolder: 'vuyro:pick-folder',
+  /** invoke: `{projectId, token, settings?}`; main sends `project.configure` with the granted folder. → BridgeResult (command.execute). */
+  setProjectFolder: 'vuyro:set-project-folder',
 } as const;
 
 /**
@@ -104,6 +108,18 @@ export interface SavedFile {
   readonly name: string;
 }
 
+/**
+ * A folder the person picked for a project. The page shows `path` but cannot send a path back: saving takes the
+ * one-time `token` (D-072).
+ */
+export interface PickedFolder {
+  readonly token: string;
+  readonly path: string;
+  readonly name: string;
+  /** The folder is a git repository's own folder (worktree mode needs one). */
+  readonly isGitRepo: boolean;
+}
+
 /** `window.vuyro`. */
 export interface VuyroBridge {
   request(method: RendererMethod, params?: unknown): Promise<BridgeResult<unknown>>;
@@ -118,4 +134,8 @@ export interface VuyroBridge {
   /** Opens a system save dialog with `name` suggested and writes `text` there; null when the person cancels. */
   saveJsonFile(name: string, text: string): Promise<BridgeResult<SavedFile | null>>;
   copyText(text: string): Promise<BridgeResult<null>>;
+  /** Opens a system dialog for the project folder; null when the person cancels. */
+  pickProjectFolder(): Promise<BridgeResult<PickedFolder | null>>;
+  /** Makes the picked folder the project's folder (and sets the project's settings layer when given). */
+  setProjectFolder(projectId: string, token: string, settings?: Record<string, unknown>): Promise<BridgeResult<unknown>>;
 }

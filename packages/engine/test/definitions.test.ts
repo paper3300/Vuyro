@@ -62,9 +62,10 @@ describe('definition files', () => {
       'nodeType:vuyro.script:active',
       'nodeType:vuyro.shared-request:active',
       'template:vuyro/ai-sdlc:active',
+      'template:vuyro/ai-sdlc:active',
     ]);
     const template = await builtinTemplate();
-    const file = definitionPath(h.registry.root, 'template', 'vuyro/ai-sdlc', 1);
+    const file = definitionPath(h.registry.root, 'template', 'vuyro/ai-sdlc', template.version);
     expect(definitionHash(JSON.parse(readFileSync(file, 'utf8')) as DefinitionEnvelope)).toBe(definitionHash(template));
     const before = await h.store.lastSequence();
     const again = await h.writer.save(template, SYSTEM, nextRequestId());

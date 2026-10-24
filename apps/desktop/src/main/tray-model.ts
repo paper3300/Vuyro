@@ -33,6 +33,8 @@ export interface QuitDeps {
   /** A fresh count of running agents and scripts; undefined when the engine cannot be asked. */
   running(): Promise<number | undefined>;
   access(): ConnectionState['access'];
+  /** The person chose to quit: the connection must not reconnect or start an engine from here on. */
+  beginQuit(): void;
   /** Shows the person the question; true = quit. */
   confirm(question: { readonly message: string; readonly detail: string }): Promise<boolean>;
   /** Tells the person something (no answer needed). */
@@ -58,6 +60,8 @@ export async function quitForGood(deps: QuitDeps): Promise<QuitOutcome> {
     });
     if (!ok) return 'cancelled';
   }
+  // Before anything can drop the link (the engine closes it as it stops): no reconnect, no new engine.
+  deps.beginQuit();
   if (deps.access() !== 'write') {
     if (running !== undefined) {
       await deps.notify({
