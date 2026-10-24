@@ -717,6 +717,29 @@ export const EVENT_CATALOG = {
       strict,
     ),
   },
+  /**
+   * A worktree the engine would have removed has changes nobody committed (a person's edits while the ticket waited,
+   * or an execution cut off before the engine's commit). It stays on disk until they are committed or discarded;
+   * removing it would lose them ([[결정 대기]] D-041). Recorded again only when the list of files changes.
+   */
+  'worktree.kept': {
+    aggregateType: 'workspace',
+    version: 1,
+    schema: Type.Object(
+      {
+        projectId: IdSchema,
+        ticketId: IdSchema,
+        key: Type.String({ minLength: 1, maxLength: 230 }),
+        /** Why it would have gone (as on `worktree.removed`). */
+        removal: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone')]),
+        reason: Type.Literal('uncommitted'),
+        /** Changed and untracked files (git status), at most the first 1000. */
+        files: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 1000 }),
+        count: Type.Integer({ minimum: 1 }),
+      },
+      strict,
+    ),
+  },
   'permission.rulesChanged': {
     aggregateType: 'permissions',
     version: 1,

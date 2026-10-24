@@ -23,9 +23,11 @@ export interface LedgerState {
   /** Overlap warnings already recorded (`<path key>\u0000<space>\u0000<space>`). */
   readonly warned: Readonly<Record<string, true>>;
   readonly worktrees: Readonly<Record<string, Worktree>>;
+  /** Worktrees kept instead of removed because of uncommitted changes (key → the files, as recorded). */
+  readonly kept: Readonly<Record<string, readonly string[]>>;
 }
 
-export const EMPTY_LEDGER: LedgerState = { entries: {}, known: {}, changed: {}, warned: {}, worktrees: {} };
+export const EMPTY_LEDGER: LedgerState = { entries: {}, known: {}, changed: {}, warned: {}, worktrees: {}, kept: {} };
 
 function without<T>(record: Readonly<Record<string, T>>, ids: readonly string[]): Record<string, T> {
   const gone = new Set(ids);
@@ -87,12 +89,15 @@ export function evolveLedger(state: LedgerState, event: NewEvent | DomainEvent):
       return { ...state, warned: { ...state.warned, [warnKey(event.data.path, a, b)]: true } };
     }
     case 'worktree.created':
-      return { ...state, worktrees: { ...state.worktrees, [event.data.worktree.key]: event.data.worktree } };
+      return { ...state, worktrees: { ...state.worktrees, [event.data.worktree.key]: event.data.worktree }, kept: without(state.kept, [event.data.worktree.key]) };
+    case 'worktree.kept':
+      return { ...state, kept: { ...state.kept, [event.data.key]: event.data.files } };
     case 'worktree.removed': {
       const space = `wt:${event.data.key}`;
       return {
         ...state,
         worktrees: without(state.worktrees, [event.data.key]),
+        kept: without(state.kept, [event.data.key]),
         known: without(state.known, [space]),
         changed: without(state.changed, [space]),
       };

@@ -332,6 +332,18 @@ export const COMMAND_CATALOG = {
         },
         strict,
       ),
+      Type.Object(
+        {
+          projectId: IdSchema,
+          op: Type.Literal('worktreeKept'),
+          ticketId: IdSchema,
+          key: Type.String({ minLength: 1, maxLength: 230 }),
+          removal: Type.Union([Type.Literal('merged'), Type.Literal('ticketDone')]),
+          files: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 1000 }),
+          count: Type.Integer({ minimum: 1 }),
+        },
+        strict,
+      ),
     ]),
     result: Empty,
   },

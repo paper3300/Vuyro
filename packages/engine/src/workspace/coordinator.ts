@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { codexHome, codexUserHooks } from '@vuyro/agent-adapters';
 import {
   type AgentProvider,
   type CommandResponse,
@@ -71,6 +72,8 @@ export interface WorkspaceCoordinatorOptions {
   readonly watchDebounceMs?: number;
   /** Runs an agent that resolves merge conflicts (`onMergeConflict: agent`); resolves true when it ended normally. */
   readonly resolveConflicts?: (request: MergeAgentRequest) => Promise<boolean>;
+  /** The user's Codex folder (its `hooks.json` turns the checkout hook off for Codex). Default `CODEX_HOME`, else `~/.codex`. */
+  readonly codexHome?: string;
   readonly reportError: (error: Error, context: string) => void;
 }
 
@@ -99,7 +102,7 @@ function requestId(step: string, ...parts: (string | number)[]): string {
   return `ws-${step}-${createHash('sha256').update(parts.join('\u0000')).digest('hex').slice(0, 40)}`;
 }
 
-/** Codex runs a repository's own hooks too when the hook trust check is bypassed (D-031): not with those present. */
+/** Codex runs a repository's own hooks too when the hook trust check is bypassed (D-031): not with those present. The user's are checked in `codexUserHooks`. */
 export function codexProjectHooks(root: string): boolean {
   if (existsSync(join(root, '.codex', 'hooks.json'))) return true;
   const config = join(root, '.codex', 'config.toml');
@@ -206,6 +209,10 @@ export class WorkspaceCoordinator {
     if (checkoutHook && target.provider === 'codex' && location.root !== undefined && codexProjectHooks(location.root)) {
       checkoutHook = false;
       warnings.push('the automatic checkout hook is off for this Codex run: the workspace has its own Codex hooks, which bypassing the hook trust check would run unchecked (changes are still found afterwards)');
+    } else if (checkoutHook && target.provider === 'codex' && codexUserHooks(this.options.codexHome ?? codexHome())) {
+      // Codex loads the user's hooks.json even when the run ignores the user's config (D-031).
+      checkoutHook = false;
+      warnings.push('the automatic checkout hook is off for this Codex run: the user has Codex hooks of their own (hooks.json), which bypassing the hook trust check would run unchecked (changes are still found afterwards)');
     }
     return { location, ...(location.root === undefined ? {} : { cwd: location.root }), checkoutHook, notes, warnings };
   }
@@ -801,7 +808,8 @@ export class WorkspaceCoordinator {
     if (retain.length > 0) await this.record({ projectId, op: 'retain', ids: retain }, ...retain);
     for (const pause of pauses.values()) await this.record({ projectId, op: 'pause', holder: pause.holder, hashes: pause.hashes }, holderKey(pause.holder), JSON.stringify(pause.hashes));
     this.scheduleExpiry(projectId, nextExpiry);
-    if (reason === 'recovery' || Object.keys(ledger.worktrees).some((key) => this.cleanup.has(ledger.worktrees[key]?.ticketId ?? ''))) {
+    // Kept worktrees (uncommitted changes) are looked at again on every pass: once someone commits or discards, they go.
+    if (reason === 'recovery' || Object.keys(ledger.kept).length > 0 || Object.keys(ledger.worktrees).some((key) => this.cleanup.has(ledger.worktrees[key]?.ticketId ?? ''))) {
       await this.exclusive(projectId, () => this.cleanWorktrees(projectId, reason === 'recovery'));
       for (const worktree of Object.values(ledger.worktrees)) this.cleanup.delete(worktree.ticketId);
     }
@@ -870,12 +878,16 @@ export class WorkspaceCoordinator {
     }
   }
 
-  /** Worktrees of completed tickets, and lane worktrees whose branch is merged into the ticket branch, are removed. */
+  /**
+   * Worktrees of completed tickets, and lane worktrees whose branch is merged into the ticket branch, are removed,
+   * unless they hold changes nobody committed: those stay, recorded as `worktree.kept`, and are looked at again on
+   * every later clean-up pass and at engine start (D-041). Removing them would lose a person's work.
+   */
   private async cleanWorktrees(projectId: string, all = false): Promise<void> {
     const ledger = await this.ledger(projectId);
     const git = this.options.git;
     for (const worktree of Object.values(ledger.worktrees)) {
-      if (!all && !this.cleanup.has(worktree.ticketId)) continue;
+      if (!all && !this.cleanup.has(worktree.ticketId) && !Object.hasOwn(ledger.kept, worktree.key)) continue;
       const state = await this.ticket(worktree.ticketId);
       const repo = state.workspace?.root;
       if (repo === undefined) continue;
@@ -889,11 +901,14 @@ export class WorkspaceCoordinator {
           const merged = head !== undefined && (await git.revParse(repo, `refs/heads/${ticketBranch}`)) !== undefined && (await git.isAncestor(repo, head, `refs/heads/${ticketBranch}`));
           // A failed lane keeps its worktree for a look until its ticket completes; a merged one goes now.
           if (busy || (!ticketDone && !merged) || (!ticketDone && lane?.status === 'failed')) continue;
+          const removal = merged && !ticketDone ? 'merged' : 'ticketDone';
+          if (await this.keepUncommitted(projectId, worktree, removal)) continue;
           if (existsSync(worktree.path)) await git.removeWorktree(repo, worktree.path);
           if (merged) await git.deleteBranch(repo, worktree.branch);
-          await this.record({ projectId, op: 'worktreeRemoved', ticketId: worktree.ticketId, key: worktree.key, reason: merged && !ticketDone ? 'merged' : 'ticketDone', branchDeleted: merged }, worktree.key, worktree.base);
+          await this.record({ projectId, op: 'worktreeRemoved', ticketId: worktree.ticketId, key: worktree.key, reason: removal, branchDeleted: merged }, worktree.key, worktree.base);
         } else if (ticketDone) {
           // The ticket branch stays: it is the ticket's result.
+          if (await this.keepUncommitted(projectId, worktree, 'ticketDone')) continue;
           if (existsSync(worktree.path)) await git.removeWorktree(repo, worktree.path);
           await this.record({ projectId, op: 'worktreeRemoved', ticketId: worktree.ticketId, key: worktree.key, reason: 'ticketDone', branchDeleted: false }, worktree.key, worktree.base);
         }
@@ -901,6 +916,29 @@ export class WorkspaceCoordinator {
         this.options.reportError(error instanceof Error ? error : new Error(String(error)), `removing worktree ${worktree.path}`);
       }
     }
+  }
+
+  /**
+   * Whether a worktree has changed or untracked files (git status; ignored files such as build output do not count).
+   * If so it is kept and recorded. A worktree whose status cannot be read is kept too (fail closed).
+   */
+  private async keepUncommitted(projectId: string, worktree: { ticketId: string; key: string; path: string }, removal: 'merged' | 'ticketDone'): Promise<boolean> {
+    if (!existsSync(worktree.path)) return false;
+    let files: string[];
+    try {
+      files = (await this.options.git.status(worktree.path)).map((entry) => entry.path);
+    } catch (error) {
+      this.options.reportError(error instanceof Error ? error : new Error(String(error)), `reading git status of ${worktree.path} before removing it (kept)`);
+      return true;
+    }
+    if (files.length === 0) return false;
+    const listed = [...new Set(files)].sort();
+    await this.record(
+      { projectId, op: 'worktreeKept', ticketId: worktree.ticketId, key: worktree.key, removal, files: listed.slice(0, 1000), count: listed.length },
+      worktree.key,
+      JSON.stringify(listed.slice(0, 1000)),
+    );
+    return true;
   }
 
   /**

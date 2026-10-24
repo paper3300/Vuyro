@@ -2,11 +2,12 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { workspaceAggregateId } from '@vuyro/contracts';
+import { EngineQueries } from '../src/daemon/queries.ts';
 import type { ScriptedSession } from '../src/workflow/scripted-agent.ts';
 import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
 import { laneWorktree, ticketWorktree } from '../src/workspace/layout.ts';
 import { openWorkflowHarness, type WorkflowHarness } from './helpers/workflow-harness.ts';
-import { edge, git, projectAt, save, template, ticketIn } from './helpers/workspace-fixtures.ts';
+import { edge, editorType, expectOk, git, gitRepo, MINUTE, projectAt, save, template, ticketIn } from './helpers/workspace-fixtures.ts';
 import { CLEAN, type ParallelTicket, startParallel } from './helpers/worktree-fixtures.ts';
 
 /**
@@ -76,6 +77,104 @@ describe('worktree mode', { timeout: 120_000 }, () => {
     // The person's own branch and working folder were not touched.
     expect(git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main');
     expect(git(repo, 'status', '--porcelain')).toBe('');
+  });
+
+  it('keeps a worktree with uncommitted changes instead of removing it, until they are committed or discarded (D-041)', async () => {
+    t = await startParallel({ settings: { workspaceMode: 'worktree', worktreeScope: 'nodeRun' }, dev: CLEAN });
+    const { h, ticketId, projectId } = t;
+    await h.drive();
+    expect(await h.status(ticketId, 'qa')).toBe('review');
+    const ticketTree = ticketWorktree(h.workspaces.layout.worktreeRoot, ticketId);
+    // While QA waits for a person, someone adds a file in the ticket's worktree and changes a committed one.
+    writeFileSync(join(ticketTree.path, 'notes.txt'), 'my notes\n');
+    writeFileSync(join(ticketTree.path, 'lane-1.txt'), 'edited by hand\n');
+
+    await h.ok('node.approve', { ticketId, nodeId: 'qa' });
+    await h.drive();
+    expect((await h.ticket(ticketId)).status).toBe('done');
+    // Nothing is lost: the worktree is still there with both changes, and the ledger says why.
+    expect(readFileSync(join(ticketTree.path, 'notes.txt'), 'utf8')).toBe('my notes\n');
+    expect(readFileSync(join(ticketTree.path, 'lane-1.txt'), 'utf8')).toBe('edited by hand\n');
+    const kinds = async () => (await h.store.readAggregate(workspaceAggregateId(projectId))).filter((event) => event.type === 'worktree.kept' || event.type === 'worktree.removed');
+    expect((await kinds()).map((event) => [event.type, event.data])).toEqual([
+      ['worktree.removed', expect.objectContaining({ reason: 'merged' }) as unknown],
+      ['worktree.removed', expect.objectContaining({ reason: 'merged' }) as unknown],
+      ['worktree.kept', { projectId, ticketId, key: ticketTree.key, removal: 'ticketDone', reason: 'uncommitted', files: ['lane-1.txt', 'notes.txt'], count: 2 }],
+    ]);
+    const shown = await new EngineQueries({ store: h.store, definitions: h.registry, clock: h.clock }).workspace(projectId, { changes: 'flagged', limit: 100 });
+    expect(shown.worktrees.find((row) => row.key === ticketTree.key)).toMatchObject({ removedAt: null, keptFiles: ['lane-1.txt', 'notes.txt'], keptCount: 2 });
+
+    // Looked at again (engine start), unchanged: still kept, recorded once.
+    await h.restart();
+    await h.drive();
+    expect(existsSync(join(ticketTree.path, 'notes.txt'))).toBe(true);
+    expect((await kinds()).filter((event) => event.type === 'worktree.kept')).toHaveLength(1);
+
+    // Once the person committed their work (or threw it away), the worktree goes; the branch keeps what was committed.
+    git(ticketTree.path, 'add', '--all');
+    git(ticketTree.path, '-c', 'user.name=Person', '-c', 'user.email=person@localhost', 'commit', '--quiet', '-m', 'notes');
+    await h.restart();
+    await h.drive();
+    expect(existsSync(ticketTree.path)).toBe(false);
+    expect((await kinds()).at(-1)?.type).toBe('worktree.removed');
+    expect(git(t.repo, 'show', `${ticketTree.branch}:notes.txt`)).toBe('my notes');
+  });
+
+  it("a merging join takes its node type's claims: it waits for a claim and merges once the paths are free", async () => {
+    h = await openWorkflowHarness({
+      behavior: async (s) => {
+        const { ticketId, nodeId, lane, cwd } = s.request;
+        if (nodeId === 'plan') {
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', items: [{ data: {} }, { data: {} }] }));
+        } else if (nodeId === 'dev') {
+          await s.sleep(MINUTE);
+          writeFileSync(join(cwd ?? '', `lane-${lane}.txt`), `work of lane ${lane}\n`);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: {} }));
+        } else {
+          // `side` works in the ticket's worktree and holds src/** for half an hour.
+          await s.sleep(30 * MINUTE);
+          expectOk(await s.vuyro('node.done', { ticketId, nodeId, port: 'done', data: {} }));
+        }
+        return undefined;
+      },
+    });
+    const repo = gitRepo(join(h.dir, 'repo'));
+    await save(h, editorType('test.side', [{ path: 'src/**', mode: 'exclusive' }]));
+    await save(h, {
+      vuyro: 'export',
+      formatVersion: 1,
+      kind: 'nodeType',
+      id: 'test.mjoin',
+      version: 1,
+      name: 'test.mjoin',
+      content: { type: 'test.mjoin', version: 1, label: 'Join', completion: 'join', inputs: [{ name: 'in', label: 'In' }], outputs: [{ name: 'done', label: 'Done' }], params: [], claims: [{ path: 'src/**', mode: 'exclusive' }] },
+    });
+    await save(
+      h,
+      template(
+        'myteam/claimjoin',
+        [
+          { id: 'plan', type: 'vuyro.agent', version: 1, params: { instructions: 'plan' } },
+          { id: 'dev', type: 'vuyro.agent', version: 1, params: { instructions: 'dev' }, ports: { in: { mode: 'each' } } },
+          { id: 'side', type: 'test.side', version: 1 },
+          { id: 'mjoin', type: 'test.mjoin', version: 1 },
+          { id: 'end', type: 'vuyro.end', version: 1 },
+        ],
+        [edge('plan', 'done', 'dev'), edge('plan', 'done', 'side'), edge('dev', 'done', 'mjoin'), edge('mjoin', 'done', 'end'), edge('side', 'done', 'end')],
+        { workspaceMode: 'worktree', worktreeScope: 'nodeRun' },
+      ),
+    );
+    const projectId = await projectAt(h, repo);
+    const ticketId = await ticketIn(h, projectId, 'myteam/claimjoin');
+    await h.drive();
+    expect((await h.ticket(ticketId)).status).toBe('done');
+    const events = (await h.store.readAggregate(ticketId)).filter((event) => (event.data as { nodeId?: string }).nodeId === 'mjoin').map((event) => event.type);
+    // Blocked by side's claim first (no start), then started as the merge step once side ended.
+    expect(events).toEqual(['node.activated', 'node.paused', 'node.resumed', 'node.started', 'node.completed']);
+    const blocked = (await h.store.readAggregate(workspaceAggregateId(projectId))).filter((event) => event.type === 'checkout.blocked');
+    expect(blocked.map((event) => (event.data as { requester: { nodeId: string } }).requester.nodeId)).toEqual(['mjoin']);
+    const ticketTree = ticketWorktree(h.workspaces.layout.worktreeRoot, ticketId);
+    expect(git(repo, 'show', `${ticketTree.branch}:lane-2.txt`)).toBe('work of lane 2');
   });
 
   it('a lane sent back by QA works again in a worktree that starts from the merged branch', async () => {

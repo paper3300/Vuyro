@@ -62,6 +62,8 @@ export interface WorkflowEngineOptions {
   readonly git?: GitClient;
   /** Watches spaces while executions run (candidates for change detection). Default none: scans at start and finish. */
   readonly watcher?: FileWatcher;
+  /** The user's Codex folder, read for the checkout hook's safety check. Default `CODEX_HOME`, else `~/.codex`. */
+  readonly codexHome?: string;
   readonly reportError?: (error: Error, context: string) => void;
 }
 
@@ -146,6 +148,7 @@ export class WorkflowEngine {
       git: options.git ?? new GitClient(),
       activity: this.activity,
       ...(options.watcher === undefined ? {} : { watcher: options.watcher }),
+      ...(options.codexHome === undefined ? {} : { codexHome: options.codexHome }),
       resolveConflicts: (request) => this.resolveConflicts(request),
       reportError: (error, context) => {
         this.report(error, context);
@@ -447,8 +450,9 @@ export class WorkflowEngine {
     const attempt = resume ? exec.attempts : exec.attempts + 1;
     const fields = { ticketId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt };
     if (!resume) {
-      const started = await this.command('start', 'node.start', fields, ticketId, node.id, exec.lane, exec.run, attempt);
-      if (!started.ok) return;
+      // The revision is part of the id: a merge that waited for a claim starts again with the same run and attempt.
+      const started = await this.command('start', 'node.start', fields, ticketId, node.id, exec.lane, exec.run, attempt, live.revision);
+      if (!started.ok || (started.result as { blocked?: string }).blocked !== undefined) return;
     }
     // The merge tracks its own git work; an agent resolving conflicts may wait on the clock in between.
     endSpan();

@@ -602,6 +602,17 @@ export const workspaceRecord: CommandHandler<'workspace.record', LedgerState> = 
           events.push({ type: 'worktree.created', data: { projectId, worktree: payload.worktree } });
         }
         break;
+      case 'worktreeKept': {
+        // Once per list of files: the clean-up checks again on every pass.
+        const known = ledger.kept[payload.key];
+        if (Object.hasOwn(ledger.worktrees, payload.key) && (known === undefined || known.join('\u0000') !== payload.files.join('\u0000'))) {
+          events.push({
+            type: 'worktree.kept',
+            data: { projectId, ticketId: payload.ticketId, key: payload.key, removal: payload.removal, reason: 'uncommitted', files: payload.files, count: payload.count },
+          });
+        }
+        break;
+      }
       case 'worktreeRemoved':
         if (Object.hasOwn(ledger.worktrees, payload.key)) {
           events.push({ type: 'worktree.removed', data: { projectId, ticketId: payload.ticketId, key: payload.key, reason: payload.reason, branchDeleted: payload.branchDeleted } });

@@ -3,6 +3,7 @@ import { ClaudeStreamNormalizer, claudeArgs } from './claude.ts';
 import type { Clock, TimerHandle } from './clock.ts';
 import { CodexStreamNormalizer, codexArgs } from './codex.ts';
 import { AGENT_ENV } from './agent-env.ts';
+import { codexHome, codexUserHooks, codexWindowsSandbox } from './codex-home.ts';
 import { claudeHookArgs, codexHookArgs, type HookCli, hookCommandLine } from './hooks.ts';
 import { agentEnvironment, resolveExecutable } from './environment.ts';
 import type { AgentAdapter, AgentRunHandle, AgentStartRequest } from './index.ts';
@@ -38,6 +39,8 @@ export interface CliAgentAdapterOptions {
   readonly vuyroMcp?: { readonly command: string; readonly args: readonly string[] };
   /** How to run the `vuyro` CLI for the automatic checkout hook (`vuyro hook pretooluse`). Absent = no hook can be installed. */
   readonly vuyroHook?: HookCli;
+  /** The user's Codex folder, read for the hook's safety checks. Default `CODEX_HOME` of `baseEnv`, else `~/.codex`. */
+  readonly codexHome?: string;
 }
 
 /** `-c` overrides that register `vuyro mcp` with Codex and forward the run variables to it. */
@@ -126,11 +129,14 @@ export class CliAgentAdapter implements AgentAdapter {
     const { clock, runner } = this.options;
     const env = agentEnvironment(this.options.baseEnv ?? process.env, request.env);
     const command = (this.options.resolve ?? resolveExecutable)(this.options.command ?? this.spec.command, env);
-    const hook = request.checkoutHook === true && this.options.vuyroHook !== undefined ? hookCommandLine(this.options.vuyroHook, this.provider) : undefined;
+    const home = this.provider === 'codex' ? (this.options.codexHome ?? codexHome(this.options.baseEnv ?? process.env)) : undefined;
+    // Fail closed: the hook trust bypass would run the user's own Codex hooks unchecked (the engine checks this too).
+    const userHooks = request.checkoutHook === true && home !== undefined && codexUserHooks(home);
+    const hook = request.checkoutHook === true && this.options.vuyroHook !== undefined && !userHooks ? hookCommandLine(this.options.vuyroHook, this.provider) : undefined;
     const extraArgs = [
       ...(this.options.extraArgs ?? this.spec.extraArgs),
       ...(this.provider === 'codex' && this.options.vuyroMcp !== undefined ? codexMcpArgs(this.options.vuyroMcp) : []),
-      ...(hook === undefined ? [] : this.provider === 'claude' ? claudeHookArgs(hook) : codexHookArgs(hook)),
+      ...(hook === undefined ? [] : this.provider === 'claude' ? claudeHookArgs(hook) : codexHookArgs(hook, { windowsSandbox: codexWindowsSandbox(home ?? '') })),
     ];
     const args = [...(this.options.prefixArgs ?? []), ...this.spec.args(request, extraArgs)];
     const normalizer = this.spec.normalizer(request);
@@ -141,7 +147,10 @@ export class CliAgentAdapter implements AgentAdapter {
     const observations = new AsyncQueue<RunObservation>();
     if (request.checkoutHook === true && hook === undefined) {
       // Changes are still found afterwards; the run says why nothing blocked edits up front.
-      observations.push({ kind: 'warning', message: 'the automatic checkout hook was asked for, but the engine has no vuyro CLI to run it', source: 'vuyro.adapter', observedAt: clock.now() });
+      const message = userHooks
+        ? 'the automatic checkout hook is off for this Codex run: the user has Codex hooks of their own (hooks.json), which bypassing the hook trust check would run unchecked'
+        : 'the automatic checkout hook was asked for, but the engine has no vuyro CLI to run it';
+      observations.push({ kind: 'warning', message, source: 'vuyro.adapter', observedAt: clock.now() });
     }
     const flags = { cancelled: false, timedOut: false, lingered: false };
     const timers: TimerHandle[] = [];

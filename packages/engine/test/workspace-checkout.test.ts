@@ -1,4 +1,5 @@
 import { mkdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { type DomainEvent, workspaceAggregateId } from '@vuyro/contracts';
@@ -460,6 +461,37 @@ describe('checkouts before edits and changes found afterwards', () => {
     expect(codex?.started.map((request) => request.checkoutHook)).toEqual([true, undefined]);
     const warnings = await h.store.query<{ message: string }>("SELECT json_extract(data, '$.message') AS message FROM events WHERE type = 'run.warningRecorded'");
     expect(warnings.map((row) => row.message)).toEqual([expect.stringContaining('the workspace has its own Codex hooks')]);
+  });
+
+  it("leaves the hook out of a Codex run when the user's Codex folder has hooks.json (loaded even with --ignore-user-config)", async () => {
+    let codex: ScriptedAgentAdapter | undefined;
+    const home = join(tmpdir(), `vuyro-codex-home-${process.pid}-${Date.now()}`);
+    mkdirSync(home);
+    try {
+      h = await openWorkflowHarness({
+        codexHome: home,
+        adapters: ({ clock, bus }) => {
+          codex = new ScriptedAgentAdapter({ provider: 'codex', clock, bus, behavior: (s) => done(s).then(() => undefined) });
+          return { codex };
+        },
+      });
+      repo = gitRepo(join(h.dir, 'repo'));
+      await save(
+        h,
+        template('myteam/codex', [{ id: 'a', type: 'vuyro.agent', version: 1, params: { instructions: 'a', provider: 'codex' } }, { id: 'end', type: 'vuyro.end', version: 1 }], [edge('a', 'done', 'end')]),
+      );
+      const projectId = await projectAt(h, repo);
+      await ticketIn(h, projectId, 'myteam/codex');
+      await h.drive();
+      writeFileSync(join(home, 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'herdr' }] }] } }));
+      await ticketIn(h, projectId, 'myteam/codex');
+      await h.drive();
+      expect(codex?.started.map((request) => request.checkoutHook)).toEqual([true, undefined]);
+      const warnings = await h.store.query<{ message: string }>("SELECT json_extract(data, '$.message') AS message FROM events WHERE type = 'run.warningRecorded'");
+      expect(warnings.map((row) => row.message)).toEqual([expect.stringContaining('the user has Codex hooks of their own')]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('an agent may not name another lane of its node, and a replaced run may not check out', async () => {

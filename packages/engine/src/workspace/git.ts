@@ -156,9 +156,13 @@ export class GitClient {
     return dir === undefined ? this.revParse(cwd, 'MERGE_HEAD').then((head) => head !== undefined) : Promise.resolve(existsSync(join(dir, 'MERGE_HEAD')));
   }
 
+  /**
+   * Removes a worktree without `--force`: git refuses when it has changed or untracked files, so nothing uncommitted
+   * is ever deleted (the caller checks first and keeps such worktrees, D-041). Ignored files (build output) go with it.
+   */
   async removeWorktree(repo: string, path: string): Promise<void> {
     this.tops.delete(path);
-    await this.run(repo, ['worktree', 'remove', '--force', path]);
+    await this.run(repo, ['worktree', 'remove', path]);
   }
 
   async prune(repo: string): Promise<void> {

@@ -41,15 +41,21 @@ export function claudeHookArgs(commandLine: string): string[] {
 
 /**
  * `hooks.PreToolUse` for Codex (a session override) and the flag without which Codex does not run hooks it has not
- * been told to trust. That flag also runs the repository's own hooks unchecked, so the engine leaves the hook out
- * when the workspace has Codex hooks of its own ([[결정 대기]] D-031).
+ * been told to trust. That flag runs every other enabled hook unchecked too, so the run also ignores the user's
+ * config.toml (its hooks, and the hooks of the plugins it enables, are not loaded; the login stays). The user's
+ * `hooks.json` and the repository's own hooks are loaded even so: the engine leaves the hook out when either exists
+ * ([[결정 대기]] D-031, [[초기 검증 결과]] M4). Without the user's config Codex would treat `workspace-write` as
+ * read-only on Windows, so the user's Windows sandbox setting is carried over.
  */
-export function codexHookArgs(commandLine: string): string[] {
+export function codexHookArgs(commandLine: string, options: { readonly windowsSandbox: string }): string[] {
   // JSON strings are valid TOML basic strings.
   const command = JSON.stringify(commandLine);
   return [
     '-c',
     `hooks.PreToolUse=[{matcher=${JSON.stringify(CODEX_EDIT_TOOLS)}, hooks=[{type="command", command=${command}, commandWindows=${command}, timeout=${HOOK_TIMEOUT_S}}]}]`,
+    '--ignore-user-config',
+    '-c',
+    `windows.sandbox=${JSON.stringify(options.windowsSandbox)}`,
     '--dangerously-bypass-hook-trust',
   ];
 }

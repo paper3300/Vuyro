@@ -590,7 +590,7 @@ const audit: Projector = {
  */
 const workspace: Projector = {
   name: 'workspace',
-  version: 1,
+  version: 2,
   tables: ['p_checkouts', 'p_checkout_blocks', 'p_workspace_changes', 'p_overlap_warnings', 'p_worktrees'],
   ddl: [
     `CREATE TABLE p_checkouts (
@@ -675,6 +675,9 @@ const workspace: Projector = {
       removed_at INTEGER,
       removed_reason TEXT,
       branch_deleted INTEGER,
+      kept_at INTEGER,
+      kept_files TEXT,
+      kept_count INTEGER,
       PRIMARY KEY (project_id, key)
     ) STRICT`,
   ],
@@ -784,7 +787,7 @@ const workspace: Projector = {
                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                   ON CONFLICT (project_id, key) DO UPDATE SET
                     path = excluded.path, branch = excluded.branch, base = excluded.base, created_at = excluded.created_at,
-                    removed_at = NULL, removed_reason = NULL, branch_deleted = NULL`,
+                    removed_at = NULL, removed_reason = NULL, branch_deleted = NULL, kept_at = NULL, kept_files = NULL, kept_count = NULL`,
             params: [
               event.data.projectId,
               worktree.key,
@@ -800,10 +803,17 @@ const workspace: Projector = {
           },
         ];
       }
+      case 'worktree.kept':
+        return [
+          {
+            sql: 'UPDATE p_worktrees SET kept_at = ?, kept_files = ?, kept_count = ? WHERE project_id = ? AND key = ?',
+            params: [event.timestamp, JSON.stringify(event.data.files), event.data.count, event.data.projectId, event.data.key],
+          },
+        ];
       case 'worktree.removed':
         return [
           {
-            sql: 'UPDATE p_worktrees SET removed_at = ?, removed_reason = ?, branch_deleted = ? WHERE project_id = ? AND key = ?',
+            sql: 'UPDATE p_worktrees SET removed_at = ?, removed_reason = ?, branch_deleted = ?, kept_at = NULL, kept_files = NULL, kept_count = NULL WHERE project_id = ? AND key = ?',
             params: [event.timestamp, event.data.reason, event.data.branchDeleted ? 1 : 0, event.data.projectId, event.data.key],
           },
         ];

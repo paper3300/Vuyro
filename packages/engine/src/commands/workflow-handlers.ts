@@ -547,10 +547,6 @@ export const nodeStart: CommandHandler<'node.start', TicketState> = {
     if (node.completion !== 'agent' && node.completion !== 'script' && !merging) return fail('invariant_violated', `node '${node.id}' has no executor (${node.completion})`);
     const fields = { ticketId: ticket.aggregateId, nodeId: node.id, lane: exec.lane, run: exec.run, attempt: payload.attempt };
     const draft = new WorkflowDraft(ticket.aggregateId, ticket.state, workflow);
-    if (merging) {
-      draft.emit({ type: 'node.started', data: { ...fields, executor: 'merge' } });
-      return decided(ticket, draft);
-    }
     // Claims the node type declares are taken together before it starts (§3.7). A conflict decides by policy.
     const claims = claimItems(node.type.spec.claims ?? []);
     if (isFailure(claims)) return claims;
@@ -574,6 +570,11 @@ export const nodeStart: CommandHandler<'node.start', TicketState> = {
       }
       if (decision.ledgerEvents.length > 0) extra.push(ledgerAppend);
       extra.push(...(await preemptionAppends(ctx, decision, ticket.aggregateId)));
+    }
+    if (merging) {
+      // A join's merge step takes its node type's claims like any executor (a custom join may declare some).
+      draft.emit({ type: 'node.started', data: { ...fields, executor: 'merge' } });
+      return { ok: true, appends: [ticketStream(ticket, draft.events), ...extra], result: {} };
     }
     if (node.completion === 'script') {
       draft.emit({ type: 'node.started', data: { ...fields, executor: 'script' } });

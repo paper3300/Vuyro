@@ -36,6 +36,8 @@ export interface WorkflowHarnessOptions {
   /** Git for worktree tests (default: git on PATH). */
   readonly git?: GitClient;
   readonly watcher?: FileWatcher;
+  /** The user's Codex folder the engine checks for hooks. Default: an empty folder name under the harness's temp dir. */
+  readonly codexHome?: string;
 }
 
 export interface WorkflowHarness {
@@ -111,6 +113,8 @@ export async function openWorkflowHarness(options: WorkflowHarnessOptions = {}):
           ...(options.agentEnv === undefined ? {} : { agentEnv: options.agentEnv }),
           ...(options.git === undefined ? {} : { git: options.git }),
           ...(options.watcher === undefined ? {} : { watcher: options.watcher }),
+          // Never the developer's own Codex folder: its hooks.json would turn the Codex checkout hook off.
+          codexHome: options.codexHome ?? join(temp.dir, 'codex-home'),
           workspaces,
         })
       : undefined;

@@ -1,10 +1,16 @@
 import type { RunObservation } from '@vuyro/contracts';
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   agentEnvironment,
   claudeArgs,
   CliAgentAdapter,
   codexArgs,
+  codexHome as codexHome_,
+  codexUserHooks,
+  codexWindowsSandbox,
   ExecutableNotFoundError,
   FakeProcessRunner,
   type FakeScript,
@@ -258,12 +264,20 @@ describe('Codex MCP tool items', () => {
 
 describe('automatic checkout hook (M4)', () => {
   const hookCli = { command: 'C:\\Program Files\\nodejs\\node.exe', args: ['C:\\vuyro\\bin.js'] };
+  // The user's Codex folder: empty unless a test puts hooks or settings in it (never the developer's own).
+  let codexHome = '';
+  beforeEach(() => {
+    codexHome = mkdtempSync(join(tmpdir(), 'vuyro-codex-home-'));
+  });
+  afterEach(() => {
+    rmSync(codexHome, { recursive: true, force: true });
+  });
 
   async function argsFor(provider: 'claude' | 'codex', extra: Partial<AgentStartRequest>, vuyroHook?: typeof hookCli) {
     const clock = new ManualClock();
     const runner = new FakeProcessRunner(clock);
     runner.enqueue({ steps: [{ exit: 0 }] });
-    const options = { runner, clock, resolve: (command: string) => command, baseEnv: {}, ...(vuyroHook === undefined ? {} : { vuyroHook }) };
+    const options = { runner, clock, resolve: (command: string) => command, baseEnv: {}, codexHome, ...(vuyroHook === undefined ? {} : { vuyroHook }) };
     const adapter = provider === 'claude' ? CliAgentAdapter.claude(options) : CliAgentAdapter.codex(options);
     const handle = adapter.start(request({ provider, ...extra }));
     const observations = await drain(handle.observations);
@@ -287,7 +301,41 @@ describe('automatic checkout hook (M4)', () => {
       'hooks.PreToolUse=[{matcher="apply_patch", hooks=[{type="command", command="\\"C:/Program Files/nodejs/node.exe\\" C:/vuyro/bin.js hook pretooluse --provider codex", commandWindows="\\"C:/Program Files/nodejs/node.exe\\" C:/vuyro/bin.js hook pretooluse --provider codex", timeout=60}]}]',
     );
     expect(args).toContain('--dangerously-bypass-hook-trust');
+    // The bypass runs every enabled hook: the user's config.toml (its hooks, its plugins' hooks) is not loaded, and the
+    // Windows sandbox it would have set is carried over (else workspace-write is read-only on Windows).
+    expect(args).toContain('--ignore-user-config');
+    expect(args[args.indexOf('windows.sandbox="unelevated"') - 1]).toBe('-c');
     expect(args.at(-1)).toBe('-');
+  });
+
+  it("Codex: the user's Windows sandbox setting is kept when the run ignores the rest of their config", async () => {
+    writeFileSync(join(codexHome, 'config.toml'), ['model = "x"', '[features]', 'hooks = true', '', '[windows]', 'sandbox = "elevated"', '', '[tui]', 'sandbox = "no"', ''].join('\n'));
+    const { args } = await argsFor('codex', { checkoutHook: true }, hookCli);
+    expect(args).toContain('windows.sandbox="elevated"');
+  });
+
+  it('Codex: no hook (and no trust bypass) when the user has hooks.json, since Codex loads it even with --ignore-user-config', async () => {
+    writeFileSync(join(codexHome, 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'x' }] }] } }));
+    const { args, observations } = await argsFor('codex', { checkoutHook: true }, hookCli);
+    expect(args).not.toContain('--dangerously-bypass-hook-trust');
+    expect(args.join(' ')).not.toContain('hooks.PreToolUse');
+    expect(observations).toContainEqual(expect.objectContaining({ kind: 'warning', message: expect.stringContaining('hooks.json') as unknown }));
+    // Claude is not affected by Codex settings.
+    expect((await argsFor('claude', { checkoutHook: true }, hookCli)).args).toContain('--settings');
+  });
+
+  it("reads the user's Codex folder conservatively", () => {
+    expect(codexUserHooks(codexHome)).toBe(false);
+    writeFileSync(join(codexHome, 'hooks.json'), '{}');
+    expect(codexUserHooks(codexHome)).toBe(false);
+    writeFileSync(join(codexHome, 'hooks.json'), '{"hooks": {"PreToolUse": []}}');
+    expect(codexUserHooks(codexHome)).toBe(false);
+    for (const text of ['{"hooks": {"PreToolUse": [{}]}}', '{"PreToolUse": []}', 'not json', '[]']) {
+      writeFileSync(join(codexHome, 'hooks.json'), text);
+      expect(codexUserHooks(codexHome)).toBe(true);
+    }
+    expect(codexWindowsSandbox(codexHome)).toBe('unelevated');
+    expect(codexHome_({ CODEX_HOME: 'D:\\codex' })).toBe('D:\\codex');
   });
 
   it('no hook unless asked; asked without a CLI to run it, the run says so', async () => {
