@@ -1,10 +1,11 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { workspaceAggregateId } from '@vuyro/contracts';
 import { EngineQueries } from '../src/daemon/queries.ts';
 import type { ScriptedSession } from '../src/workflow/scripted-agent.ts';
 import { currentExecution, nodeProgress } from '../src/workflow/state.ts';
+import { isRepositoryTop } from '../src/workspace/git.ts';
 import { laneWorktree, ticketWorktree } from '../src/workspace/layout.ts';
 import { CLI } from './helpers/engine-harness.ts';
 import { openWorkflowHarness, SYSTEM, type WorkflowHarness } from './helpers/workflow-harness.ts';
@@ -368,5 +369,36 @@ describe('worktree mode', { timeout: 120_000 }, () => {
     await h.ok('node.done', { ticketId: shared, nodeId: 'brainstorming', port: 'done', summary: 'Same again' });
     await h.drive();
     expect(seen).toEqual([`spec/main@${repo}`]);
+  });
+  it('worktree mode is saved only for a git repository: an empty .git, a folder inside a repository or no folder is refused (D-072)', async () => {
+    h = await openWorkflowHarness({ behavior: () => Promise.resolve(undefined) });
+    const repo = gitRepo(join(h.dir, 'repo'));
+    const fake = join(h.dir, 'fake');
+    mkdirSync(join(fake, '.git'), { recursive: true });
+    // git itself decides, not the presence of .git.
+    expect(await isRepositoryTop(repo)).toBe(true);
+    expect(await isRepositoryTop(fake)).toBe(false);
+    expect(await isRepositoryTop(join(repo, 'src'))).toBe(false);
+    expect(await isRepositoryTop(join(h.dir, 'missing'))).toBe(false);
+
+    const { projectId } = (await h.ok('project.create', { name: 'sample' })).result as { projectId: string };
+    const refused = async (payload: Record<string, unknown>) => {
+      const response = await h?.exec('project.configure', { projectId, ...payload });
+      return response?.ok === false ? response.error.code : 'ok';
+    };
+    expect(await refused({ settings: { workspaceMode: 'worktree' } })).toBe('validation_failed'); // no folder
+    expect(await refused({ root: fake, settings: { workspaceMode: 'worktree' } })).toBe('validation_failed');
+    expect(await refused({ root: join(repo, 'src'), settings: { workspaceMode: 'worktree' } })).toBe('validation_failed');
+    expect(await refused({ root: fake })).toBe('ok');
+    // The mode alone, against the folder the project has.
+    expect(await refused({ settings: { workspaceMode: 'worktree' } })).toBe('validation_failed');
+    expect(await refused({ root: repo, settings: { workspaceMode: 'worktree' } })).toBe('ok');
+    // Moving a worktree project to a folder that is not a repository, or clearing it, is refused too.
+    expect(await refused({ root: fake })).toBe('validation_failed');
+    expect(await refused({ root: null })).toBe('validation_failed');
+    expect(await refused({ baseRef: 'main' })).toBe('ok');
+    expect(await refused({ root: fake, settings: { workspaceMode: 'shared' } })).toBe('ok');
+    const configured = (await h.store.readAggregate(projectId)).filter((event) => event.type === 'project.configured');
+    expect(configured).toHaveLength(4);
   });
 });

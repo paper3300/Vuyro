@@ -43,6 +43,11 @@ export interface EngineConnector {
   launch(uiCredential: string): Promise<{ readonly started: boolean; readonly pid: number }>;
   /** A fresh UI credential (`vuc_…`, at least 32 characters). */
   newCredential(): string;
+  /**
+   * Ends an engine this app started (`launch` said `started`) but never reached, when the app quits for good: there
+   * is no link to ask it to shut down, and leaving it would keep it running with nobody to stop it.
+   */
+  stopLaunched(pid: number): void;
 }
 
 export interface Scheduler {
@@ -100,6 +105,8 @@ export class EngineConnection {
   private stopped = false;
   /** Quitting for good: never reconnect or start an engine again, whatever happens to the link meanwhile. */
   private quitting = false;
+  /** An engine this app started and has not reached yet (its pid). */
+  private unreachedLaunch: number | undefined;
   private startedByApp = false;
 
   constructor(options: EngineConnectionOptions) {
@@ -136,6 +143,8 @@ export class EngineConnection {
   beginQuit(): void {
     this.quitting = true;
     this.clearRetry();
+    // An attempt still under way stops its engine itself (through the link, or here once it fails).
+    if (this.establishing === undefined) this.stopUnreachedLaunch();
   }
 
   /** Tries again now instead of waiting for the next retry. */
@@ -241,12 +250,17 @@ export class EngineConnection {
       const { link, launched } = await this.open();
       if (this.isStopped()) {
         // An engine this attempt started while the person was quitting: stop it again instead of leaving it behind.
-        if (this.isQuitting() && launched && link.hello.identity === 'ui') await link.request('engine.shutdown', {}).catch(() => undefined);
+        if (this.isQuitting() && launched && link.hello.identity === 'ui') {
+          this.unreachedLaunch = undefined;
+          await link.request('engine.shutdown', {}).catch(() => undefined);
+        }
         link.close();
         return;
       }
       this.adopt(link);
     } catch (error) {
+      // Started an engine, could not reach it, and the person is quitting: nothing will come back to it.
+      if (this.isQuitting()) this.stopUnreachedLaunch();
       this.onError(error instanceof Error ? error : new Error(String(error)), 'engine connection');
       const message = error instanceof Error ? error.message : String(error);
       this.update({ phase: this.state.phase === 'launching' ? 'failed' : 'offline', access: 'none', message });
@@ -273,6 +287,7 @@ export class EngineConnection {
     this.update({ phase: 'launching' });
     const launched = await this.connector.launch(credential);
     this.startedByApp = launched.started;
+    if (launched.started) this.unreachedLaunch = launched.pid;
     try {
       return { link: await this.connector.connect(credential), launched: launched.started };
     } catch (error) {
@@ -284,6 +299,7 @@ export class EngineConnection {
 
   private adopt(link: EngineLink): void {
     this.link = link;
+    this.unreachedLaunch = undefined;
     this.attempt = 0;
     const access = link.hello.identity === 'ui' ? 'write' : 'read-only';
     link.onClose(() => {
@@ -358,6 +374,17 @@ export class EngineConnection {
       this.scheduler.setTimeout(() => {
         if (this.link === link && !subscriber.closed && subscriber.handle === undefined) void this.attach(subscriber, link);
       }, wait);
+    }
+  }
+
+  private stopUnreachedLaunch(): void {
+    const pid = this.unreachedLaunch;
+    this.unreachedLaunch = undefined;
+    if (pid === undefined) return;
+    try {
+      this.connector.stopLaunched(pid);
+    } catch (error) {
+      this.onError(error instanceof Error ? error : new Error(String(error)), 'stopping an unreached engine');
     }
   }
 

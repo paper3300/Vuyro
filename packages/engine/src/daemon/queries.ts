@@ -28,7 +28,7 @@ import { type ExchangeSource, exportDefinition, previewImport } from '../workflo
 import type { CompiledWorkflow } from '../workflow/compile.ts';
 import { ticketWaitReasons, type WaitReason } from '../workflow/machine.ts';
 import { EMPTY_TICKET, evolveTicket } from '../workflow/state.ts';
-import { gitDir } from '../workspace/git.ts';
+import { isRepositoryTop } from '../workspace/git.ts';
 import { DEFAULT_LOG_TEXT_LIMIT, runLogEntry } from './run-log.ts';
 import { workflowView } from './workflow-view.ts';
 
@@ -46,7 +46,7 @@ export interface ProjectRow {
   readonly baseRef: string | null;
   /** The project layer of the workspace settings (app → project → template → node), or null when never set. */
   readonly settings: WorkspaceSettings | null;
-  /** Whether the folder is a git repository's own folder now (worktree mode needs one). Read from its `.git`, no process. */
+  /** Whether the folder is a git repository's own folder now (worktree mode needs one), as git says (`isRepositoryTop`). */
   readonly rootIsGitRepo: boolean;
 }
 
@@ -266,11 +266,13 @@ export class EngineQueries {
     const rows = await this.store.query<{ projectId: string; name: string; createdAt: number; root: string | null; baseRef: string | null; settings: string | null }>(
       'SELECT project_id AS projectId, name, created_at AS createdAt, root, base_ref AS baseRef, settings FROM p_projects ORDER BY created_at, project_id',
     );
-    return rows.map((row) => ({
-      ...row,
-      settings: row.settings === null ? null : (JSON.parse(row.settings) as WorkspaceSettings),
-      rootIsGitRepo: row.root !== null && gitDir(row.root) !== undefined,
-    }));
+    return Promise.all(
+      rows.map(async (row) => ({
+        ...row,
+        settings: row.settings === null ? null : (JSON.parse(row.settings) as WorkspaceSettings),
+        rootIsGitRepo: row.root !== null && (await isRepositoryTop(row.root)),
+      })),
+    );
   }
 
   async tickets(projectId?: string): Promise<TicketRow[]> {

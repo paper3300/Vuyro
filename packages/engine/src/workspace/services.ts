@@ -4,6 +4,7 @@ import { stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type Clock, systemClock } from '../runtime/clock.ts';
+import { isRepositoryTop } from './git.ts';
 import type { LayoutOptions } from './layout.ts';
 import { CASE_INSENSITIVE } from './paths.ts';
 
@@ -18,6 +19,8 @@ export interface WorkspaceServices {
   readonly clock: Clock;
   /** `sha256:<hex>` of a workspace file, `null` when there is no such file. */
   hash(root: string, path: string): Promise<string | null>;
+  /** Whether a folder is a git repository's own folder (worktree mode needs one). */
+  isGitRepository(folder: string): Promise<boolean>;
 }
 
 export async function hashFile(file: string): Promise<string | null> {
@@ -48,5 +51,6 @@ export function workspaceServices(options: { worktreeRoot?: string; clock?: Cloc
     caseInsensitive: options.caseInsensitive ?? CASE_INSENSITIVE,
     clock: options.clock ?? systemClock,
     hash: (root, path) => hashFile(join(root, ...path.split('/'))),
+    isGitRepository: (folder) => isRepositoryTop(folder),
   };
 }

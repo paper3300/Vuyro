@@ -23,7 +23,7 @@ import {
   startTicket,
 } from './helpers/shared-fixtures.ts';
 import { HUMAN, openWorkflowHarness, SYSTEM, type WorkflowHarness, type WorkflowHarnessOptions } from './helpers/workflow-harness.ts';
-import { edge, expectOk, projectAt, save, template } from './helpers/workspace-fixtures.ts';
+import { edge, expectOk, gitRepo, projectAt, save, template } from './helpers/workspace-fixtures.ts';
 
 /**
  * Shared nodes (M5): triggers, who may run what, the failure policies, protected paths, requests that cannot be served,
@@ -319,7 +319,8 @@ describe('shared nodes', { timeout: 30_000 }, () => {
       expect((await error(mismatch)).issues).toHaveLength(1);
       expect(h.processes.spawned).toEqual([]);
 
-      const worktree = await projectAt(h, root, { workspaceMode: 'worktree' });
+      // Worktree mode needs a git repository (the engine checks it when the project is configured).
+      const worktree = await projectAt(h, gitRepo(join(h.dir, 'worktree-repo')), { workspaceMode: 'worktree' });
       await defineShared(h, worktree, buildSpec({ batchTrigger: { count: 1 } }));
       const { ticketId } = (await h.ok('ticket.create', { projectId: worktree, title: 'wt', template: { id: 'myteam/quick-flow' } })).result as { ticketId: string };
       await h.ok('node.done', { ticketId, nodeId: 'task', port: 'done', data: { what: 1 } });

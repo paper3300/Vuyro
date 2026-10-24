@@ -19,6 +19,10 @@ export class FakeEngine {
   /** When set, `launch` starts nothing and another engine "already" runs without our credential. */
   launchRace = false;
   failLaunch: Error | undefined;
+  /** The next N connects to a running engine fail as if it did not answer (an engine that started but is not reachable). */
+  connectFailures = 0;
+  /** Pids passed to `stopLaunched`. */
+  readonly killed: number[] = [];
   /** When set, `launch` waits for it (a launch still on its way). */
   launchGate: Promise<void> | undefined;
   /** `engine.shutdown` closes the pipe before its answer arrives (the engine stopping fast). */
@@ -58,10 +62,18 @@ export class FakeEngine {
       connect: (credential) => {
         connects.push(credential);
         if (!this.running) return Promise.reject(new EngineConnectError('unavailable', 'no engine'));
+        if (this.connectFailures > 0) {
+          this.connectFailures -= 1;
+          return Promise.reject(new EngineConnectError('unavailable', 'the engine does not answer yet'));
+        }
         if (credential !== undefined && !this.known.has(credential)) return Promise.reject(new EngineConnectError('unauthenticated', 'invalid UI credential'));
         const link = new FakeLink(this, credential === undefined ? 'unverified' : 'ui');
         this.links.add(link);
         return Promise.resolve(link);
+      },
+      stopLaunched: (pid) => {
+        this.killed.push(pid);
+        this.crash();
       },
       launch: async (credential) => {
         this.launches.push(credential);

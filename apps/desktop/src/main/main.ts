@@ -2,13 +2,14 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, protocol, session, Tray, type WebContents } from 'electron';
+import { isRepositoryTop } from '@vuyro/engine';
 import { BRIDGE_CHANNELS, type ConnectionState } from '../shared/bridge.ts';
 import { APP_INDEX, APP_SCHEME, appResponseHeaders, resolveAppFile } from './app-protocol.ts';
 import { EngineConnection } from './engine-connection.ts';
 import { engineConnector } from './engine-connector.ts';
 import { checkCopyText, type FileAccess, type FileDialogs, openJsonFile, saveJsonFile } from './file-exchange.ts';
 import { checkRendererRequest, checkSubscribe, isTrustedFrame } from './ipc-policy.ts';
-import { type FolderAccess, FolderGrants, pickProjectFolder, setProjectFolder } from './project-folder.ts';
+import { checkWorktreeMode, type FolderAccess, FolderGrants, pickProjectFolder, setProjectFolder } from './project-folder.ts';
 import { quitForGood, trayItems, trayTooltip } from './tray-model.ts';
 import { mainWindowOptions } from './window-options.ts';
 
@@ -156,10 +157,32 @@ function registerIpc(): void {
     }
   };
   const refusal = { ok: false, error: { code: 'bridge_refused', message: 'untrusted sender', retryable: false } } as const;
+  // The project folder: picked in a system dialog, checked here, saved by token as `project.configure` (D-072).
+  // Whether it is a git repository is git's answer (the engine's own rule), never the mere presence of `.git`.
+  const folders: FolderAccess = {
+    kind: async (path) => {
+      try {
+        return (await stat(path)).isDirectory() ? 'directory' : 'file';
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ENOTDIR') return 'missing';
+        throw error;
+      }
+    },
+    isGitRepo: (path) => isRepositoryTop(path),
+  };
+  /** The project's folder as the engine has it: null without one, undefined when the engine cannot be asked. */
+  const projectRoot = async (projectId: string): Promise<string | null | undefined> => {
+    const listed = await connection.request<{ projects: { projectId: string; root: string | null }[] }>('query.projects', {});
+    return listed.ok ? listed.value.projects.find((project) => project.projectId === projectId)?.root : undefined;
+  };
   ipcMain.handle(BRIDGE_CHANNELS.request, async (event, message: unknown) => {
     if (!trusted(event)) return refusal;
     const checked = checkRendererRequest(message);
     if (!checked.ok) return checked;
+    if (checked.method === 'command.execute') {
+      const mode = await checkWorktreeMode(checked.params, projectRoot, folders);
+      if (mode !== undefined) return { ok: false, error: mode };
+    }
     return connection.request(checked.method, checked.params);
   });
   ipcMain.handle(BRIDGE_CHANNELS.connection, (event) => (trusted(event) ? connection.current : undefined));
@@ -201,17 +224,6 @@ function registerIpc(): void {
     await clipboard.writeText(checked.text);
     return { ok: true, value: null };
   });
-  // The project folder: picked in a system dialog, checked here, saved by token as `project.configure` (D-072).
-  const folders: FolderAccess = {
-    kind: async (path) => {
-      try {
-        return (await stat(path)).isDirectory() ? 'directory' : 'file';
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ENOTDIR') return 'missing';
-        throw error;
-      }
-    },
-  };
   ipcMain.handle(BRIDGE_CHANNELS.pickFolder, async (event) => {
     if (!trusted(event)) return refusal;
     const parent = BrowserWindow.fromWebContents(event.sender) ?? undefined;

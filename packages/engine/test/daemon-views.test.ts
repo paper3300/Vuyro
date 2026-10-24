@@ -1,4 +1,5 @@
-import { mkdirSync, readdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { AgentAdapter, AgentStartRequest } from '@vuyro/agent-adapters';
@@ -103,7 +104,11 @@ describe.runIf(process.platform === 'win32')('daemon views for the app', () => {
       expect.objectContaining({ name: 'no folder', root: null, baseRef: null, settings: null, rootIsGitRepo: false }),
       expect.objectContaining({ name: 'with folder', root: folder, settings: { workspaceMode: 'shared', onConflict: 'warn' }, rootIsGitRepo: false }),
     ]);
+    // An empty .git is not a repository; git decides.
     mkdirSync(join(folder, '.git'));
+    expect((await listed())[1]?.rootIsGitRepo).toBe(false);
+    rmSync(join(folder, '.git'), { recursive: true });
+    execFileSync('git', ['init', '--quiet'], { cwd: folder });
     expect((await listed())[1]?.rootIsGitRepo).toBe(true);
   });
 

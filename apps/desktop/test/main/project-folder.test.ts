@@ -1,7 +1,7 @@
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { BridgeResult } from '../../src/shared/bridge.ts';
-import { checkSetProjectFolder, type FolderAccess, FolderGrants, pickProjectFolder, setProjectFolder } from '../../src/main/project-folder.ts';
+import { checkSetProjectFolder, checkWorktreeMode, type FolderAccess, FolderGrants, pickProjectFolder, setProjectFolder } from '../../src/main/project-folder.ts';
 
 /**
  * The project folder from the app (D-072): main picks and checks it, the page holds a one-time grant, and saving turns
@@ -12,19 +12,23 @@ const REPO = resolve('C:\\work\\notepad');
 const PLAIN = resolve('C:\\work\\plain');
 const FILE = resolve('C:\\work\\notes.txt');
 
-function disk(entries: Record<string, 'directory' | 'file'>) {
-  const looked: string[] = [];
+/** A fake disk; `repos` are the folders git says are repositories (main asks git, never looks for `.git` itself). */
+function disk(entries: Record<string, 'directory' | 'file'>, repos: readonly string[] = []) {
+  const asked: string[] = [];
   const access: FolderAccess & { failWith?: Error } = {
     kind: (path) => {
-      looked.push(path);
       if (access.failWith !== undefined) return Promise.reject(access.failWith);
       return Promise.resolve(entries[path] ?? 'missing');
     },
+    isGitRepo: (path) => {
+      asked.push(path);
+      return Promise.resolve(repos.includes(path));
+    },
   };
-  return { access, looked, entries };
+  return { access, asked, entries };
 }
 
-const files = () => disk({ [REPO]: 'directory', [join(REPO, '.git')]: 'directory', [PLAIN]: 'directory', [FILE]: 'file' });
+const files = () => disk({ [REPO]: 'directory', [PLAIN]: 'directory', [FILE]: 'file' }, [REPO]);
 const dialog = (path: string | undefined) => ({ pickFolder: () => Promise.resolve(path) });
 
 function sender() {
@@ -44,11 +48,12 @@ describe('picking a project folder', () => {
     expect(grants.size).toBe(1);
   });
 
-  it('a plain folder is not a git repository; a linked worktree (`.git` file) is', async () => {
-    const plain = await pickProjectFolder(dialog(PLAIN), files().access, new FolderGrants(), 1);
-    expect(plain).toMatchObject({ ok: true, value: { isGitRepo: false } });
-    const linked = disk({ [PLAIN]: 'directory', [join(PLAIN, '.git')]: 'file' });
-    expect(await pickProjectFolder(dialog(PLAIN), linked.access, new FolderGrants(), 1)).toMatchObject({ ok: true, value: { isGitRepo: true } });
+  it('git decides: a folder with only an empty .git is not a repository', async () => {
+    const plain = files();
+    expect(await pickProjectFolder(dialog(PLAIN), plain.access, new FolderGrants(), 1)).toMatchObject({ ok: true, value: { isGitRepo: false } });
+    expect(plain.asked).toEqual([PLAIN]);
+    const emptyGit = disk({ [PLAIN]: 'directory', [join(PLAIN, '.git')]: 'directory' });
+    expect(await pickProjectFolder(dialog(PLAIN), emptyGit.access, new FolderGrants(), 1)).toMatchObject({ ok: true, value: { isGitRepo: false } });
   });
 
   it('cancelled: nothing granted', async () => {
@@ -161,5 +166,28 @@ describe('saving the folder as the project folder', () => {
     expect(checkSetProjectFolder({ projectId: '0190aaaa-bbbb-7ccc-8ddd-eeeeee123456', token: `vpf_${'0'.repeat(32)}` })).toMatchObject({ ok: true });
     expect(checkSetProjectFolder({ projectId: 'p1', token: `vpf_${'0'.repeat(32)}`, settings: { workspaceMode: 'shared' } })).toMatchObject({ ok: true, settings: { workspaceMode: 'shared' } });
     expect(checkSetProjectFolder({ projectId: 'p'.repeat(65), token: `vpf_${'0'.repeat(32)}` })).toMatchObject({ ok: false });
+  });
+});
+
+describe('changing only the mode from the page', () => {
+  const configure = (projectId: string, settings: unknown) => ({ requestId: 'ui-1', type: 'project.configure', payload: { projectId, settings } });
+  const roots: Record<string, string | null> = { repo: REPO, plain: PLAIN, bare: null };
+  const projectRoot = (projectId: string) => Promise.resolve(roots[projectId]);
+
+  it('worktree mode only for a project whose folder git calls a repository', async () => {
+    const { access, asked } = files();
+    expect(await checkWorktreeMode(configure('repo', { workspaceMode: 'worktree' }), projectRoot, access)).toBeUndefined();
+    expect(await checkWorktreeMode(configure('plain', { workspaceMode: 'worktree' }), projectRoot, access)).toMatchObject({ code: 'folder_unusable', message: 'worktree 모드는 git 저장소 폴더에서만 쓸 수 있습니다.' });
+    expect(await checkWorktreeMode(configure('bare', { workspaceMode: 'worktree' }), projectRoot, access)).toMatchObject({ code: 'folder_unusable', message: 'worktree 모드는 프로젝트 폴더를 먼저 골라야 쓸 수 있습니다.' });
+    expect(asked).toEqual([REPO, PLAIN]);
+  });
+
+  it('leaves everything else alone, and the engine decides when the project cannot be looked up', async () => {
+    const { access, asked } = files();
+    expect(await checkWorktreeMode(configure('plain', { workspaceMode: 'shared' }), projectRoot, access)).toBeUndefined();
+    expect(await checkWorktreeMode({ requestId: 'ui-1', type: 'ticket.create', payload: { projectId: 'plain', settings: { workspaceMode: 'worktree' } } }, projectRoot, access)).toBeUndefined();
+    expect(await checkWorktreeMode(configure('unknown', { workspaceMode: 'worktree' }), projectRoot, access)).toBeUndefined();
+    expect(await checkWorktreeMode(null, projectRoot, access)).toBeUndefined();
+    expect(asked).toEqual([]);
   });
 });

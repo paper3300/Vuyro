@@ -55,6 +55,15 @@ export function engineConnector(options: EngineConnectorOptions = {}): EngineCon
       });
       return { started: launched.started, pid: launched.pid };
     },
+    stopLaunched(pid) {
+      // No link to send engine.shutdown on: end the process. The engine is built to survive that (crash recovery,
+      // runs queue again at its next start, 명령·이벤트 계약 §11).
+      try {
+        process.kill(pid);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+      }
+    },
   };
 }
 

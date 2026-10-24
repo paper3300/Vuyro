@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
+import { realpath } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { resolveExecutable } from '@vuyro/agent-adapters';
 
@@ -72,6 +73,28 @@ export function nodeGitExec(options: { readonly command?: string; readonly env?:
         resolve({ code, stdout, stderr: error !== null && typeof error.code !== 'number' ? `${stderr}${error.message}` : stderr });
       });
     });
+}
+
+let defaultExec: GitExec | undefined;
+
+/**
+ * Whether `folder` is the top folder of a git working tree, asked of git itself (`rev-parse --show-toplevel`: read-only,
+ * no shell). An empty or broken `.git`, a plain folder inside another repository, or no git at all is not one. The app
+ * and the engine use this one rule before they allow worktree mode (D-072).
+ */
+export async function isRepositoryTop(folder: string, exec?: GitExec): Promise<boolean> {
+  let real: string;
+  try {
+    real = await realpath(folder);
+  } catch {
+    return false;
+  }
+  const result = await (exec ?? (defaultExec ??= nodeGitExec()))(['rev-parse', '--show-toplevel'], real);
+  const top = result.code === 0 ? result.stdout.trim() : '';
+  if (top === '') return false;
+  const realTop = await realpath(top).catch(() => top);
+  const key = (path: string) => (process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path));
+  return key(real) === key(realTop);
 }
 
 /** One porcelain status entry: the path (and the old path of a rename). */

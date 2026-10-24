@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { basename, isAbsolute, join } from 'node:path';
+import { basename, isAbsolute } from 'node:path';
 import type { BridgeError, BridgeResult, PickedFolder } from '../shared/bridge.ts';
 
 /**
@@ -19,6 +19,8 @@ export interface FolderDialog {
 
 export interface FolderAccess {
   kind(path: string): Promise<'directory' | 'file' | 'missing'>;
+  /** Whether git itself says the folder is a repository's own folder (the engine's `isRepositoryTop`: read-only, no shell). */
+  isGitRepo(path: string): Promise<boolean>;
 }
 
 interface Grant {
@@ -78,10 +80,6 @@ export class FolderGrants {
 
 const failure = (code: string, message: string): { ok: false; error: BridgeError } => ({ ok: false, error: { code, message, retryable: false } });
 
-/** A repository's own folder: `.git` is there (a folder, or a file in a linked worktree). */
-async function isGitRepo(access: FolderAccess, path: string): Promise<boolean> {
-  return (await access.kind(join(path, '.git'))) !== 'missing';
-}
 
 export async function pickProjectFolder(dialog: FolderDialog, access: FolderAccess, grants: FolderGrants, owner: number): Promise<BridgeResult<PickedFolder | null>> {
   const path = await dialog.pickFolder();
@@ -90,7 +88,7 @@ export async function pickProjectFolder(dialog: FolderDialog, access: FolderAcce
   try {
     const kind = await access.kind(path);
     if (kind !== 'directory') return failure('folder_unusable', kind === 'missing' ? '폴더가 없습니다.' : '폴더가 아닙니다.');
-    const git = await isGitRepo(access, path);
+    const git = await access.isGitRepo(path);
     return { ok: true, value: { token: grants.grant(owner, path, git), path, name: basename(path) || path, isGitRepo: git } };
   } catch (error) {
     return failure('folder_unusable', `폴더를 읽을 수 없습니다: ${(error as Error).message}`);
@@ -124,11 +122,30 @@ export async function setProjectFolder(
   if (grant === undefined) return failure('folder_grant_invalid', '고른 폴더를 확인할 수 없습니다. 폴더를 다시 고르세요.');
   try {
     if ((await access.kind(grant.path)) !== 'directory') return failure('folder_unusable', '고른 폴더가 없어졌습니다. 폴더를 다시 고르세요.');
-    const git = await isGitRepo(access, grant.path);
+    const git = await access.isGitRepo(grant.path);
     if (checked.settings?.workspaceMode === 'worktree' && !git) return failure('folder_unusable', 'worktree 모드는 git 저장소 폴더에서만 쓸 수 있습니다.');
   } catch (error) {
     return failure('folder_unusable', `폴더를 읽을 수 없습니다: ${(error as Error).message}`);
   }
   const payload = { projectId: checked.projectId, root: grant.path, ...(checked.settings === undefined ? {} : { settings: checked.settings }) };
   return send('command.execute', { requestId: `ui-${randomUUID()}`, type: 'project.configure', payload });
+}
+
+/**
+ * A mode-only change from the page (`project.configure {projectId, settings}` through `request`, no folder): worktree
+ * mode needs the project's folder to be a git repository. `projectRoot` answers null for a project without a folder and
+ * undefined when it cannot tell (the engine then decides alone: it checks again when it saves).
+ */
+export async function checkWorktreeMode(params: unknown, projectRoot: (projectId: string) => Promise<string | null | undefined>, access: FolderAccess): Promise<BridgeError | undefined> {
+  if (typeof params !== 'object' || params === null) return undefined;
+  const { type, payload } = params as { type?: unknown; payload?: unknown };
+  if (type !== 'project.configure' || typeof payload !== 'object' || payload === null) return undefined;
+  const { projectId, settings } = payload as { projectId?: unknown; settings?: unknown };
+  if (typeof projectId !== 'string' || typeof settings !== 'object' || settings === null) return undefined;
+  if ((settings as { workspaceMode?: unknown }).workspaceMode !== 'worktree') return undefined;
+  const root = await projectRoot(projectId);
+  if (root === undefined) return undefined;
+  const refused = (message: string): BridgeError => ({ code: 'folder_unusable', message, retryable: false });
+  if (root === null) return refused('worktree 모드는 프로젝트 폴더를 먼저 골라야 쓸 수 있습니다.');
+  return (await access.isGitRepo(root)) ? undefined : refused('worktree 모드는 git 저장소 폴더에서만 쓸 수 있습니다.');
 }

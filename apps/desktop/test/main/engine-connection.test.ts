@@ -307,6 +307,52 @@ describe('engine connection', () => {
     expect(engine.links.size).toBe(0);
   });
 
+  it('an engine it started but could not reach is ended when the person quits, and nothing starts again', async () => {
+    const { engine, scheduler, connection } = setup((fake) => {
+      fake.connectFailures = 1;
+    });
+    await connection.start();
+    expect(engine.launches).toHaveLength(1);
+    expect(connection.current.phase).toBe('failed');
+    connection.beginQuit();
+    expect(engine.killed).toEqual([1]);
+    expect(engine.running).toBe(false);
+    await scheduler.advance(60_000);
+    expect(engine.launches).toHaveLength(1);
+  });
+
+  it('quitting while that engine is still being reached: the attempt ends it once it fails', async () => {
+    let open: () => void = () => undefined;
+    const { engine, connection } = setup((fake) => {
+      fake.launchGate = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+      fake.connectFailures = 1;
+    });
+    const starting = connection.start();
+    await settle();
+    connection.beginQuit();
+    // The attempt is under way: it, not beginQuit, decides (it may still reach the engine and stop it properly).
+    expect(engine.killed).toEqual([]);
+    open();
+    await starting;
+    expect(engine.killed).toEqual([1]);
+    expect(engine.running).toBe(false);
+  });
+
+  it('an engine it started and reached later is stopped through the link, not ended', async () => {
+    const { engine, scheduler, connection } = setup((fake) => {
+      fake.connectFailures = 1;
+    });
+    await connection.start();
+    await scheduler.advance(100);
+    expect(connection.current).toMatchObject({ phase: 'connected', access: 'write' });
+    connection.beginQuit();
+    expect((await connection.shutdownEngine()).ok).toBe(true);
+    expect(engine.killed).toEqual([]);
+    expect(engine.shutdowns).toBe(1);
+  });
+
   it('a person who has not quit yet still gets a lost engine back (the quit state starts with the confirmation)', async () => {
     const { engine, scheduler, connection } = setup();
     await connection.start();

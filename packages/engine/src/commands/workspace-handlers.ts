@@ -4,6 +4,7 @@ import {
   type ClaimSpec,
   type ClaimWait,
   type CommandError,
+  type CommandPayload,
   commandError,
   type Conflict,
   type DetectedChange,
@@ -54,12 +55,28 @@ function stream(aggregateType: string, loaded: Loaded<unknown>, events: readonly
 export const projectConfigure: CommandHandler<'project.configure', ProjectState> = {
   target: (payload) => ({ definition: projectAggregate, aggregateId: payload.projectId }),
   scope: () => ({}),
-  decide: (_ctx, payload, target) => {
+  decide: (ctx, payload, target) => {
     if (target === undefined) throw new Error('project not loaded');
     if (!target.state.exists) return Promise.resolve(fail('not_found', `project ${payload.projectId} does not exist`));
-    return Promise.resolve({ ok: true, appends: [stream('project', target, [{ type: 'project.configured', data: payload }])], result: {} });
+    return worktreeNeedsRepository(ctx, payload, target.state).then(
+      (refusal) => refusal ?? { ok: true, appends: [stream('project', target, [{ type: 'project.configured', data: payload }])], result: {} },
+    );
   },
 };
+
+/**
+ * Worktree mode needs the project folder to be a git repository's own folder (D-072): checked when the change touches
+ * the folder or the settings, against the folder and mode the project has after it.
+ */
+async function worktreeNeedsRepository(ctx: HandlerContext, payload: CommandPayload<'project.configure'>, state: ProjectState): Promise<Failure | undefined> {
+  if (payload.root === undefined && payload.settings === undefined) return undefined;
+  const settings = payload.settings ?? state.settings;
+  if (settings?.workspaceMode !== 'worktree') return undefined;
+  const root = payload.root === undefined ? state.root : (payload.root ?? undefined);
+  if (root === undefined) return fail('validation_failed', 'worktree mode needs a project folder that is a git repository');
+  if (!(await servicesOf(ctx).isGitRepository(root))) return fail('validation_failed', `worktree mode needs a git repository, and ${root} is not the top folder of one`);
+  return undefined;
+}
 
 export const appConfigure: CommandHandler<'app.configure', AppSettingsState> = {
   target: () => ({ definition: appSettingsAggregate, aggregateId: APP_SETTINGS_AGGREGATE_ID }),
